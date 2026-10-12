@@ -1,0 +1,293 @@
+"""Durable, run-bound session events and evidence.
+
+This is the only persistent event sink used by the harness and runtime.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import threading
+import time
+import uuid
+from pathlib import Path, PureWindowsPath
+
+
+RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+
+
+class LogFailure(RuntimeError):
+    """A durable session write did not complete."""
+
+
+def validate_run_id(run_id: str) -> str:
+    if not isinstance(run_id, str) or not RUN_ID_PATTERN.fullmatch(run_id):
+        raise ValueError("Invalid run_id")
+    return run_id
+
+
+def safe_relative_path(value: str) -> Path:
+    """Validate an untrusted relative name before reading or storing evidence."""
+    if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
+        raise ValueError("Invalid relative path")
+    if Path(value).is_absolute() or PureWindowsPath(value).is_absolute():
+        raise ValueError("Absolute paths are not allowed")
+    parts = value.split("/")
+    if any(part in ("", ".", "..") or ":" in part for part in parts):
+        raise ValueError("Path escapes session")
+    return Path(*parts)
+
+
+class SessionLog:
+    def __init__(self, runs_root: Path, run_id: str, metadata: dict | None = None, *, recovery: bool = False):
+        self.run_id = validate_run_id(run_id)
+        self.run_dir = Path(runs_root).resolve() / run_id
+        self.events_path = self.run_dir / "events.jsonl"
+        self.session_path = self.run_dir / "session.json"
+        self.artifacts_dir = self.run_dir / "artifacts"
+        self._lock = threading.RLock()
+        self._closed = False
+        self.failed = False
+        self._listeners: set = set()
+        if recovery:
+            if not self.session_path.is_file():
+                raise LogFailure("Session metadata is missing")
+            self.metadata = json.loads(self.session_path.read_text(encoding="utf-8"))
+            if self.metadata.get("run_id") != run_id:
+                raise LogFailure("Session metadata run_id mismatch")
+            self._seq = max((event["seq"] for event in self.read_events()), default=0)
+        else:
+            if self.run_dir.exists():
+                raise LogFailure("Session already exists")
+            self.run_dir.mkdir(parents=True)
+            self.artifacts_dir.mkdir()
+            self._seq = 0
+            self.metadata = {"run_id": run_id, "created_at": time.time(), **(metadata or {})}
+            if self.metadata["run_id"] != run_id:
+                raise ValueError("Metadata run_id mismatch")
+            self._write_metadata()
+            self.events_path.touch()
+        self.artifacts_dir.mkdir(exist_ok=True)
+
+    @property
+    def latest_seq(self) -> int:
+        with self._lock:
+            return self._seq
+
+    def _write_metadata(self) -> None:
+        temp_path = self.run_dir / f"session-{uuid.uuid4().hex}.tmp"
+        try:
+            with temp_path.open("w", encoding="utf-8", newline="\n") as stream:
+                json.dump(self.metadata, stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_path, self.session_path)
+        except Exception as exc:
+            self.failed = True
+            raise LogFailure(f"Metadata write failed: {exc}") from exc
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    def update(self, **fields) -> dict:
+        with self._lock:
+            self._require_open()
+            if "run_id" in fields and fields["run_id"] != self.run_id:
+                raise ValueError("Cannot change run_id")
+            self.metadata = {**self.metadata, **fields}
+            self._write_metadata()
+            return dict(self.metadata)
+
+    def append(self, kind: str, fields: dict | None = None) -> dict:
+        with self._lock:
+            self._require_open()
+            if not isinstance(kind, str) or not kind:
+                raise ValueError("Event kind is required")
+            values = fields or {}
+            if any(key in values for key in ("run_id", "seq", "kind", "at")):
+                raise ValueError("Event identity fields are reserved")
+            event = {"run_id": self.run_id, "seq": self._seq + 1, "kind": kind, "at": time.time(), **values}
+            try:
+                with self.events_path.open("a", encoding="utf-8", newline="\n") as stream:
+                    stream.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except Exception as exc:
+                self.failed = True
+                raise LogFailure(f"Event write failed: {exc}") from exc
+            self._seq += 1
+            for listener in list(self._listeners):
+                try:
+                    listener(event)
+                except Exception:
+                    self._listeners.discard(listener)
+            return event
+
+    def listen(self, callback) -> None:
+        with self._lock:
+            self._require_open()
+            self._listeners.add(callback)
+
+    def unlisten(self, callback) -> None:
+        with self._lock:
+            self._listeners.discard(callback)
+
+    def preserve_bytes(self, name: str, data: bytes) -> dict:
+        with self._lock:
+            self._require_open()
+            relative = safe_relative_path(name)
+            if not isinstance(data, bytes):
+                raise TypeError("Evidence must be bytes")
+            saved_name = relative.with_name(f"{relative.stem}-{uuid.uuid4().hex}{relative.suffix}")
+            path = self.artifacts_dir / saved_name
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if any(part.is_symlink() for part in (path.parent, *path.parents)):
+                    raise ValueError("Artifact link is not allowed")
+                with path.open("xb") as stream:
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                digest = hashlib.sha256(data).hexdigest()
+                if path.stat().st_size != len(data) or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                    raise OSError("Evidence verification failed")
+            except Exception as exc:
+                self.failed = True
+                raise LogFailure(f"Evidence write failed: {exc}") from exc
+            return {"path": (Path("artifacts") / saved_name).as_posix(), "bytes": len(data), "sha256": digest}
+
+    def preserve_file(self, name: str, source: Path) -> dict:
+        return self.preserve_bytes(name, Path(source).read_bytes())
+
+    def read_events(self, after_seq: int = 0, limit: int = 500) -> list[dict]:
+        if not isinstance(after_seq, int) or after_seq < 0 or not 1 <= limit <= 1000:
+            raise ValueError("Invalid event cursor")
+        if not self.events_path.exists():
+            return []
+        result = []
+        with self.events_path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                event = json.loads(line)
+                if event["run_id"] != self.run_id:
+                    raise LogFailure("Event run_id mismatch")
+                if event["seq"] > after_seq:
+                    result.append(event)
+                    if len(result) >= limit:
+                        break
+        return result
+
+    def flush(self) -> None:
+        with self._lock:
+            self._require_open()
+            for path in (self.events_path, self.session_path):
+                with path.open("rb") as stream:
+                    os.fsync(stream.fileno())
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            self._listeners.clear()
+
+    def _require_open(self) -> None:
+        if self._closed or self.failed:
+            raise LogFailure("Session writer is closed or failed")
+
+
+class SessionStore:
+    """Read disk lifecycle state before admitting another run."""
+
+    def __init__(self, runs_root: Path):
+        self.root = Path(runs_root).resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def create(self, run_id: str, metadata: dict) -> SessionLog:
+        defaults = {"phase": "preparing", "run_result": None, "log_status": "collecting",
+                    "cleanup_status": "pending", "lab_reset_status": "pending"}
+        return SessionLog(self.root, run_id, {**defaults, **metadata})
+
+    def read(self, run_id: str) -> dict:
+        path = self.root / validate_run_id(run_id) / "session.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise KeyError(run_id) from exc
+        if not isinstance(data, dict) or data.get("run_id") != run_id:
+            raise LogFailure("Corrupt session metadata")
+        return data
+
+    def list_runs(self) -> list[dict]:
+        result = []
+        for directory in self.root.iterdir():
+            if not directory.is_dir() or not RUN_ID_PATTERN.fullmatch(directory.name):
+                continue
+            try:
+                result.append(self.read(directory.name))
+            except (KeyError, ValueError, LogFailure):
+                result.append({"run_id": directory.name, "phase": "recovery_required",
+                               "cleanup_status": "recovery_required", "metadata_error": True})
+        return sorted(result, key=lambda item: item.get("created_at", 0), reverse=True)
+
+    def can_start(self) -> tuple[bool, str]:
+        for meta in self.list_runs():
+            path = self.root / meta["run_id"]
+            if meta.get("metadata_error"):
+                return False, f"{meta['run_id']}: session metadata needs recovery"
+            if ((path / "runtime").exists() or meta.get("phase") != "finished"
+                    or meta.get("log_status") != "finalized"
+                    or meta.get("cleanup_status") != "succeeded"
+                    or meta.get("lab_reset_status") != "succeeded"):
+                return False, f"{meta['run_id']}: session cleanup is incomplete"
+        return True, ""
+
+
+class ControllerLease:
+    """OS process lock for the one local lab controller."""
+
+    def __init__(self, runs_root: Path):
+        root = Path(runs_root).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        self.path = root / ".controller.lock"
+        self._stream = None
+
+    def acquire(self) -> bool:
+        if self._stream is not None:
+            return True
+        try:
+            stream = self.path.open("a+b")
+        except OSError:
+            return False
+        if self.path.stat().st_size == 0:
+            stream.write(b"0")
+            stream.flush()
+        stream.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            stream.close()
+            return False
+        self._stream = stream
+        return True
+
+    def release(self) -> None:
+        if self._stream is None:
+            return
+        stream = self._stream
+        self._stream = None
+        try:
+            stream.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        finally:
+            stream.close()
