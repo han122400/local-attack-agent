@@ -57,7 +57,9 @@ class SessionLog:
             self.metadata = json.loads(self.session_path.read_text(encoding="utf-8"))
             if self.metadata.get("run_id") != run_id:
                 raise LogFailure("Session metadata run_id mismatch")
-            self._seq = max((event["seq"] for event in self.read_events()), default=0)
+            self.artifacts_dir.mkdir(exist_ok=True)
+            self._seq = self._scan_recovery_events()
+            self.append("recovery_opened", {"previous_phase": self.metadata.get("phase")})
         else:
             if self.run_dir.exists():
                 raise LogFailure("Session already exists")
@@ -70,6 +72,35 @@ class SessionLog:
             self._write_metadata()
             self.events_path.touch()
         self.artifacts_dir.mkdir(exist_ok=True)
+
+    def _scan_recovery_events(self) -> int:
+        if not self.events_path.exists():
+            self.events_path.touch()
+            return 0
+        last_seq = 0
+        with self.events_path.open("rb") as stream:
+            while True:
+                good_end = stream.tell()
+                line = stream.readline()
+                if not line:
+                    break
+                try:
+                    item = json.loads(line)
+                    if (not isinstance(item, dict) or item.get("run_id") != self.run_id
+                            or type(item.get("seq")) is not int or item["seq"] != last_seq + 1):
+                        raise ValueError("Event identity or sequence mismatch")
+                except (ValueError, UnicodeDecodeError) as exc:
+                    tail = line + stream.read()
+                    if b"\n" in tail.rstrip(b"\n"):
+                        raise LogFailure("Corrupt event in the middle of the log") from exc
+                    self.preserve_bytes("recovery/partial-tail.bin", tail)
+                    with self.events_path.open("r+b") as writer:
+                        writer.truncate(good_end)
+                        writer.flush()
+                        os.fsync(writer.fileno())
+                    break
+                last_seq = item["seq"]
+        return last_seq
 
     @property
     def latest_seq(self) -> int:
@@ -217,6 +248,66 @@ class SessionStore:
         if not isinstance(data, dict) or data.get("run_id") != run_id:
             raise LogFailure("Corrupt session metadata")
         return data
+
+    def repair_unowned_metadata(self, run_id: str) -> dict:
+        """Rebuild a creation record only when no runtime or owned process remains.
+
+        An unknown process owner is never inferred from a directory name.  A
+        record with a runtime or an unmatched process start stays blocked.
+        """
+        run_id = validate_run_id(run_id)
+        directory = self.root / run_id
+        if not directory.is_dir() or (directory / "runtime").exists():
+            raise LogFailure("Cannot repair metadata while runtime ownership is unknown")
+        session_path = directory / "session.json"
+        try:
+            return self.read(run_id)
+        except (KeyError, ValueError, LogFailure):
+            pass
+        outstanding = set()
+        result = None
+        events_path = directory / "events.jsonl"
+        if events_path.exists():
+            try:
+                for line in events_path.read_text(encoding="utf-8").splitlines():
+                    event = json.loads(line)
+                    if event.get("run_id") != run_id:
+                        raise ValueError("Event run_id mismatch")
+                    process = event.get("process") or {}
+                    identity = (process.get("pid"), process.get("created_at"))
+                    if event.get("kind") == "process_started":
+                        outstanding.add(identity)
+                    elif event.get("kind") == "process_stopped":
+                        outstanding.discard(identity)
+                    elif event.get("kind") in {"finalize_started", "run_finalized"}:
+                        result = event.get("run_result") or result
+            except (ValueError, UnicodeDecodeError, TypeError) as exc:
+                raise LogFailure("Cannot establish process ownership from events") from exc
+        if outstanding:
+            raise LogFailure("Cannot repair metadata with unconfirmed managed processes")
+        if session_path.exists():
+            artifact = directory / "artifacts" / "recovery"
+            artifact.mkdir(parents=True, exist_ok=True)
+            backup = artifact / f"session-metadata-{uuid.uuid4().hex}.bin"
+            with backup.open("xb") as stream:
+                stream.write(session_path.read_bytes())
+                stream.flush()
+                os.fsync(stream.fileno())
+        metadata = {"run_id": run_id, "created_at": time.time(), "phase": "recovery_required",
+                    "run_result": result or "interrupted", "cleanup_status": "recovery_required",
+                    "log_status": "collecting", "lab_reset_status": "pending",
+                    "runtime_creation_intent": False, "managed_processes": [],
+                    "metadata_rebuilt": True}
+        temporary = directory / f"session-repair-{uuid.uuid4().hex}.tmp"
+        try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+                json.dump(metadata, stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, session_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return metadata
 
     def list_runs(self) -> list[dict]:
         result = []

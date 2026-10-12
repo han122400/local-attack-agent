@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import time
@@ -13,6 +14,7 @@ from urllib.parse import urlsplit
 
 from command_runtime import CommandRuntime
 from harness import Harness, ModelFailure
+from lab import reset_lab
 from model_settings import default_model_settings, validate_model_settings
 from session_log import ControllerLease, LogFailure, SessionLog, SessionStore, validate_run_id
 
@@ -54,7 +56,7 @@ class ExplorerV3:
         self.instance_id = uuid.uuid4().hex
         self.transport = transport
         self.browser_enabled = browser_enabled
-        self.lab_reset = lab_reset
+        self.lab_reset = lab_reset or reset_lab
         self.allowed_target = allowed_target
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
@@ -94,7 +96,7 @@ class ExplorerV3:
                 raise RuntimeError(reason)
             self.stop_event.clear()
             run_id = uuid.uuid4().hex
-            metadata = {"owner_instance_id": self.instance_id, "controller_pid": __import__("os").getpid(),
+            metadata = {"owner_instance_id": self.instance_id, "controller_pid": os.getpid(),
                         "runtime_path": str(self.store.root / run_id / "runtime"),
                         "runtime_creation_intent": False, "goal": goal.strip(), "target": target,
                         "model": model, "model_settings": selected, "budgets": selected_budgets,
@@ -137,6 +139,14 @@ class ExplorerV3:
         with self.lock:
             self._runtime = runtime
         try:
+            if not any(item.get("lab_reset_status") == "succeeded" and item.get("phase") == "finished"
+                       for item in self.store.list_runs() if item.get("run_id") != run_id):
+                log.update(initial_lab_status="running")
+                initial_probe = self.lab_reset()
+                if not isinstance(initial_probe, dict) or not initial_probe.get("verified"):
+                    raise RuntimeError("Initial lab reset probe failed")
+                log.append("initial_lab_reset", {"probe": initial_probe})
+                log.update(initial_lab_status="succeeded", initial_lab_probe=initial_probe)
             log.update(phase="running")
             runtime.start_session(run_id, target=log.metadata["target"], browser=self.browser_enabled)
             result, reason = self._loop(run_id, log, runtime)
@@ -206,27 +216,30 @@ class ExplorerV3:
         try:
             log.update(run_result=run_result, finish_reason=reason, phase="finalizing")
             log.append("finalize_started", {"run_result": run_result, "reason": reason})
-            log.update(cleanup_status="running")
-            runtime.stop(run_id, 20)
-            if runtime.inspect(run_id)["managed_processes"]:
-                raise RuntimeError("Managed processes remain after stop")
-            log.append("cleanup_step", {"step": "stop", "status": "succeeded"})
-            runtime.export_evidence(run_id)
-            log.update(log_status="preserved")
-            log.append("cleanup_step", {"step": "evidence", "status": "succeeded"})
-            runtime.destroy(run_id, 20)
-            if runtime.inspect(run_id)["runtime_exists"]:
-                raise RuntimeError("Runtime folder remains after destroy")
-            log.update(cleanup_status="succeeded")
-            log.append("cleanup_step", {"step": "destroy", "status": "succeeded"})
-            log.update(phase="resetting", lab_reset_status="running")
-            if self.lab_reset is None:
-                raise RuntimeError("Lab reset implementation is unavailable")
-            probe = self.lab_reset()
-            if not isinstance(probe, dict) or not probe.get("verified"):
-                raise RuntimeError("Lab reset probe failed")
-            log.append("lab_reset", {"probe": probe, "status": "succeeded"})
-            log.update(lab_reset_status="succeeded")
+            if log.metadata.get("cleanup_status") != "succeeded" or runtime.inspect(run_id)["runtime_exists"] or runtime.inspect(run_id)["managed_processes"]:
+                log.update(cleanup_status="running")
+                runtime.stop(run_id, 20)
+                if runtime.inspect(run_id)["managed_processes"]:
+                    raise RuntimeError("Managed processes remain after stop")
+                log.append("cleanup_step", {"step": "stop", "status": "succeeded"})
+                if log.metadata.get("log_status") not in {"preserved", "finalized"}:
+                    if log.metadata.get("log_status") == "failed" and log.metadata.get("runtime_creation_intent") and not runtime.inspect(run_id)["runtime_exists"]:
+                        raise RuntimeError("Evidence source is missing after log failure")
+                    runtime.export_evidence(run_id)
+                    log.update(log_status="preserved")
+                    log.append("cleanup_step", {"step": "evidence", "status": "succeeded"})
+                runtime.destroy(run_id, 20)
+                if runtime.inspect(run_id)["runtime_exists"]:
+                    raise RuntimeError("Runtime folder remains after destroy")
+                log.update(cleanup_status="succeeded")
+                log.append("cleanup_step", {"step": "destroy", "status": "succeeded"})
+            if log.metadata.get("lab_reset_status") != "succeeded":
+                log.update(phase="resetting", lab_reset_status="running")
+                probe = self.lab_reset()
+                if not isinstance(probe, dict) or not probe.get("verified"):
+                    raise RuntimeError("Lab reset probe failed")
+                log.append("lab_reset", {"probe": probe, "status": "succeeded"})
+                log.update(lab_reset_status="succeeded")
             log.append("run_finalized", {"run_result": run_result, "reason": reason})
             log.update(phase="finished", log_status="finalized", finished_at=time.time())
             log.flush()
@@ -234,6 +247,13 @@ class ExplorerV3:
                 self._recent_state.update(status=run_result, phase="finished", finish_reason=reason,
                                           finished_at=log.metadata["finished_at"])
         except Exception as exc:
+            # A failed writer must still stop owned processes, while retaining
+            # runtime files for an explicit recovery attempt.
+            if log.failed:
+                try:
+                    runtime.stop(run_id, 20, record=False)
+                except Exception:
+                    pass
             try:
                 failed = {"phase": "recovery_required", "finish_reason": reason,
                           "cleanup_error": str(exc)[:500]}
@@ -281,6 +301,55 @@ class ExplorerV3:
 
     def get_run(self, run_id: str) -> dict:
         return self.store.read(validate_run_id(run_id))
+
+    def recover(self, run_id: str) -> bool:
+        validate_run_id(run_id)
+        with self.lock:
+            if self.worker and self.worker.is_alive():
+                return False
+            if not self.lease.acquire():
+                raise RuntimeError("Another controller owns the local lab")
+            try:
+                try:
+                    metadata = self.store.read(run_id)
+                except (KeyError, ValueError, LogFailure):
+                    metadata = self.store.repair_unowned_metadata(run_id)
+                if (metadata.get("phase") == "finished" and metadata.get("cleanup_status") == "succeeded"
+                        and metadata.get("log_status") == "finalized" and metadata.get("lab_reset_status") == "succeeded"):
+                    self.lease.release()
+                    return False
+                log = SessionLog(self.store.root, run_id, recovery=True)
+                result = metadata.get("run_result") or "interrupted"
+                reason = metadata.get("finish_reason") or "App exited during the run"
+                attempts = int(metadata.get("recovery_attempts", 0)) + 1
+                cleanup = "succeeded" if metadata.get("cleanup_status") == "succeeded" else "recovery_required"
+                log.update(run_result=result, cleanup_status=cleanup, phase="recovery_required",
+                           recovery_attempts=attempts, recovery_owner_instance_id=self.instance_id)
+                log.append("recovery_started", {"attempt": attempts, "previous_phase": metadata.get("phase")})
+                self.stop_event.clear()
+                self.active_run_id = run_id
+                self._recent_state = {**log.metadata, "status": "recovery_required", "console": ""}
+                log.listen(self._broadcast)
+                self.worker = threading.Thread(target=self._recover_thread,
+                                               args=(run_id, log, result, reason), daemon=True)
+                self.worker.start()
+                return True
+            except Exception:
+                self.lease.release()
+                raise
+
+    def _recover_thread(self, run_id: str, log: SessionLog, result: str, reason: str) -> None:
+        runtime = CommandRuntime(self.store.root, log)
+        try:
+            runtime.restore_owned(run_id, log.metadata.get("managed_processes", []))
+            with self.lock:
+                self._runtime = runtime
+            self._finalize(run_id, log, runtime, result, reason)
+        finally:
+            with self.lock:
+                self._runtime = None
+                self.active_run_id = None
+            self.lease.release()
 
 
 # Temporary import compatibility while the HTTP routes migrate in step 4.

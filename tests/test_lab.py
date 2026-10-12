@@ -14,6 +14,31 @@ def inspected(status):
 
 
 class LabTests(unittest.TestCase):
+    def test_reset_restarts_only_owned_container_and_requires_data_probe(self):
+        info = {"Config": {"Image": "bkimminich/juice-shop:v20.2.0"}, "Mounts": [],
+                "NetworkSettings": {"Ports": {"3000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "3000"}]}}}
+        inspected_full = subprocess.CompletedProcess([], 0, json.dumps([info]), "")
+        restarted = subprocess.CompletedProcess([], 0, "juice-lab", "")
+        with patch("lab._docker", side_effect=[inspected_full, restarted]) as docker, \
+             patch("lab._probe_initial_state", return_value={"verified": True, "products": 46, "challenges": 116, "solved": 0}):
+            result = lab.reset_lab()
+        self.assertTrue(result["verified"])
+        self.assertEqual(docker.call_args_list[1].args, ("restart", "juice-lab"))
+
+    def test_reset_rejects_wrong_container_and_probe_mismatch(self):
+        info = {"Config": {"Image": "other:latest"}, "Mounts": [],
+                "NetworkSettings": {"Ports": {"3000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "3000"}]}}}
+        with patch("lab._docker", return_value=subprocess.CompletedProcess([], 0, json.dumps([info]), "")) as docker:
+            with self.assertRaises(RuntimeError):
+                lab.reset_lab()
+            self.assertEqual(docker.call_count, 1)
+        info["Config"]["Image"] = "bkimminich/juice-shop:v20.2.0"
+        with patch("lab._docker", side_effect=[subprocess.CompletedProcess([], 0, json.dumps([info]), ""),
+                                               subprocess.CompletedProcess([], 0, "juice-lab", "")]), \
+             patch("lab._probe_initial_state", return_value={"verified": False, "products": 46, "challenges": 116, "solved": 1}):
+            with self.assertRaises(RuntimeError):
+                lab.reset_lab(wait_seconds=0)
+
     def test_running_requires_web_response_to_be_ready(self):
         with patch("lab._docker", return_value=inspected("running")), patch("lab._web_ready", return_value=False):
             self.assertEqual(lab.get_status()["status"], "starting")

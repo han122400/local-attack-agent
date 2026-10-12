@@ -76,6 +76,21 @@ class SessionLogTests(unittest.TestCase):
             self.assertTrue(second.acquire())
             second.release()
 
+    def test_recovery_keeps_monotonic_sequence_past_first_page_and_preserves_torn_tail(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            log.close()
+            with log.events_path.open("w", encoding="utf-8") as stream:
+                for seq in range(1, 1002):
+                    stream.write(json.dumps({"run_id": RUN_ID, "seq": seq, "kind": "test", "at": 1}) + "\n")
+                stream.write('{"partial":')
+            recovered = SessionLog(Path(temp), RUN_ID, recovery=True)
+            event = recovered.append("after_recovery", {})
+            self.assertGreater(event["seq"], 1001)
+            self.assertTrue(any(path.read_bytes() == b'{"partial":' for path in recovered.artifacts_dir.rglob("*partial*.bin") if path.is_file()))
+            self.assertEqual(len(recovered.read_events(after_seq=1000)), event["seq"] - 1000)
+            recovered.close()
+
 
 if __name__ == "__main__":
     unittest.main()

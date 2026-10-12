@@ -51,6 +51,66 @@ class ExplorerLoopTests(unittest.TestCase):
                 explorer.start(goal="inspect", chain_mode="campaign")
             self.assertEqual(SessionStore(Path(temp)).list_runs(), [])
 
+    def test_recovery_resumes_incomplete_run_and_preserves_original_result(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = SessionStore(Path(temp))
+            run_id = "a" * 32
+            log = store.create(run_id, {"goal": "inspect", "target": "http://127.0.0.1:3000/",
+                                        "run_result": "error", "finish_reason": "model failed"})
+            log.append("original", {"message": "keep"})
+            log.close()
+            explorer = ExplorerV3(Path(temp), browser_enabled=False, lab_reset=lambda: {"verified": True})
+            self.assertFalse(explorer.can_start()[0])
+            self.assertTrue(explorer.recover(run_id))
+            explorer.worker.join(10)
+            meta = store.read(run_id)
+            self.assertEqual(meta["run_result"], "error")
+            self.assertEqual(meta["phase"], "finished")
+            self.assertTrue(explorer.can_start()[0])
+            events = [json.loads(line) for line in (Path(temp) / run_id / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(events[0]["kind"], "original")
+            self.assertTrue(any(item["kind"] == "recovery_opened" for item in events))
+
+    def test_failed_reset_blocks_start_until_same_run_recovery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            answers = iter([model_reply("finish")])
+            def transport(_payload):
+                yield next(answers)
+            attempts = 0
+            def reset():
+                nonlocal attempts
+                attempts += 1
+                if attempts == 2:  # initial reset succeeds, final reset fails
+                    raise RuntimeError("probe mismatch")
+                return {"verified": True}
+            explorer = ExplorerV3(Path(temp), transport=transport, browser_enabled=False, lab_reset=reset)
+            run_id = explorer.start(goal="inspect")
+            explorer.worker.join(10)
+            self.assertFalse(explorer.can_start()[0])
+            self.assertEqual(SessionStore(Path(temp)).read(run_id)["run_result"], "completed")
+            self.assertTrue(explorer.recover(run_id))
+            explorer.worker.join(10)
+            self.assertTrue(explorer.can_start()[0])
+            self.assertEqual(SessionStore(Path(temp)).read(run_id)["run_result"], "completed")
+
+    def test_recovery_rebuilds_interrupted_creation_without_runtime(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run_id = "b" * 32
+            directory = Path(temp) / run_id
+            directory.mkdir()
+            (directory / "session.json").write_text("{broken", encoding="utf-8")
+            explorer = ExplorerV3(Path(temp), browser_enabled=False,
+                                  lab_reset=lambda: {"verified": True})
+            self.assertFalse(explorer.can_start()[0])
+            self.assertTrue(explorer.recover(run_id))
+            explorer.worker.join(10)
+            state = explorer.get_run(run_id)
+            self.assertEqual(state["run_result"], "interrupted")
+            self.assertEqual(state["phase"], "finished")
+            self.assertTrue(state["metadata_rebuilt"])
+            self.assertEqual(len(list((directory / "artifacts" / "recovery").glob("session-metadata-*.bin"))), 1)
+            self.assertTrue(explorer.can_start()[0])
+
 
 if __name__ == "__main__":
     unittest.main()

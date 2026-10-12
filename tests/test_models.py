@@ -61,30 +61,32 @@ class ModelRouteTests(unittest.TestCase):
                 self.assertEqual(error.exception.status_code, 503)
 
     def test_start_passes_installed_model_to_explorer(self):
-        with patch("app.get_ollama_models", return_value=[{"name": "other:7b", "size": 7000}]), patch.object(app.EXPLORER, "start", return_value=True) as start:
-            response = self.start_request({"target": explorer_module.TARGET, "model": "other:7b"})
-        self.assertEqual(response, {"started": True})
-        start.assert_called_once_with(explorer_module.TARGET, "other:7b")
+        with patch("app.get_ollama_models", return_value=[{"name": "other:7b", "size": 7000}]), patch.object(app.EXPLORER, "start", return_value="a" * 32) as start:
+            response = self.start_request({"target": explorer_module.TARGET, "model": "other:7b", "goal": "inspect"})
+        self.assertEqual(response, {"started": True, "run_id": "a" * 32, "run_url": "/runs/" + "a" * 32})
+        start.assert_called_once_with(explorer_module.TARGET, "other:7b", goal="inspect", model_settings=None,
+                                      scenario_source="manual", chain_mode="none", budgets=None)
 
     def test_start_rejects_unknown_or_invalid_model_before_running(self):
         for model in ("missing:7b", "", None, ["other:7b"]):
             with self.subTest(model=model), patch("app.get_ollama_models", return_value=[{"name": "other:7b"}]), patch.object(app.EXPLORER, "start") as start:
                 with self.assertRaises(HTTPException) as error:
-                    self.start_request({"model": model})
+                    self.start_request({"goal": "inspect", "model": model})
                 self.assertEqual(error.exception.status_code, 400)
                 start.assert_not_called()
 
     def test_missing_model_uses_default_and_running_run_is_rejected(self):
         with patch("app.get_ollama_models", return_value=[{"name": app.MODEL}]), patch.object(app.EXPLORER, "start", return_value=False) as start:
             with self.assertRaises(HTTPException) as error:
-                self.start_request({})
+                self.start_request({"goal": "inspect"})
         self.assertEqual(error.exception.status_code, 409)
-        start.assert_called_once_with(explorer_module.TARGET, app.MODEL)
+        start.assert_called_once_with(explorer_module.TARGET, app.MODEL, goal="inspect", model_settings=None,
+                                      scenario_source="manual", chain_mode="none", budgets=None)
 
     def test_start_reports_unavailable_ollama_and_blocks_cross_site(self):
         with patch("app.get_ollama_models", side_effect=RuntimeError("Ollama 연결 실패")), patch.object(app.EXPLORER, "start") as start:
             with self.assertRaises(HTTPException) as error:
-                self.start_request({"model": "other:7b"})
+                self.start_request({"goal": "inspect", "model": "other:7b"})
             self.assertEqual(error.exception.status_code, 503)
             with self.assertRaises(HTTPException) as error:
                 self.start_request({}, origin="https://example.com")

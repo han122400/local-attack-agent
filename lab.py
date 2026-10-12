@@ -3,6 +3,7 @@
 import json
 import subprocess
 import threading
+import time
 from urllib.request import urlopen
 
 CONTAINER = "juice-lab"
@@ -70,3 +71,65 @@ def start_lab() -> dict:
         if result.returncode:
             raise RuntimeError("컨테이너 시작 실패 · Docker Desktop에서 juice-lab의 로그와 포트를 확인하세요.")
         return get_status()
+
+
+def _probe_initial_state() -> dict:
+    """Check reset data, not only server reachability or container mounts."""
+    with urlopen(TARGET + "rest/products/search?q=", timeout=5) as response:
+        products = json.load(response)
+    with urlopen(TARGET + "api/Challenges/", timeout=5) as response:
+        challenges = json.load(response)
+    product_rows = products.get("data") if isinstance(products, dict) else None
+    challenge_rows = challenges.get("data") if isinstance(challenges, dict) else None
+    if not isinstance(product_rows, list) or not isinstance(challenge_rows, list):
+        raise RuntimeError("Juice Shop 초기 데이터 형식이 올바르지 않습니다.")
+    solved = sum(bool(item.get("solved")) for item in challenge_rows if isinstance(item, dict))
+    verified = (products.get("status") == "success" and challenges.get("status") == "success"
+                and len(product_rows) == 46 and len(challenge_rows) == 116 and solved == 0
+                and any(item.get("name") == "Apple Juice (1000ml)" for item in product_rows if isinstance(item, dict)))
+    return {"verified": verified, "products": len(product_rows), "challenges": len(challenge_rows),
+            "solved": solved, "apple_juice_present": any(item.get("name") == "Apple Juice (1000ml)"
+                                                   for item in product_rows if isinstance(item, dict))}
+
+
+def reset_lab(*, wait_seconds: float = 45) -> dict:
+    """Restart the existing fixed container and verify its reseeded data."""
+    with _start_lock:
+        try:
+            inspected = _docker("inspect", CONTAINER, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("juice-lab 설정을 확인할 수 없습니다.") from exc
+        if inspected.returncode:
+            raise RuntimeError("기존 juice-lab 컨테이너를 찾을 수 없습니다.")
+        try:
+            items = json.loads(inspected.stdout)
+            info = items[0]
+            image = info["Config"]["Image"]
+            mounts = info["Mounts"]
+            published = info["NetworkSettings"]["Ports"]["3000/tcp"]
+        except (ValueError, TypeError, KeyError, IndexError) as exc:
+            raise RuntimeError("juice-lab 설정 형식을 확인할 수 없습니다.") from exc
+        if (image != "bkimminich/juice-shop:v20.2.0" or mounts != []
+                or not any(item.get("HostIp") == "127.0.0.1" and item.get("HostPort") == "3000"
+                           for item in published)):
+            raise RuntimeError("juice-lab 이미지·마운트·포트가 예상한 실험환경과 다릅니다.")
+        try:
+            restarted = _docker("restart", CONTAINER, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("juice-lab 재시작 결과를 확인하지 못했습니다.") from exc
+        if restarted.returncode:
+            raise RuntimeError("juice-lab 재시작에 실패했습니다.")
+        deadline = time.monotonic() + max(0, wait_seconds)
+        last_error = ""
+        while True:
+            try:
+                probe = _probe_initial_state()
+                if probe.get("verified"):
+                    return {"container": CONTAINER, "image": image, "verified": True,
+                            "probe": probe, "checked_at": time.time()}
+                last_error = f"초기 데이터 불일치: {probe}"
+            except (OSError, ValueError, RuntimeError) as exc:
+                last_error = str(exc)[:300]
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"juice-lab 초기화 검증 실패: {last_error}")
+            time.sleep(min(0.5, deadline - time.monotonic()))

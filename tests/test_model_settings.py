@@ -31,8 +31,8 @@ def start_request(body):
 class ModelSettingsTests(unittest.TestCase):
     def test_custom_settings_reach_the_run_from_start_api(self):
         settings = {"think": True, "keep_alive": "10m", "options": {"temperature": 0.7, "num_ctx": 16384, "num_predict": 2048, "top_k": 20}}
-        with patch("app.get_ollama_models", return_value=[{"name": "qwen3.5:9b"}]), patch.object(app.EXPLORER, "start", return_value=True) as start:
-            self.assertEqual(start_request({"model": "qwen3.5:9b", "model_settings": settings}), {"started": True})
+        with patch("app.get_ollama_models", return_value=[{"name": "qwen3.5:9b"}]), patch.object(app.EXPLORER, "start", return_value="a" * 32) as start:
+            self.assertEqual(start_request({"goal": "inspect", "model": "qwen3.5:9b", "model_settings": settings})["run_id"], "a" * 32)
         self.assertEqual(start.call_args.kwargs.get("model_settings"), settings)
 
     def test_bad_settings_are_rejected_before_starting(self):
@@ -43,7 +43,7 @@ class ModelSettingsTests(unittest.TestCase):
         for settings in invalid:
             with self.subTest(settings=settings), patch("app.get_ollama_models", return_value=[{"name": app.MODEL}]), patch.object(app.EXPLORER, "start") as start:
                 with self.assertRaises(HTTPException) as error:
-                    start_request({"model_settings": settings})
+                    start_request({"goal": "inspect", "model_settings": settings})
                 self.assertEqual(error.exception.status_code, 400)
                 start.assert_not_called()
 

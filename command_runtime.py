@@ -460,7 +460,7 @@ class CommandRuntime:
             self.log.append("exec_finished", {"exec_id": exec_id, "call_id": call_id, **asdict(result)})
         return result
 
-    def stop(self, run_id: str, timeout: float = 10) -> None:
+    def stop(self, run_id: str, timeout: float = 10, *, record: bool = True) -> None:
         self._check_run(run_id)
         self._cancel.set()
         worker = self._worker
@@ -470,8 +470,8 @@ class CommandRuntime:
             except OSError:
                 pass
         deadline = time.monotonic() + timeout
+        errors = []
         for pid, record in list(self._owned.items()):
-            process = self._worker if self._worker and self._worker.pid == pid else None
             try:
                 current = psutil.Process(pid)
                 if abs(current.create_time() - record["created_at"]) > 0.01:
@@ -487,22 +487,51 @@ class CommandRuntime:
                     raise RuntimeError("Owned process did not stop")
             except psutil.NoSuchProcess:
                 pass
+            except Exception as exc:
+                errors.append(exc)
+                continue
             self._owned.pop(pid, None)
-            self.log.append("process_stopped", {"exec_id": record["exec_id"], "process": record})
-        self.log.update(managed_processes=[])
+            if record:
+                try:
+                    self.log.append("process_stopped", {"exec_id": record["exec_id"], "process": record})
+                except Exception as exc:
+                    errors.append(exc)
+        if record:
+            try:
+                self.log.update(managed_processes=list(self._owned.values()))
+            except Exception as exc:
+                errors.append(exc)
         if self._conn is not None:
             self._conn.close()
             self._conn = None
         if worker is not None:
-            worker.wait(timeout=max(0.1, deadline - time.monotonic()))
+            try:
+                worker.wait(timeout=max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired as exc:
+                errors.append(exc)
         for thread in self._output_threads:
             thread.join(timeout=max(0.1, deadline - time.monotonic()))
         self._worker = None
-        self.log.append("runtime_stopped", {})
+        if record:
+            try:
+                self.log.append("runtime_stopped", {})
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            raise RuntimeError("Runtime stop incomplete: " + "; ".join(str(item) for item in errors))
 
     def cancel(self) -> None:
         """Signal in-flight work; finalization performs the owned-process stop."""
         self._cancel.set()
+
+    def restore_owned(self, run_id: str, records: list[dict]) -> None:
+        """Load only the process identities recorded by this run for crash recovery."""
+        self._check_run(run_id)
+        for record in records:
+            if (not isinstance(record, dict) or record.get("run_id") != run_id
+                    or type(record.get("pid")) is not int or type(record.get("created_at")) not in (int, float)):
+                raise RuntimeError("Invalid owned process identity")
+        self._owned = {record["pid"]: dict(record) for record in records}
 
     def export_evidence(self, run_id: str) -> list[dict]:
         self._check_run(run_id)

@@ -448,12 +448,12 @@ class Explorer:
         return ({"api": 0, "page": 1, "form": 1, "route": 2, "script": 3}.get(kind, 4), 0 if url.endswith("main.js") else 1)
 
 
-from explorer import V2Explorer  # noqa: E402 - keep the v1 implementation available for its regression tests.
+from explorer import ExplorerV3  # noqa: E402 - v1 helpers above remain for unrelated regression tests.
 from lab import get_status as get_lab_status, start_lab
 from model_settings import settings_schema, validate_model_settings, model_presets
 
 
-EXPLORER = V2Explorer()
+EXPLORER = ExplorerV3()
 app = FastAPI(title="Juice Explorer", docs_url=None, redoc_url=None)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1"])
 
@@ -593,39 +593,97 @@ async def start(request: Request) -> dict:
     check_origin(request)
     try:
         body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
-        target = body.get("target", TARGET) if isinstance(body, dict) else TARGET
-        model = body.get("model", MODEL) if isinstance(body, dict) else MODEL
+        if not isinstance(body, dict):
+            raise ValueError("실험 설정은 JSON 객체여야 합니다.")
+        target = body.get("target", TARGET)
+        model = body.get("model", MODEL)
+        goal = body.get("goal", "")
+        if not isinstance(goal, str) or not goal.strip():
+            raise ValueError("수동 시나리오의 목표를 입력하세요.")
+        scenario_source = body.get("scenario_source", "manual")
+        chain_mode = body.get("chain_mode", "none")
         if not isinstance(model, str) or not model.strip() or len(model) > 256:
             raise ValueError("설치된 Ollama 모델을 선택하세요.")
         models = await run_in_threadpool(get_ollama_models)
         if model not in {item["name"] for item in models}:
             raise ValueError(f"설치된 Ollama 모델을 찾지 못했습니다: {model}. 모델 목록을 새로고침하세요.")
-        if isinstance(body, dict) and "model_settings" in body:
-            settings = validate_model_settings(body["model_settings"])
-            started = EXPLORER.start(target, model, model_settings=settings)
-        else:
-            started = EXPLORER.start(target, model)
+        settings = validate_model_settings(body["model_settings"]) if "model_settings" in body else None
+        started = EXPLORER.start(target, model, goal=goal, model_settings=settings,
+                                 scenario_source=scenario_source, chain_mode=chain_mode,
+                                 budgets=body.get("budgets"))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if not started:
         raise HTTPException(status_code=409, detail="Already running")
-    return {"started": True}
+    return {"started": True, "run_id": started, "run_url": f"/runs/{started}"}
 
 
 @app.post("/api/stop")
-def stop(request: Request) -> dict:
+def stop(request: Request, run_id: str) -> dict:
     check_origin(request)
-    EXPLORER.stop()
+    if not EXPLORER.stop(run_id):
+        raise HTTPException(status_code=409, detail="해당 실험은 실행 중이 아닙니다.")
     return {"stopping": True}
 
 
 @app.post("/api/reset")
-def reset(request: Request) -> dict:
+def reset(request: Request, run_id: str) -> dict:
     check_origin(request)
-    EXPLORER.reset()
-    return {"reset": True}
+    try:
+        recovered = EXPLORER.recover(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="실험을 찾을 수 없습니다.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if not recovered:
+        raise HTTPException(status_code=409, detail="복구할 수 없는 실험 상태입니다.")
+    return {"recovering": True, "run_id": run_id}
+
+
+@app.get("/api/runs/{run_id}")
+def run_state(run_id: str) -> JSONResponse:
+    try:
+        state = EXPLORER.get_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="실험을 찾을 수 없습니다.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    live = EXPLORER.active_run_id == run_id and bool(EXPLORER.worker and EXPLORER.worker.is_alive())
+    return JSONResponse({**state, "live_available": live}, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/runs/{run_id}/stop")
+def run_stop(run_id: str, request: Request) -> dict:
+    check_origin(request)
+    try:
+        EXPLORER.get_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="실험을 찾을 수 없습니다.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not EXPLORER.stop(run_id):
+        raise HTTPException(status_code=409, detail="해당 실험은 실행 중이 아닙니다.")
+    return {"stopping": True, "run_id": run_id}
+
+
+@app.post("/api/runs/{run_id}/reset")
+def run_reset(run_id: str, request: Request) -> dict:
+    check_origin(request)
+    try:
+        recovered = EXPLORER.recover(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="실험을 찾을 수 없습니다.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if not recovered:
+        raise HTTPException(status_code=409, detail="복구할 수 없는 실험 상태입니다.")
+    return {"recovering": True, "run_id": run_id}
 
 
 @app.get("/api/lab")
