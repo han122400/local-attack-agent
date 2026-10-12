@@ -28,7 +28,7 @@ async function loadModels() {
   updateModelControls();
   try {
     const response = await fetch('/api/models', { cache: 'no-store' });
-    if (response.status === 404) throw new Error('서버 재시작 필요 · 실행 창에서 Ctrl+C 후 run.cmd를 다시 실행하세요.');
+    if (response.status === 404) throw new Error('서버 재시작 필요 · 실행 창에서 Ctrl+C 후 가상환경의 Python으로 app.py를 다시 실행하세요.');
     const body = await response.json();
     if (!response.ok) throw new Error(body.detail || `HTTP ${response.status}`);
     const options = body.models.map(model => {
@@ -111,8 +111,9 @@ function evidenceCard(record, kind) {
   const main = kind === '화면' ? `${record.title || '제목 없음'} · ${record.url}`
     : kind === '행동' ? `${record.label} · ${record.before_screen_id || '시작'} → ${record.after_screen_id || '진행 중'}`
     : kind === '요청' ? `${record.method} ${record.url}`
-    : `HTTP ${record.status} · ${record.content_type || '응답 유형 없음'} · ${record.bytes} bytes`;
+    : `HTTP ${record.status} · ${record.content_type || '응답 유형 없음'} · ${record.bytes ?? '—'} bytes`;
   card.append(text('div', main, 'evidence-main'));
+  if (record.error) card.append(text('div', `응답 수집 실패: ${record.error}`, 'result-error'));
   const relation = kind === '화면' ? `행동 ${record.action_id || '—'} · 요소 ${record.element_ids?.length || 0}개`
     : kind === '행동' ? `요청 ${(record.request_ids || []).join(', ') || '없음'}`
     : kind === '요청' ? `행동 ${record.action_id || '—'} · 쿼리 ${Object.keys(record.query || {}).join(', ') || '없음'}`
@@ -188,7 +189,7 @@ function renderExperiments(experiments) {
   for (const item of experiments) {
     const card = document.createElement('article'); card.className = 'result-card';
     const head = document.createElement('div'); head.className = 'result-head';
-    head.append(text('strong', `${item.id} · ${item.hypothesis_id}`), text('span', item.result, `badge ${item.result === '예상한 변화 관찰' ? 'yes' : 'no'}`));
+    head.append(text('strong', `${item.id} · ${item.hypothesis_id}`), text('span', item.result, `badge ${item.result === '변화 관찰' ? 'yes' : 'no'}`));
     card.append(head);
     if (item.hypothesis_verdict) card.append(text('div', `가설 판정: ${item.hypothesis_verdict} · ${item.note || ''}`, 'result-detail'));
     const refs = document.createElement('div'); refs.className = 'evidence-refs';
@@ -268,7 +269,7 @@ function renderPlan(state) {
   planSignature = signature;
   const plan = state.plan?.length ? state.plan : [state.planner_version
     ? '첫 화면을 관찰하면 LLM이 계획을 세웁니다.'
-    : '이 기록은 이전 고정 탐색 방식입니다. run.cmd로 서버를 재시작하면 새 실행에 LLM 계획이 적용됩니다.'];
+    : '이 기록은 이전 고정 탐색 방식입니다. app.py로 서버를 재시작하면 새 실행에 LLM 계획이 적용됩니다.'];
   $('planList').replaceChildren(...plan.map(step => text('li', step)));
   $('decisionCount').textContent = `${decisions.length} decisions`;
   const cards = decisions.slice(-5).reverse().map(decision => {
@@ -350,7 +351,7 @@ async function pollLab() {
     const response = await fetch('/api/lab', { cache: 'no-store' });
     if (response.status === 404) {
       labState = {
-        message: '대시보드 서버 재시작 필요 · 실행 창에서 Ctrl+C 후 run.cmd를 다시 실행하세요.',
+        message: '대시보드 서버 재시작 필요 · 실행 창에서 Ctrl+C 후 가상환경의 Python으로 app.py를 다시 실행하세요.',
         status: 'error', can_start: false,
       };
       return;

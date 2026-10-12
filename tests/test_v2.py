@@ -62,5 +62,118 @@ class V2GuardTests(unittest.TestCase):
         self.assertEqual(explorer.snapshot()["step"], 0)
 
 
+class ComparisonRegressionTests(unittest.TestCase):
+    def response(self, value):
+        import json
+        return {"status": 200, "content_type": "application/json",
+                **v2.summarize_body(json.dumps(value).encode(), "application/json")}
+
+    def test_array_tail_and_missing_null_are_real_changes(self):
+        before = list(range(11))
+        after = before.copy()
+        after[10] = 999
+        for left, right, path in (
+            ({"items": before}, {"items": after}, "$.items[10]"),
+            ({"meta": {"x": None}}, {"meta": {}}, "$.meta.x"),
+            ({"items": [None]}, {"items": []}, "$.items[0]"),
+            ({"items": []}, {"items": [None]}, "$.items[0]"),
+        ):
+            with self.subTest(path=path):
+                difference = v2.compare_responses(self.response(left), self.response(right))
+                self.assertTrue(difference["meaningful_change"])
+                self.assertEqual(difference["json_differences"][0]["path"], path)
+
+    def test_detail_limit_does_not_hide_changes(self):
+        difference = v2.compare_responses(self.response(list(range(30))), self.response([-1] * 30))
+        self.assertTrue(difference["meaningful_change"])
+        self.assertEqual(len(difference["json_differences"]), 20)
+
+
+class CancellationRegressionTests(unittest.TestCase):
+    def test_stalled_model_can_stop_reset_and_restart(self):
+        import asyncio
+        import threading
+        import httpx2 as httpx
+        from unittest.mock import patch
+
+        entered = threading.Event()
+        closed = threading.Event()
+        class StalledStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                entered.set()
+                await asyncio.Event().wait()
+                yield b""
+            async def aclose(self):
+                closed.set()
+        class ModelOnlyExplorer(v2.V2Explorer):
+            async def _run(self, gen):
+                self.loop = asyncio.get_running_loop()
+                self.task = asyncio.current_task()
+                await self._ask_json(gen, {}, "test", {})
+        client_type = httpx.AsyncClient
+        def client(**kwargs):
+            return client_type(transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, stream=StalledStream())), **kwargs)
+        explorer = ModelOnlyExplorer()
+        with patch("v2.httpx.AsyncClient", side_effect=client):
+            try:
+                self.assertTrue(explorer.start())
+                self.assertTrue(entered.wait(2))
+                explorer.stop()
+                explorer.worker.join(2)
+                self.assertFalse(explorer.worker.is_alive())
+                self.assertTrue(closed.is_set())
+                self.assertEqual(explorer.snapshot()["status"], "stopped")
+                entered.clear()
+                closed.clear()
+                self.assertTrue(explorer.start())
+                self.assertTrue(entered.wait(2))
+                explorer.reset()
+                self.assertFalse(explorer.worker.is_alive())
+                self.assertTrue(closed.is_set())
+                self.assertEqual(explorer.snapshot()["status"], "idle")
+                self.assertEqual(explorer.snapshot()["console"], "")
+            finally:
+                explorer.stop()
+                explorer.worker.join(2)
+
+    def test_overall_budget_cancels_a_stalled_run(self):
+        import asyncio
+        from unittest.mock import patch
+        class StalledExplorer(v2.V2Explorer):
+            async def _run(self, gen):
+                await asyncio.Event().wait()
+        explorer = StalledExplorer()
+        with patch("v2.MAX_SECONDS", 0.05):
+            explorer.start()
+            explorer.worker.join(2)
+        self.assertFalse(explorer.worker.is_alive())
+        self.assertEqual(explorer.snapshot()["status"], "error")
+        self.assertIn("전체 실행 시간", explorer.snapshot()["message"])
+
+
+class CaptureRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stalled_body_is_recorded_as_error_and_not_offered_for_experiment(self):
+        import asyncio
+        import time
+        from test_planner import observed_run
+        explorer, _, request, _ = observed_run()
+        explorer.state["observations"]["responses"].clear()
+        explorer._deadline = time.monotonic() + 0.05
+        response = type("Response", (), {"request": object(), "status": 200,
+                        "headers": {"content-type": "application/json"}, "url": v2.TARGET})()
+        async def stalled_body():
+            await asyncio.Event().wait()
+        response.body = stalled_body
+        tracker = v2._Tracker(explorer, 0, None)
+        tracker.request_ids[response.request] = request["id"]
+        tracker.on_response(response)
+        await asyncio.wait_for(tracker.flush(), 1)
+        recorded = explorer.state["observations"]["responses"][0]
+        self.assertIn("error", recorded)
+        self.assertTrue(recorded["truncated"])
+        self.assertEqual(explorer._eligible(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,8 @@
 로컬 Ollama 모델이 OWASP Juice Shop의 화면과 네트워크 관찰을 바탕으로 탐색 계획과 다음 행동을 선택하는 실험 프로젝트입니다. FastAPI 대시보드에서 계획, 모델 출력, 관찰 기록, 가설과 응답 비교 결과를 확인할 수 있습니다.
 
 현재 구현의 대상은 `http://127.0.0.1:3000/`으로 제한됩니다. 응답 차이는 관찰 결과로 기록하며 취약점 확정을 의미하지 않습니다.
+브라우저의 WebSocket 연결은 모두 차단하고 HTTP 조회만 사용합니다. 실행은 최대 10분이며,
+응답 본문 수집은 최대 8초입니다. 수집 실패 응답은 오류로 기록하고 실험 후보에서 제외합니다.
 
 ## 실행 환경
 
@@ -21,6 +23,14 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m playwright install chromium
 ```
 
+macOS/Linux에서는 다음 명령을 사용합니다.
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m playwright install chromium
+```
+
 Juice Shop 실습 컨테이너를 준비합니다.
 
 ```powershell
@@ -33,6 +43,12 @@ docker run -d --name juice-lab -p 127.0.0.1:3000:3000 bkimminich/juice-shop:v20.
 ```powershell
 .\.venv\Scripts\python.exe app.py
 ```
+
+macOS/Linux에서는 `.venv/bin/python app.py`로 시작합니다.
+
+테스트는 Windows에서 `.\.venv\Scripts\python.exe -m unittest discover -s tests -v`,
+macOS/Linux에서 `.venv/bin/python -m unittest discover -s tests -v`로 실행합니다.
+브라우저 테스트에는 위에서 설치한 Chromium이 필요하며, 모델 응답과 사이트는 모의 데이터로 검증합니다.
 
 브라우저에서 <http://127.0.0.1:8765/>에 접속해 설치된 모델을 선택합니다. Ollama 연결 주소는 `http://127.0.0.1:11434`입니다.
 
