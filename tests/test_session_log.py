@@ -91,6 +91,28 @@ class SessionLogTests(unittest.TestCase):
             self.assertEqual(len(recovered.read_events(after_seq=1000)), event["seq"] - 1000)
             recovered.close()
 
+    def test_missing_metadata_with_unknown_owned_resource_stays_blocked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            directory = root / RUN_ID
+            (directory / "runtime").mkdir(parents=True)
+            store = SessionStore(root)
+            self.assertFalse(store.can_start()[0])
+            with self.assertRaises(LogFailure):
+                store.repair_unowned_metadata(RUN_ID)
+            self.assertTrue((directory / "runtime").exists())
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            directory = root / RUN_ID
+            directory.mkdir()
+            event = {"run_id": RUN_ID, "seq": 1, "kind": "process_started", "at": 1,
+                     "process": {"pid": 123, "created_at": 1}}
+            (directory / "events.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+            store = SessionStore(root)
+            with self.assertRaises(LogFailure):
+                store.repair_unowned_metadata(RUN_ID)
+            self.assertFalse((directory / "session.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

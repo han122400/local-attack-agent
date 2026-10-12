@@ -213,9 +213,13 @@ class SessionLog:
     def flush(self) -> None:
         with self._lock:
             self._require_open()
-            for path in (self.events_path, self.session_path):
-                with path.open("r+b") as stream:
-                    os.fsync(stream.fileno())
+            try:
+                for path in (self.events_path, self.session_path):
+                    with path.open("r+b") as stream:
+                        os.fsync(stream.fileno())
+            except Exception as exc:
+                self.failed = True
+                raise LogFailure(f"Session flush failed: {exc}") from exc
 
     def close(self) -> None:
         with self._lock:

@@ -71,7 +71,12 @@ class ExplorerV3:
         with self.lock:
             if self.worker and self.worker.is_alive():
                 return False, "Another run is active or finalizing"
-            return self.store.can_start()
+            if not self.lease.acquire():
+                return False, "Another controller owns the local lab"
+            try:
+                return self.store.can_start()
+            finally:
+                self.lease.release()
 
     def start(self, target: str = TARGET, model: str = MODEL, *, goal: str = "Explore the local lab",
               model_settings: dict | None = None, scenario_source: str = "manual", chain_mode: str = "none",
@@ -213,43 +218,59 @@ class ExplorerV3:
 
     def _finalize(self, run_id: str, log: SessionLog, runtime: CommandRuntime,
                   run_result: str, reason: str) -> None:
+        configured = log.metadata.get("budgets")
+        configured = configured if isinstance(configured, dict) else {}
+        budget = configured.get("finalize_seconds", DEFAULT_BUDGETS["finalize_seconds"])
+        budget = budget if type(budget) is int and budget > 0 else DEFAULT_BUDGETS["finalize_seconds"]
+        deadline = time.monotonic() + budget
+        def remaining(cap: float) -> float:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("Finalization time budget exhausted")
+            return min(cap, left)
         try:
             log.update(run_result=run_result, finish_reason=reason, phase="finalizing")
             log.append("finalize_started", {"run_result": run_result, "reason": reason})
             if log.metadata.get("cleanup_status") != "succeeded" or runtime.inspect(run_id)["runtime_exists"] or runtime.inspect(run_id)["managed_processes"]:
                 log.update(cleanup_status="running")
-                runtime.stop(run_id, 20)
+                runtime.stop(run_id, remaining(20))
                 if runtime.inspect(run_id)["managed_processes"]:
                     raise RuntimeError("Managed processes remain after stop")
                 log.append("cleanup_step", {"step": "stop", "status": "succeeded"})
                 if log.metadata.get("log_status") not in {"preserved", "finalized"}:
                     if log.metadata.get("log_status") == "failed" and log.metadata.get("runtime_creation_intent") and not runtime.inspect(run_id)["runtime_exists"]:
                         raise RuntimeError("Evidence source is missing after log failure")
+                    remaining(120)
                     runtime.export_evidence(run_id)
+                    remaining(120)
                     log.update(log_status="preserved")
                     log.append("cleanup_step", {"step": "evidence", "status": "succeeded"})
-                runtime.destroy(run_id, 20)
+                runtime.destroy(run_id, remaining(20))
                 if runtime.inspect(run_id)["runtime_exists"]:
                     raise RuntimeError("Runtime folder remains after destroy")
                 log.update(cleanup_status="succeeded")
                 log.append("cleanup_step", {"step": "destroy", "status": "succeeded"})
             if log.metadata.get("lab_reset_status") != "succeeded":
                 log.update(phase="resetting", lab_reset_status="running")
+                remaining(120)
                 probe = self.lab_reset()
+                remaining(120)
                 if not isinstance(probe, dict) or not probe.get("verified"):
                     raise RuntimeError("Lab reset probe failed")
                 log.append("lab_reset", {"probe": probe, "status": "succeeded"})
                 log.update(lab_reset_status="succeeded")
             log.append("run_finalized", {"run_result": run_result, "reason": reason})
-            log.update(phase="finished", log_status="finalized", finished_at=time.time())
+            remaining(120)
             log.flush()
+            remaining(120)
+            log.update(phase="finished", log_status="finalized", cleanup_error="", finished_at=time.time())
             with self.lock:
                 self._recent_state.update(status=run_result, phase="finished", finish_reason=reason,
                                           finished_at=log.metadata["finished_at"])
         except Exception as exc:
             # A failed writer must still stop owned processes, while retaining
             # runtime files for an explicit recovery attempt.
-            if log.failed:
+            if log.failed or isinstance(exc, LogFailure):
                 try:
                     runtime.stop(run_id, 20, record=False)
                 except Exception:

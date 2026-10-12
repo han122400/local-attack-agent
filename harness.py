@@ -109,6 +109,10 @@ class Harness:
                 last_error = exc
                 if exc.kind != "format" or self.calls >= self.max_calls:
                     raise
+                payload = {**payload, "messages": [*payload["messages"],
+                    {"role": "user", "content": "The previous response was invalid: " + str(exc)[:220]
+                     + ". Return one short, complete JSON Command. For run_python put Python in code; "
+                       "content must be empty. Keep the command concise enough to finish within the output limit."}]}
             except (httpx.HTTPError, OSError, TimeoutError, json.JSONDecodeError) as exc:
                 failure = ModelFailure("transport", str(exc)[:300], call_id)
                 self.log.append("model_error", {"call_id": call_id, "error_kind": failure.kind,

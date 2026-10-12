@@ -7,8 +7,10 @@ for arbitrary CMD or Python code.
 from __future__ import annotations
 
 import hashlib
+import codecs
 import json
 import os
+import signal
 import select
 import shutil
 import socket
@@ -26,6 +28,56 @@ import psutil
 from session_log import LogFailure, SessionLog, safe_relative_path, validate_run_id
 
 
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    class _BasicLimit(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64), ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t), ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD), ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD), ("SchedulingClass", wintypes.DWORD)]
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint64) for name in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+    class _ExtendedLimit(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", _BasicLimit), ("IoInfo", _IoCounters),
+                    ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    _kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                   ctypes.c_void_p, wintypes.DWORD]
+    _kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    _kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+
+def _new_process_job(process: subprocess.Popen):
+    """Hold a Windows kill-on-close job for the process and its descendants."""
+    if os.name != "nt":
+        return None
+    job = _kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+    try:
+        limits = _ExtendedLimit()
+        limits.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not _kernel32.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            raise OSError(ctypes.get_last_error(), "SetInformationJobObject failed")
+        if not _kernel32.AssignProcessToJobObject(job, wintypes.HANDLE(int(process._handle))):
+            raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
+        return job
+    except Exception:
+        _kernel32.CloseHandle(job)
+        raise
+
+
 def installed_chromium() -> str | None:
     configured = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE")
     if configured and Path(configured).is_file():
@@ -37,6 +89,7 @@ def installed_chromium() -> str | None:
 
 WORKER_SOURCE = r'''import ast
 import asyncio
+import contextlib
 import inspect
 import json
 import os
@@ -97,27 +150,31 @@ async def main():
                     continue
                 exec_id = message["exec_id"]
                 source = Path(message["path"])
-                try:
-                    namespace = {"__name__": "__agent__", "__file__": str(source),
-                                 "browser": browser, "context": context, "page": page, "asyncio": asyncio}
-                    compiled = compile(source.read_text(encoding="utf-8"), str(source), "exec",
-                                       flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
-                    result = eval(compiled, namespace, namespace)
-                    if inspect.isawaitable(result):
-                        await result
-                    entry = namespace.get("main")
-                    if callable(entry):
-                        result = entry(page, context, browser)
-                        if inspect.isawaitable(result):
-                            await result
-                    sys.stdout.flush()
-                    sys.stderr.flush()
-                    send(sock, {"type": "result", "exec_id": exec_id, "exit_code": 0, "exception": ""})
-                except BaseException:
-                    detail = traceback.format_exc()
-                    print(detail, file=sys.stderr, flush=True)
-                    send(sock, {"type": "result", "exec_id": exec_id, "exit_code": 1,
-                                "exception": detail[-4000:]})
+                with open(message["stdout_path"], "w", encoding="utf-8", buffering=1) as out, \
+                     open(message["stderr_path"], "w", encoding="utf-8", buffering=1) as err:
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        try:
+                            namespace = {"__name__": "__agent__", "__file__": str(source),
+                                         "browser": browser, "context": context, "page": page, "asyncio": asyncio}
+                            compiled = compile(source.read_text(encoding="utf-8"), str(source), "exec",
+                                               flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                            result = eval(compiled, namespace, namespace)
+                            if inspect.isawaitable(result):
+                                await result
+                            entry = namespace.get("main")
+                            if callable(entry):
+                                result = entry(page, context, browser)
+                                if inspect.isawaitable(result):
+                                    await result
+                            exit_code, detail = 0, ""
+                        except BaseException:
+                            detail = traceback.format_exc()
+                            print(detail, file=sys.stderr, flush=True)
+                            exit_code = 1
+                        out.flush()
+                        err.flush()
+                send(sock, {"type": "result", "exec_id": exec_id, "exit_code": exit_code,
+                            "exception": detail[-4000:]})
         finally:
             await context.close()
             await browser.close()
@@ -153,10 +210,12 @@ class CommandRuntime:
         self._lock = threading.RLock()
         self._cancel = threading.Event()
         self._owned: dict[int, dict] = {}
+        self._jobs: dict[int, object] = {}
         self._worker: subprocess.Popen | None = None
         self._conn: socket.socket | None = None
         self._control_buffer = b""
         self._active_exec_id: str | None = None
+        self._call_by_exec: dict[str, str] = {}
         self._output: dict[str, dict] = {}
         self._output_error: LogFailure | None = None
         self._output_threads: list[threading.Thread] = []
@@ -192,26 +251,58 @@ class CommandRuntime:
                 self._start_browser_worker()
 
     def _register(self, process: subprocess.Popen, role: str, exec_id: str = "") -> None:
-        created = psutil.Process(process.pid).create_time()
+        try:
+            job = _new_process_job(process)
+        except Exception:
+            process.kill()
+            process.wait(timeout=5)
+            raise
+        try:
+            created = psutil.Process(process.pid).create_time()
+        except Exception:
+            if job is not None:
+                self._jobs[process.pid] = job
+                self._close_job(process.pid, terminate=True)
+            process.wait(timeout=5)
+            raise
         record = {"pid": process.pid, "created_at": created, "role": role, "exec_id": exec_id,
                   "run_id": self.run_id}
         self._owned[process.pid] = record
+        if job is not None:
+            self._jobs[process.pid] = job
         try:
             self.log.update(managed_processes=list(self._owned.values()))
             self.log.append("process_started", {"exec_id": exec_id, "process": record})
         except Exception:
             self._kill_tree(process, record)
             self._owned.pop(process.pid, None)
+            self._close_job(process.pid)
             raise
 
     def _unregister(self, process: subprocess.Popen) -> None:
+        if process.pid in self._jobs:
+            # A descendant can outlive CMD. Keep the job and ownership record
+            # until stop() terminates the whole group.
+            return
         record = self._owned.pop(process.pid, None)
         self.log.update(managed_processes=list(self._owned.values()))
         if record:
             self.log.append("process_stopped", {"exec_id": record["exec_id"], "process": record})
 
-    @staticmethod
-    def _kill_tree(process: subprocess.Popen, record: dict) -> None:
+    def _close_job(self, pid: int, *, terminate: bool = False) -> None:
+        job = self._jobs.pop(pid, None)
+        if job is None:
+            return
+        if terminate:
+            if not _kernel32.TerminateJobObject(job, 1):
+                error = ctypes.get_last_error()
+                _kernel32.CloseHandle(job)
+                raise OSError(error, "TerminateJobObject failed")
+        _kernel32.CloseHandle(job)
+
+    def _kill_tree(self, process: subprocess.Popen, record: dict) -> None:
+        if process.pid in self._jobs:
+            self._close_job(process.pid, terminate=True)
         try:
             current = psutil.Process(record["pid"])
             if abs(current.create_time() - record["created_at"]) > 0.01:
@@ -272,11 +363,13 @@ class CommandRuntime:
             raise RuntimeError("Browser worker is unavailable")
         self._conn.sendall((json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8"))
 
-    def _wait_control(self, timeout: float) -> dict:
+    def _wait_control(self, timeout: float, on_poll=None) -> dict:
         if self._conn is None:
             raise RuntimeError("Browser worker is unavailable")
         deadline = time.monotonic() + timeout
         while True:
+            if on_poll is not None:
+                on_poll()
             if b"\n" in self._control_buffer:
                 line, self._control_buffer = self._control_buffer.split(b"\n", 1)
                 return json.loads(line)
@@ -297,7 +390,9 @@ class CommandRuntime:
             if not chunk:
                 return
             try:
-                self.log.append("exec_output", {"exec_id": exec_id, "channel": channel, "text": chunk})
+                kind = "exec_output" if exec_id else "worker_output"
+                self.log.append(kind, {"exec_id": exec_id, "call_id": self._call_by_exec.get(exec_id, ""),
+                                       "channel": channel, "text": chunk})
             except LogFailure as exc:
                 self._output_error = exc
                 self._cancel.set()
@@ -319,8 +414,7 @@ class CommandRuntime:
                         chunk = stream.read(4096)
                         if not chunk:
                             break
-                        active = exec_id or self._active_exec_id or ""
-                        self._add_output(active, name, chunk.decode("utf-8", errors="replace"))
+                        self._add_output(exec_id, name, chunk.decode("utf-8", errors="replace"))
                 finally:
                     stream.close()
             thread = threading.Thread(target=read_output, daemon=True)
@@ -340,6 +434,24 @@ class CommandRuntime:
             if not target.parent.resolve().is_relative_to(self.runtime_dir):
                 raise ValueError("File path escapes runtime")
         return target
+
+    def _tail_python_output(self, paths: dict, offsets: dict, decoders: dict,
+                            exec_id: str, *, final: bool = False) -> None:
+        for channel, path in paths.items():
+            with path.open("rb") as stream:
+                stream.seek(offsets[channel])
+                while True:
+                    data = stream.read(65536)
+                    if not data:
+                        break
+                    offsets[channel] += len(data)
+                    chunk = decoders[channel].decode(data)
+                    if chunk:
+                        self._add_output(exec_id, channel, chunk)
+            if final:
+                remaining = decoders[channel].decode(b"", final=True)
+                if remaining:
+                    self._add_output(exec_id, channel, remaining)
 
     def _run_command(self, command: str, exec_id: str, timeout: float) -> int:
         shell = ["cmd.exe", "/D", "/S", "/C", command] if os.name == "nt" else ["/bin/sh", "-c", command]
@@ -381,6 +493,7 @@ class CommandRuntime:
         action = command.get("action", "") if isinstance(command, dict) else ""
         result = ExecutionResult(exec_id=exec_id, action=action)
         began = time.monotonic()
+        self._call_by_exec[exec_id] = call_id
         self.log.append("exec_started", {"exec_id": exec_id, "call_id": call_id, "action": action,
                                          "cwd": str(self.runtime_dir)})
         try:
@@ -418,9 +531,17 @@ class CommandRuntime:
                 snapshot = self.log.preserve_bytes(f"code/{exec_id}.py", code.encode("utf-8"))
                 result.artifact_path = snapshot["path"]
                 result.path = str(source)
-                self._active_exec_id = exec_id
-                self._send_control({"type": "execute", "exec_id": exec_id, "path": str(source)})
-                reply = self._wait_control(timeout)
+                paths = {name: self.runtime_dir / "tmp" / f"{exec_id}.{name}" for name in ("stdout", "stderr")}
+                for path in paths.values():
+                    path.touch()
+                offsets = {name: 0 for name in paths}
+                decoders = {name: codecs.getincrementaldecoder("utf-8")("replace") for name in paths}
+                def poll_output():
+                    self._tail_python_output(paths, offsets, decoders, exec_id)
+                self._send_control({"type": "execute", "exec_id": exec_id, "path": str(source),
+                                    "stdout_path": str(paths["stdout"]), "stderr_path": str(paths["stderr"])})
+                reply = self._wait_control(timeout, on_poll=poll_output)
+                self._tail_python_output(paths, offsets, decoders, exec_id, final=True)
                 if reply.get("type") != "result" or reply.get("exec_id") != exec_id:
                     raise RuntimeError("Browser worker response mismatch")
                 result.exit_code = reply.get("exit_code")
@@ -458,6 +579,7 @@ class CommandRuntime:
             if self._output_error is not None:
                 raise self._output_error
             self.log.append("exec_finished", {"exec_id": exec_id, "call_id": call_id, **asdict(result)})
+            self._call_by_exec.pop(exec_id, None)
         return result
 
     def stop(self, run_id: str, timeout: float = 10, *, record: bool = True) -> None:
@@ -473,6 +595,8 @@ class CommandRuntime:
         errors = []
         for pid, record in list(self._owned.items()):
             try:
+                if pid in self._jobs:
+                    self._close_job(pid, terminate=True)
                 current = psutil.Process(pid)
                 if abs(current.create_time() - record["created_at"]) > 0.01:
                     raise RuntimeError("Owned process PID was reused")
@@ -561,8 +685,17 @@ class CommandRuntime:
         expected = self.log.run_dir / "runtime"
         if self.runtime_dir != expected or self.runtime_dir.resolve() != expected.absolute():
             raise RuntimeError("Runtime path does not match owned session")
-        if self.runtime_dir.exists():
-            shutil.rmtree(self.runtime_dir)
+        deadline = time.monotonic() + timeout
+        while self.runtime_dir.exists():
+            try:
+                shutil.rmtree(self.runtime_dir)
+            except OSError as exc:
+                # Windows can retain a Chromium profile handle briefly after
+                # the job has terminated. A bounded retry preserves the
+                # cleanup gate if the handle is not released.
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"Runtime deletion failed: {exc}") from exc
+                time.sleep(0.2)
         if self.runtime_dir.exists():
             raise RuntimeError("Runtime folder remains")
         self.log.append("runtime_destroyed", {"runtime_path": str(self.runtime_dir)})
