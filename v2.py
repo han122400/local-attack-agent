@@ -329,7 +329,7 @@ class V2Explorer:
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            if isinstance(exc, TimeoutError):
+            if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
                 exc = TimeoutError(f"전체 실행 시간 {MAX_SECONDS}초 초과")
             with self.lock:
                 if gen == self.generation:
