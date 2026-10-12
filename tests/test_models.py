@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import unittest
@@ -9,6 +10,7 @@ from starlette.requests import Request
 
 import app
 import v2
+from model_transport import mock_model
 
 
 class ModelRouteTests(unittest.TestCase):
@@ -112,9 +114,9 @@ class RunModelTests(unittest.TestCase):
         request = {"id": "REQ-0001", "action_id": "ACT-0001", "method": "GET", "url": v2.TARGET + "rest/products/search?q=apple", "query": {"q": "apple"}}
         response = {"id": "RES-0001", "status": 200, "content_type": "application/json"}
         stream = io.BytesIO(b'{"message":{"content":"{}"}}\n')
-        with patch("v2.urlopen", return_value=stream) as opened:
-            self.assertEqual(explorer._ask_ollama(explorer.generation, request, response), ({}, ""))
-        sent = json.loads(opened.call_args.args[0].data)
+        with mock_model(return_value=stream) as opened:
+            self.assertEqual(asyncio.run(explorer._ask_ollama(explorer.generation, request, response)), ({}, ""))
+        sent = json.loads(opened.call_args.args[0].content)
         self.assertEqual(sent["model"], "other:7b")
         self.assertIs(sent["think"], False)
         self.assertIs(sent["stream"], True)
@@ -122,8 +124,8 @@ class RunModelTests(unittest.TestCase):
     def test_previous_generation_cannot_use_next_runs_model(self):
         explorer = v2.V2Explorer()
         explorer.generation = 2
-        with patch("v2.urlopen") as opened:
-            self.assertEqual(explorer._ask_ollama(1, {}, {}), (None, "중지됨"))
+        with mock_model() as opened:
+            self.assertEqual(asyncio.run(explorer._ask_ollama(1, {}, {})), (None, "중지됨"))
             opened.assert_not_called()
 
 

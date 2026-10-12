@@ -64,7 +64,7 @@
     const timer = setTimeout(() => controller.abort(), 6000);
     try {
       const response = await fetch('/api/ollama/ps', { cache: 'no-store', signal: controller.signal });
-      if (response.status === 404) throw new Error('서버 재시작 필요 · 실행 창에서 Ctrl+C 후 run.cmd를 다시 실행하세요.');
+      if (response.status === 404) throw new Error('서버 재시작 필요 · 실행 창에서 Ctrl+C 후 가상환경의 Python으로 app.py를 다시 실행하세요.');
       const body = await response.json();
       if (!response.ok) throw new Error(body.detail || `HTTP ${response.status}`);
       if (!Array.isArray(body.models)) throw new Error('실행 모델 목록 형식이 올바르지 않습니다.');

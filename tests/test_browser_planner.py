@@ -1,4 +1,5 @@
 """Real Chromium, fixture site, deterministic model transport; no Ollama or lab writes."""
+import asyncio
 import io
 import json
 import time
@@ -7,6 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
 
 import v2
+from model_transport import mock_model
 
 
 HTML = """<!doctype html><title>Fixture catalog</title>
@@ -35,7 +37,7 @@ class BrowserPlannerTests(unittest.IsolatedAsyncioTestCase):
 
         def answer(request, **kwargs):
             nonlocal plan_count
-            payload = json.loads(request.data)
+            payload = json.loads(request.content)
             prompt = json.loads(payload["messages"][1]["content"])
             transcripts.append(prompt)
             if "claim" in payload["format"]["properties"]:
@@ -93,7 +95,7 @@ class BrowserPlannerTests(unittest.IsolatedAsyncioTestCase):
                         return FixtureResponse(url)
                 class ExperimentContext:
                     request = FixtureHTTP()
-                with patch("v2.urlopen", side_effect=answer):
+                with mock_model(side_effect=answer):
                     await explorer._agent_loop(0, page, tracker, ExperimentContext(), screen)
                 self.assertEqual(await page.locator("input").input_value(), "Pear")
                 self.assertEqual([a["kind"] for a in explorer.state["observations"]["actions"]], ["open", "click", "search"])
@@ -106,6 +108,45 @@ class BrowserPlannerTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await context.close()
                 await browser.close()
+
+
+class WebSocketGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_production_browser_blocks_websockets_before_server_contact(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        received = threading.Event()
+        class Probe(BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.set()
+                self.send_response(400)
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Probe)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        explorer = v2.V2Explorer()
+        async def recon(gen, page, tracker):
+            await page.context.route(v2.TARGET, lambda route: route.fulfill(
+                content_type="text/html", body="<!doctype html><title>Socket guard fixture</title>"))
+            await page.goto(v2.TARGET)
+            result = await page.evaluate("""async urls => Promise.all(urls.map(url => new Promise(resolve => {
+                const socket = new WebSocket(url);
+                socket.onclose = event => resolve(event.code);
+            })))""", [f"ws://127.0.0.1:{server.server_port}/probe", "ws://127.0.0.1:3000/probe"])
+            self.assertEqual(result, [1008, 1008])
+            self.assertFalse(received.is_set())
+            self.assertEqual(explorer.state["blocked_requests"], 2)
+            return {}
+        async def finished(*args):
+            pass
+        try:
+            with patch.object(explorer, "_recon", side_effect=recon), patch.object(explorer, "_agent_loop", side_effect=finished):
+                await asyncio.wait_for(explorer._run(0), 10)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(2)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,8 @@ import asyncio
 from unittest.mock import patch
 
 import v2
+import httpx2 as httpx
+from model_transport import mock_model
 from planning import validate_decision
 
 
@@ -47,9 +49,9 @@ class PlanningRegressionTests(unittest.TestCase):
     def test_hypothesis_receives_action_and_response_evidence(self):
         explorer, _, request, response = observed_run()
         stream = io.BytesIO(b'{"message":{"content":"{}"}}\n')
-        with patch("v2.urlopen", return_value=stream) as opened:
-            explorer._ask_ollama(0, request, response)
-        prompt = json.loads(json.loads(opened.call_args.args[0].data)["messages"][1]["content"])
+        with mock_model(return_value=stream) as opened:
+            asyncio.run(explorer._ask_ollama(0, request, response))
+        prompt = json.loads(json.loads(opened.call_args.args[0].content)["messages"][1]["content"])
         self.assertEqual(prompt["observed_response"]["sample"]["items"][0]["name"], "Pear drink")
         self.assertEqual(prompt["observed_action"]["kind"], "open")
 
@@ -58,9 +60,9 @@ class PlanningRegressionTests(unittest.TestCase):
         explorer.state["experiments"].append({"id": "EXP-001", "result": "변화 관찰",
             "differences": {"baseline_vs_changed": {"changed_fields": [{"field": "list_length", "baseline": 46, "changed": 1}]}}})
         stream = io.BytesIO(b'{"message":{"content":"{}"}}\n')
-        with patch("v2.urlopen", return_value=stream) as opened:
-            explorer._ask_plan(0, screen)
-        prompt = json.loads(json.loads(opened.call_args.args[0].data)["messages"][1]["content"])
+        with mock_model(return_value=stream) as opened:
+            asyncio.run(explorer._ask_plan(0, screen))
+        prompt = json.loads(json.loads(opened.call_args.args[0].content)["messages"][1]["content"])
         self.assertEqual(prompt["screen"]["text_excerpt"], "Pear drink")
         self.assertEqual(prompt["requests"][0]["id"], request["id"])
         self.assertEqual(prompt["experiments"][0]["differences"]["baseline_vs_changed"]["changed_fields"][0]["changed"], 1)
@@ -70,7 +72,7 @@ class PlanningRegressionTests(unittest.TestCase):
         decision = {"plan": ["관찰된 카탈로그를 확인했다"], "reason": "추가 동작 없이 종료",
             "action": "finish", "element_id": "", "request_id": "", "value": ""}
         stream = io.BytesIO((json.dumps({"message": {"content": json.dumps(decision)}}) + "\n").encode())
-        with patch("v2.urlopen", return_value=stream):
+        with mock_model(return_value=stream):
             asyncio.run(explorer._agent_loop(0, None, None, None, screen))
         self.assertEqual(explorer.state["plan"], ["관찰된 카탈로그를 확인했다"])
         self.assertEqual(explorer.state["finish_reason"], "추가 동작 없이 종료")
@@ -85,9 +87,9 @@ class PlanningRegressionTests(unittest.TestCase):
         streams = [io.BytesIO((json.dumps({"message": {"content": json.dumps(d)}}) + "\n").encode()) for d in (invalid, finish)]
         payloads = []
         def answer(request, **kwargs):
-            payloads.append(json.loads(request.data))
+            payloads.append(json.loads(request.content))
             return streams.pop(0)
-        with patch("v2.urlopen", side_effect=answer):
+        with mock_model(side_effect=answer):
             asyncio.run(explorer._agent_loop(0, None, None, None, screen))
         feedback = json.loads(payloads[1]["messages"][1]["content"])["recent_decisions"][-1]
         self.assertEqual(feedback["status"], "rejected")
@@ -96,7 +98,7 @@ class PlanningRegressionTests(unittest.TestCase):
 
     def test_unavailable_planner_reports_failure_without_fallback(self):
         explorer, screen, _, _ = observed_run()
-        with patch("v2.urlopen", side_effect=v2.URLError("offline")):
+        with mock_model(side_effect=httpx.ConnectError("offline")):
             with self.assertRaisesRegex(RuntimeError, "계획 생성 실패"):
                 asyncio.run(explorer._agent_loop(0, None, None, None, screen))
         self.assertEqual(explorer.state["hypotheses"], [])
