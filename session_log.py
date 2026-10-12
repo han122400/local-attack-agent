@@ -183,7 +183,7 @@ class SessionLog:
         with self._lock:
             self._require_open()
             for path in (self.events_path, self.session_path):
-                with path.open("rb") as stream:
+                with path.open("r+b") as stream:
                     os.fsync(stream.fileno())
 
     def close(self) -> None:
