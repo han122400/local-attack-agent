@@ -448,8 +448,9 @@ class Explorer:
         return ({"api": 0, "page": 1, "form": 1, "route": 2, "script": 3}.get(kind, 4), 0 if url.endswith("main.js") else 1)
 
 
-from v2 import V2Explorer  # noqa: E402 - keep the v1 implementation available for its regression tests.
+from explorer import V2Explorer  # noqa: E402 - keep the v1 implementation available for its regression tests.
 from lab import get_status as get_lab_status, start_lab
+from model_settings import settings_schema, validate_model_settings, model_presets
 
 
 EXPLORER = V2Explorer()
@@ -484,9 +485,31 @@ def get_ollama_models() -> list[dict]:
 @app.get("/api/models")
 def ollama_models() -> JSONResponse:
     try:
-        return JSONResponse({"models": get_ollama_models(), "default_model": MODEL}, headers={"Cache-Control": "no-store"})
+        return JSONResponse({"models": get_ollama_models(), "default_model": MODEL, "settings_schema": settings_schema()}, headers={"Cache-Control": "no-store"})
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/api/models/details")
+def ollama_model_details(model: str) -> JSONResponse:
+    try:
+        if model not in {item["name"] for item in get_ollama_models()}:
+            raise HTTPException(status_code=400, detail="설치된 모델을 선택하세요.")
+        request = UrlRequest("http://127.0.0.1:11434/api/show", data=json.dumps({"model": model}).encode(), headers={"Content-Type": "application/json"})
+        with urlopen(request, timeout=5) as response:
+            payload = json.load(response)
+        if not isinstance(payload, dict):
+            raise ValueError("모델 상세 응답 형식이 올바르지 않습니다.")
+        info = payload.get("model_info") or {}
+        lengths = [value for key, value in info.items() if key.endswith(".context_length") and type(value) is int]
+        return JSONResponse({"model": model, "capabilities": payload.get("capabilities", []),
+                             "thinking": payload.get("thinking"), "context_length": min(lengths) if lengths else None,
+                             "parameters": payload.get("parameters", ""), "details": payload.get("details", {}),
+                             "presets": model_presets(model)}, headers={"Cache-Control": "no-store"})
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError, TypeError, AttributeError) as exc:
+        raise HTTPException(status_code=503, detail=f"Ollama 모델 상세를 불러오지 못했습니다: {exc}") from exc
 
 
 def ollama_processor(size: int | None, size_vram: int | None) -> str:
@@ -577,7 +600,11 @@ async def start(request: Request) -> dict:
         models = await run_in_threadpool(get_ollama_models)
         if model not in {item["name"] for item in models}:
             raise ValueError(f"설치된 Ollama 모델을 찾지 못했습니다: {model}. 모델 목록을 새로고침하세요.")
-        started = EXPLORER.start(target, model)
+        if isinstance(body, dict) and "model_settings" in body:
+            settings = validate_model_settings(body["model_settings"])
+            started = EXPLORER.start(target, model, model_settings=settings)
+        else:
+            started = EXPLORER.start(target, model)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:

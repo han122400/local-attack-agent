@@ -12,6 +12,6 @@ def mock_model(return_value=None, side_effect=None):
     def respond(request):
         stream = opened(request)
         return httpx.Response(200, content=stream.getvalue())
-    with patch("v2.httpx.AsyncClient", side_effect=lambda **kwargs:
+    with patch("explorer.httpx.AsyncClient", side_effect=lambda **kwargs:
                client_type(transport=httpx.MockTransport(respond), **kwargs)):
         yield opened

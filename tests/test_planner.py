@@ -5,33 +5,33 @@ import unittest
 import asyncio
 from unittest.mock import patch
 
-import v2
+import explorer as explorer_module
 import httpx2 as httpx
 from model_transport import mock_model
 from planning import validate_decision
 
 
 def observed_run():
-    explorer = v2.V2Explorer()
+    explorer = explorer_module.V2Explorer()
     explorer._deadline = time.monotonic() + 60
     screen = explorer._record(0, "screens", {
-        "url": v2.TARGET, "title": "Catalog", "text_excerpt": "Pear drink", "element_ids": []})
+        "url": explorer_module.TARGET, "title": "Catalog", "text_excerpt": "Pear drink", "element_ids": []})
     action = explorer._record(0, "actions", {"kind": "open", "label": "시작 URL"})
     request = explorer._record(0, "requests", {"action_id": action["id"], "source": "browser",
-        "method": "GET", "url": v2.TARGET + "catalog?query=", "query": {"query": {"value": "", "type": "string"}}})
+        "method": "GET", "url": explorer_module.TARGET + "catalog?query=", "query": {"query": {"value": "", "type": "string"}}})
     response = explorer._record(0, "responses", {"request_id": request["id"], "status": 200,
-        "content_type": "application/json", **v2.summarize_body(b'{"items":[{"name":"Pear drink"}]}', "application/json")})
+        "content_type": "application/json", **explorer_module.summarize_body(b'{"items":[{"name":"Pear drink"}]}', "application/json")})
     return explorer, screen, request, response
 
 
 class PlanningRegressionTests(unittest.TestCase):
     def test_executor_allows_observed_read_navigation_and_rejects_write_controls(self):
-        element = {"kind": "a", "href": v2.TARGET + "#/catalog-new", "label": "Browse", "visible": True}
-        self.assertEqual(v2.V2Explorer._element_actions(element), ["click"])
-        for changes in ({"href": "https://example.com/"}, {"href": v2.TARGET + "#/checkout"},
+        element = {"kind": "a", "href": explorer_module.TARGET + "#/catalog-new", "label": "Browse", "visible": True}
+        self.assertEqual(explorer_module.V2Explorer._element_actions(element), ["click"])
+        for changes in ({"href": "https://example.com/"}, {"href": explorer_module.TARGET + "#/checkout"},
                         {"label": "Delete item"}, {"form_method": "post"}, {"disabled": True}):
             with self.subTest(changes=changes):
-                self.assertEqual(v2.V2Explorer._element_actions(dict(element, **changes)), [])
+                self.assertEqual(explorer_module.V2Explorer._element_actions(dict(element, **changes)), [])
 
     def test_stale_elements_and_exhausted_budgets_cannot_be_executed(self):
         decision = {"plan": ["화면 확인"], "reason": "관찰", "action": "click", "element_id": "EL-0001", "request_id": "", "value": ""}
@@ -45,6 +45,14 @@ class PlanningRegressionTests(unittest.TestCase):
     def test_observed_read_requests_are_available_without_scripted_search(self):
         explorer, _, request, _ = observed_run()
         self.assertEqual([r["id"] for r in explorer._eligible()], [request["id"]])
+
+    def test_search_rejects_tried_value_but_allows_another_model_value(self):
+        elements = [{"id": "EL-0001", "allowed_actions": ["search"], "blocked_values": ["Pear"]}]
+        decision = {"plan": ["조회 결과 비교"], "reason": "새 검색값을 확인", "action": "search",
+                    "element_id": "EL-0001", "request_id": "", "value": "Pear"}
+        self.assertIsNotNone(validate_decision(decision, elements, [], 2, 1))
+        decision["value"] = "Cocoa"
+        self.assertIsNone(validate_decision(decision, elements, [], 2, 1))
 
     def test_hypothesis_receives_action_and_response_evidence(self):
         explorer, _, request, response = observed_run()
@@ -66,6 +74,34 @@ class PlanningRegressionTests(unittest.TestCase):
         self.assertEqual(prompt["screen"]["text_excerpt"], "Pear drink")
         self.assertEqual(prompt["requests"][0]["id"], request["id"])
         self.assertEqual(prompt["experiments"][0]["differences"]["baseline_vs_changed"]["changed_fields"][0]["changed"], 1)
+
+    def test_model_schema_excludes_unavailable_tools_and_ids(self):
+        explorer, screen, request, _ = observed_run()
+        explorer.state["hypotheses"] = [{}] * explorer_module.MAX_HYPOTHESES
+        stream = io.BytesIO(b'{"message":{"content":"{}"}}\n')
+        with mock_model(return_value=stream) as opened:
+            asyncio.run(explorer._ask_plan(0, screen))
+        properties = json.loads(opened.call_args.args[0].content)["format"]["properties"]
+        self.assertEqual(properties["action"]["enum"], ["finish"])
+        self.assertEqual(properties["element_id"].get("enum"), [""])
+        self.assertEqual(properties["request_id"].get("enum"), [""])
+
+    def test_model_schema_pairs_actions_with_their_valid_element_ids(self):
+        explorer, screen, _, _ = observed_run()
+        button = explorer._record(0, "elements", {"screen_id": screen["id"], "kind": "button", "label": "Browse",
+                                                  "allowed_actions": ["click"]})
+        field = explorer._record(0, "elements", {"screen_id": screen["id"], "kind": "input", "label": "Search",
+                                                 "allowed_actions": ["search"]})
+        stream = io.BytesIO(b'{"message":{"content":"{}"}}\n')
+        with mock_model(return_value=stream) as opened:
+            asyncio.run(explorer._ask_plan(0, screen))
+        branches = json.loads(opened.call_args.args[0].content)["format"].get("oneOf", [])
+        self.assertTrue(branches, "Action and target must be constrained together")
+        choices = {b["properties"]["action"]["const"]: b["properties"] for b in branches}
+        self.assertEqual(choices["click"]["element_id"]["enum"], [button["id"]])
+        self.assertEqual(choices["search"]["element_id"]["enum"], [field["id"]])
+        self.assertEqual(choices["click"]["value"]["const"], "")
+        self.assertEqual(choices["search"]["request_id"]["const"], "")
 
     def test_model_finish_does_not_trigger_scripted_search_or_experiment(self):
         explorer, screen, _, _ = observed_run()
@@ -95,6 +131,19 @@ class PlanningRegressionTests(unittest.TestCase):
         self.assertEqual(feedback["status"], "rejected")
         self.assertTrue(feedback["error"])
         self.assertEqual(len(explorer.state["observations"]["actions"]), 1)
+
+    def test_non_object_decision_is_rejected_and_llm_can_replan(self):
+        explorer, screen, _, _ = observed_run()
+        explorer._record(0, "elements", {"screen_id": screen["id"], "kind": "button", "label": "Details",
+                                        "allowed_actions": ["click"]})
+        finish = {"plan": ["관찰 종료"], "reason": "형식을 수정하여 종료", "action": "finish",
+                  "element_id": "", "request_id": "", "value": ""}
+        streams = [io.BytesIO((json.dumps({"message": {"content": json.dumps(d)}}) + "\n").encode())
+                   for d in ([], finish)]
+        with mock_model(side_effect=lambda *args: streams.pop(0)):
+            asyncio.run(explorer._agent_loop(0, None, None, None, screen))
+        self.assertEqual([d["status"] for d in explorer.state["decisions"]], ["rejected", "completed"])
+        self.assertEqual(explorer.state["finish_reason"], "형식을 수정하여 종료")
 
     def test_unavailable_planner_reports_failure_without_fallback(self):
         explorer, screen, _, _ = observed_run()

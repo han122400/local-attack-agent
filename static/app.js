@@ -1,5 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const statusLabels = { idle: '대기 중', running: '실행 중', stopping: '중지 중', stopped: '중지됨', completed: '완료', error: '오류' };
+const statusLabels = { idle: '대기 중', running: '실행 중', stopping: '중지 중', stopped: '중지됨', completed: '완료', stalled: '탐색 정체', error: '오류' };
 let actionError = '';
 let liveConnected = false;
 let evidenceSignature = '';
@@ -16,7 +16,8 @@ function updateModelControls() {
   const active = ['running', 'stopping'].includes(runState?.status);
   $('modelSelect').disabled = active || startPending || modelsLoading || !modelsReady;
   $('refreshModelsButton').disabled = active || startPending || modelsLoading;
-  $('startButton').disabled = !runState || active || startPending || modelsLoading || !modelsReady || !$('modelSelect').value;
+  window.modelSettings.setLocked(active || startPending || modelsLoading || !modelsReady);
+  $('startButton').disabled = !runState || active || startPending || modelsLoading || !modelsReady || !$('modelSelect').value || !window.modelSettings.ready;
 }
 
 async function loadModels() {
@@ -31,6 +32,8 @@ async function loadModels() {
     if (response.status === 404) throw new Error('서버 재시작 필요 · 실행 창에서 Ctrl+C 후 가상환경의 Python으로 app.py를 다시 실행하세요.');
     const body = await response.json();
     if (!response.ok) throw new Error(body.detail || `HTTP ${response.status}`);
+    if (!body.settings_schema) throw new Error('세부설정을 적용하려면 대시보드 서버를 재시작하세요.');
+    window.modelSettings.configure(body.settings_schema);
     const options = body.models.map(model => {
       const size = Number(model.size);
       const label = size > 0 ? `${model.name} · ${(size / 1024 ** 3).toFixed(1)} GiB` : model.name;
@@ -45,6 +48,7 @@ async function loadModels() {
       const preferred = ['running', 'stopping'].includes(runState?.status) ? [runState.model, previous] : [previous, runState?.model];
       $('modelSelect').value = [...preferred, body.default_model, names[0]].find(name => names.includes(name));
       $('modelStatus').textContent = `설치된 모델 ${options.length}개 · 비교 전 결과 JSON을 저장하면 사용 모델도 함께 기록됩니다.`;
+      await window.modelSettings.load($('modelSelect').value, runState);
     } else {
       const empty = text('option', '설치된 모델 없음');
       empty.value = '';
@@ -230,6 +234,7 @@ function renderEvents(events) {
 
 function render(state) {
   runState = state;
+  window.modelSettings.syncRun(state);
   renderPlan(state);
   if (!liveConnected) updateConsole(state.console || '');
   $('streamStatus').textContent = state.model_streaming ? '생성 중 ●' : state.status === 'running' ? '연결됨' : '대기';
@@ -307,14 +312,15 @@ async function poll() {
 async function action(name) {
   if (name === 'start') {
     if ($('startButton').disabled) return;
-    startPending = true;
-    updateModelControls();
   }
   try {
     const options = { method: 'POST' };
     if (name === 'start') {
+      const settings = window.modelSettings.read();
+      startPending = true;
+      updateModelControls();
       options.headers = { 'Content-Type': 'application/json' };
-      options.body = JSON.stringify({ target: $('targetInput').value.trim(), model: $('modelSelect').value });
+      options.body = JSON.stringify({ target: $('targetInput').value.trim(), model: $('modelSelect').value, model_settings: settings });
     }
     const response = await fetch(`/api/${name}`, options);
     if (!response.ok) {
@@ -328,7 +334,13 @@ async function action(name) {
 }
 
 $('refreshModelsButton').addEventListener('click', loadModels);
-$('modelSelect').addEventListener('change', updateModelControls);
+$('modelSelect').addEventListener('change', async () => {
+  const loaded = window.modelSettings.load($('modelSelect').value, runState);
+  updateModelControls();
+  await loaded;
+  updateModelControls();
+});
+window.addEventListener('model-settings-ready', updateModelControls);
 $('startButton').addEventListener('click', () => action('start'));
 $('stopButton').addEventListener('click', () => action('stop'));
 $('resetButton').addEventListener('click', () => action('reset'));

@@ -4,8 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Juice Explorer v2 · 근거 기반 정찰</title>
-  <link rel="stylesheet" href="/style.css?v=20261012-ollama-ps">
-  <script src="/app.js?v=20261012-llm-planner" defer></script>
+  <link rel="stylesheet" href="/style.css?v=20261013-model-settings">
+  <script src="/model-settings.js?v=20261013-model-settings" defer></script>
+  <script src="/app.js?v=20261013-model-settings" defer></script>
   <script src="/ollama-status.js?v=20261012-ollama-ps" defer></script>
 </head>
 <body>
@@ -39,6 +40,42 @@
             <button id="refreshModelsButton" class="button secondary" type="button">목록 새로고침</button>
           </div>
           <p id="modelStatus" class="model-status" role="status" aria-live="polite">설치된 모델을 확인합니다.</p>
+          <details class="model-advanced" id="modelAdvancedSettings">
+            <summary>모델 세부설정 <span>샘플링 · 토큰 · Thinking</span></summary>
+            <p class="settings-note">다음 실행의 계획·가설 생성에 공통 적용합니다. 빈 숫자 칸은 모델/Ollama 기본값을 사용하며, 입력값은 이 브라우저에 모델별로 저장됩니다.</p>
+            <div class="settings-toolbar">
+              <button id="resetModelSettingsButton" class="button secondary" type="button">앱 초기값</button>
+              <button id="modelDefaultsButton" class="button secondary" type="button">모델 기본값</button>
+              <button id="officialPresetButton" class="button secondary" type="button" hidden>공식 프리셋</button>
+            </div>
+            <p id="modelSettingsStatus" class="model-status" role="status" aria-live="polite">세부설정 불러오는 중…</p>
+            <fieldset id="modelSettingsFields" disabled>
+              <legend class="visually-hidden">Ollama 생성 파라미터</legend>
+              <div class="settings-grid" id="modelOptionsGrid"></div>
+              <div class="settings-grid settings-runtime">
+                <label for="thinkingSelect">Thinking <code>think</code>
+                  <select id="thinkingSelect"><option value="false">끄기</option><option value="null">모델 기본값</option></select>
+                  <small id="thinkingHelp">모델이 지원하는 값만 표시합니다.</small>
+                </label>
+                <label for="keepAliveSelect">모델 메모리 유지 <code>keep_alive</code>
+                  <select id="keepAliveSelect">
+                    <option value="">Ollama 기본값</option><option value="1m">1분</option><option value="5m">5분</option>
+                    <option value="10m">10분</option><option value="30m">30분</option><option value="1h">1시간</option>
+                    <option value="0">응답 후 즉시 해제</option><option value="-1">계속 유지</option>
+                  </select>
+                  <small>응답을 마친 뒤 모델을 메모리에 유지할 시간</small>
+                </label>
+              </div>
+            </fieldset>
+            <details class="model-parameters"><summary>설치된 모델의 기본 파라미터 보기</summary><pre id="modelParameters">—</pre></details>
+            <p class="settings-note">컨텍스트 크기는 GPU 메모리 배치에도 영향을 줍니다. 출력 한도를 늘려도 전체 실행 시간 제한은 적용됩니다.</p>
+            <div class="settings-sources">
+              <a href="https://docs.ollama.com/modelfile#valid-parameters-and-values" target="_blank" rel="noopener">Ollama 파라미터 ↗</a>
+              <a href="https://docs.ollama.com/capabilities/thinking" target="_blank" rel="noopener">Thinking 문서 ↗</a>
+              <a id="presetSource" hidden target="_blank" rel="noopener">모델 공식 프리셋 출처 ↗</a>
+            </div>
+          </details>
+          <details class="model-parameters" id="runSettingsDetails" hidden><summary>현재 실행에 사용한 모델 설정</summary><pre id="runSettingsValue"></pre></details>
         </div>
         <div class="lab-status-row">
           <div class="lab-status-info" role="status" aria-live="polite">

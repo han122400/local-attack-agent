@@ -7,7 +7,7 @@ import unittest
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
 
-import v2
+import explorer as explorer_module
 from model_transport import mock_model
 
 
@@ -30,7 +30,7 @@ load('');
 
 class BrowserPlannerTests(unittest.IsolatedAsyncioTestCase):
     async def test_model_choices_drive_dom_input_experiment_and_feedback(self):
-        explorer = v2.V2Explorer()
+        explorer = explorer_module.V2Explorer()
         explorer._deadline = time.monotonic() + 60
         transcripts = []
         plan_count = 0
@@ -60,13 +60,13 @@ class BrowserPlannerTests(unittest.IsolatedAsyncioTestCase):
                     result.update(plan=["두 검색 결과의 차이를 확인했다"], reason="실험 결과를 확인하여 종료")
             return io.BytesIO((json.dumps({"message": {"content": json.dumps(result, ensure_ascii=False)}}) + "\n").encode())
 
-        async with v2.async_playwright() as playwright:
-            executable = v2.installed_chromium()
+        async with explorer_module.async_playwright() as playwright:
+            executable = explorer_module.installed_chromium()
             browser = await playwright.chromium.launch(headless=True, **({"executable_path": executable} if executable else {}))
             context = await browser.new_context(service_workers="block")
             try:
                 async def serve(route):
-                    if not v2.allowed_url(route.request.url):
+                    if not explorer_module.allowed_url(route.request.url):
                         await route.abort()
                     elif urlsplit(route.request.url).path == "/catalog":
                         value = parse_qs(urlsplit(route.request.url).query).get("query", [""])[0]
@@ -76,7 +76,7 @@ class BrowserPlannerTests(unittest.IsolatedAsyncioTestCase):
                         await route.fulfill(content_type="text/html", body=HTML)
                 await context.route("**/*", serve)
                 page = await context.new_page()
-                tracker = v2._Tracker(explorer, 0, page)
+                tracker = explorer_module._Tracker(explorer, 0, page)
                 page.on("request", tracker.on_request)
                 page.on("response", tracker.on_response)
                 screen = await explorer._recon(0, page, tracker)
@@ -125,11 +125,11 @@ class WebSocketGuardTests(unittest.IsolatedAsyncioTestCase):
         server = ThreadingHTTPServer(("127.0.0.1", 0), Probe)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        explorer = v2.V2Explorer()
+        explorer = explorer_module.V2Explorer()
         async def recon(gen, page, tracker):
-            await page.context.route(v2.TARGET, lambda route: route.fulfill(
+            await page.context.route(explorer_module.TARGET, lambda route: route.fulfill(
                 content_type="text/html", body="<!doctype html><title>Socket guard fixture</title>"))
-            await page.goto(v2.TARGET)
+            await page.goto(explorer_module.TARGET)
             result = await page.evaluate("""async urls => Promise.all(urls.map(url => new Promise(resolve => {
                 const socket = new WebSocket(url);
                 socket.onclose = event => resolve(event.code);

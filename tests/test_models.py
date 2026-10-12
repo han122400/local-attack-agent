@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 import app
-import v2
+import explorer as explorer_module
 from model_transport import mock_model
 
 
@@ -59,9 +59,9 @@ class ModelRouteTests(unittest.TestCase):
 
     def test_start_passes_installed_model_to_explorer(self):
         with patch("app.get_ollama_models", return_value=[{"name": "other:7b", "size": 7000}]), patch.object(app.EXPLORER, "start", return_value=True) as start:
-            response = self.start_request({"target": v2.TARGET, "model": "other:7b"})
+            response = self.start_request({"target": explorer_module.TARGET, "model": "other:7b"})
         self.assertEqual(response, {"started": True})
-        start.assert_called_once_with(v2.TARGET, "other:7b")
+        start.assert_called_once_with(explorer_module.TARGET, "other:7b")
 
     def test_start_rejects_unknown_or_invalid_model_before_running(self):
         for model in ("missing:7b", "", None, ["other:7b"]):
@@ -76,7 +76,7 @@ class ModelRouteTests(unittest.TestCase):
             with self.assertRaises(HTTPException) as error:
                 self.start_request({})
         self.assertEqual(error.exception.status_code, 409)
-        start.assert_called_once_with(v2.TARGET, app.MODEL)
+        start.assert_called_once_with(explorer_module.TARGET, app.MODEL)
 
     def test_start_reports_unavailable_ollama_and_blocks_cross_site(self):
         with patch("app.get_ollama_models", side_effect=RuntimeError("Ollama 연결 실패")), patch.object(app.EXPLORER, "start") as start:
@@ -91,27 +91,27 @@ class ModelRouteTests(unittest.TestCase):
 
 class RunModelTests(unittest.TestCase):
     def test_selected_model_is_saved_in_run_and_console(self):
-        explorer = v2.V2Explorer()
-        with patch("v2.threading.Thread"):
-            self.assertTrue(explorer.start(v2.TARGET, "other:7b"))
+        explorer = explorer_module.V2Explorer()
+        with patch("explorer.threading.Thread"):
+            self.assertTrue(explorer.start(explorer_module.TARGET, "other:7b"))
         self.assertEqual(explorer.snapshot()["model"], "other:7b")
         self.assertIn("other:7b", explorer.snapshot()["console"])
         with patch.object(app.EXPLORER, "snapshot", return_value=explorer.snapshot()):
             self.assertEqual(json.loads(app.export_state().body)["model"], "other:7b")
 
     def test_active_run_keeps_its_model_when_start_is_rejected(self):
-        explorer = v2.V2Explorer()
-        with patch("v2.threading.Thread") as thread:
+        explorer = explorer_module.V2Explorer()
+        with patch("explorer.threading.Thread") as thread:
             thread.return_value.is_alive.return_value = True
-            explorer.start(v2.TARGET, "other:7b")
-            self.assertFalse(explorer.start(v2.TARGET, "third:8b"))
+            explorer.start(explorer_module.TARGET, "other:7b")
+            self.assertFalse(explorer.start(explorer_module.TARGET, "third:8b"))
         self.assertEqual(explorer.snapshot()["model"], "other:7b")
 
     def test_ollama_request_uses_run_model_and_keeps_thinking_disabled(self):
-        explorer = v2.V2Explorer()
-        with patch("v2.threading.Thread"):
-            explorer.start(v2.TARGET, "other:7b")
-        request = {"id": "REQ-0001", "action_id": "ACT-0001", "method": "GET", "url": v2.TARGET + "rest/products/search?q=apple", "query": {"q": "apple"}}
+        explorer = explorer_module.V2Explorer()
+        with patch("explorer.threading.Thread"):
+            explorer.start(explorer_module.TARGET, "other:7b")
+        request = {"id": "REQ-0001", "action_id": "ACT-0001", "method": "GET", "url": explorer_module.TARGET + "rest/products/search?q=apple", "query": {"q": "apple"}}
         response = {"id": "RES-0001", "status": 200, "content_type": "application/json"}
         stream = io.BytesIO(b'{"message":{"content":"{}"}}\n')
         with mock_model(return_value=stream) as opened:
@@ -122,7 +122,7 @@ class RunModelTests(unittest.TestCase):
         self.assertIs(sent["stream"], True)
 
     def test_previous_generation_cannot_use_next_runs_model(self):
-        explorer = v2.V2Explorer()
+        explorer = explorer_module.V2Explorer()
         explorer.generation = 2
         with mock_model() as opened:
             self.assertEqual(asyncio.run(explorer._ask_ollama(1, {}, {})), (None, "중지됨"))
