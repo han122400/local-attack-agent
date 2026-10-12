@@ -64,6 +64,7 @@ class ExplorerV3:
         self.active_run_id: str | None = None
         self._runtime: CommandRuntime | None = None
         self._subscribers: set[queue.Queue] = set()
+        self._event_subscribers: set[queue.Queue] = set()
         self._recent_state: dict = {"status": "idle", "run_id": None, "console": "", "model": MODEL,
                                     "target": TARGET, "model_settings": default_model_settings()}
 
@@ -126,6 +127,13 @@ class ExplorerV3:
         with self.lock:
             if event.get("run_id") != self.active_run_id:
                 return
+            for subscriber in list(self._event_subscribers):
+                if subscriber.full():
+                    try:
+                        subscriber.get_nowait()
+                    except queue.Empty:
+                        pass
+                subscriber.put_nowait(event)
             if event["kind"] in {"model_delta", "exec_output"}:
                 chunk = event.get("text", "")
                 self._recent_state["console"] = (self._recent_state.get("console", "") + chunk)[-60000:]
@@ -319,6 +327,19 @@ class ExplorerV3:
     def unsubscribe(self, subscriber: queue.Queue) -> None:
         with self.lock:
             self._subscribers.discard(subscriber)
+
+    def subscribe_events(self, run_id: str) -> queue.Queue | None:
+        validate_run_id(run_id)
+        with self.lock:
+            if self.active_run_id != run_id or self.worker is None or not self.worker.is_alive():
+                return None
+            subscriber: queue.Queue = queue.Queue(maxsize=2048)
+            self._event_subscribers.add(subscriber)
+            return subscriber
+
+    def unsubscribe_events(self, subscriber: queue.Queue) -> None:
+        with self.lock:
+            self._event_subscribers.discard(subscriber)
 
     def get_run(self, run_id: str) -> dict:
         return self.store.read(validate_run_id(run_id))

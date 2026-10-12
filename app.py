@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+import codecs
+import io
 import json
+import os
 import queue
 import re
 import subprocess
 import tempfile
 import threading
 import time
+import zipfile
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -19,7 +23,7 @@ from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
 from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.concurrency import run_in_threadpool
@@ -451,6 +455,7 @@ class Explorer:
 from explorer import ExplorerV3  # noqa: E402 - v1 helpers above remain for unrelated regression tests.
 from lab import get_status as get_lab_status, start_lab
 from model_settings import settings_schema, validate_model_settings, model_presets
+from session_log import LogFailure, safe_relative_path, validate_run_id
 
 
 EXPLORER = ExplorerV3()
@@ -582,7 +587,9 @@ def export_state() -> Response:
 
 def check_origin(request: Request) -> None:
     origin = request.headers.get("origin")
-    if origin and origin != f"http://{DASHBOARD_HOST}:{DASHBOARD_PORT}":
+    expected = (f"{request.scope.get('scheme', 'http')}://"
+                f"{request.headers.get('host') or f'{DASHBOARD_HOST}:{DASHBOARD_PORT}'}")
+    if origin and origin != expected:
         raise HTTPException(status_code=403, detail="Invalid origin")
     if request.headers.get("sec-fetch-site") not in {None, "same-origin"}:
         raise HTTPException(status_code=403, detail="Cross-site request blocked")
@@ -644,16 +651,177 @@ def reset(request: Request, run_id: str) -> dict:
     return {"recovering": True, "run_id": run_id}
 
 
-@app.get("/api/runs/{run_id}")
-def run_state(run_id: str) -> JSONResponse:
+def existing_run(run_id: str) -> dict:
     try:
-        state = EXPLORER.get_run(run_id)
+        return EXPLORER.get_run(validate_run_id(run_id))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="실험을 찾을 수 없습니다.") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    live = EXPLORER.active_run_id == run_id and bool(EXPLORER.worker and EXPLORER.worker.is_alive())
-    return JSONResponse({**state, "live_available": live}, headers={"Cache-Control": "no-store"})
+    except (LogFailure, OSError) as exc:
+        raise HTTPException(status_code=503, detail=f"실험 기록을 읽을 수 없습니다: {exc}") from exc
+
+
+def live_available(run_id: str) -> bool:
+    return (EXPLORER.active_run_id == run_id
+            and EXPLORER.worker is not None and EXPLORER.worker.is_alive())
+
+
+@app.get("/api/runs")
+def run_list() -> JSONResponse:
+    can_start, reason = EXPLORER.can_start()
+    summaries = []
+    for state in EXPLORER.store.list_runs()[:50]:
+        summaries.append({key: state.get(key) for key in (
+            "run_id", "goal", "model", "started_at", "finished_at", "phase", "run_result",
+            "cleanup_status", "lab_reset_status", "metadata_error")})
+    return JSONResponse({"runs": summaries, "active_run_id": EXPLORER.active_run_id,
+                         "can_start": can_start, "blocked_reason": reason},
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/runs/{run_id}")
+def run_state(run_id: str) -> JSONResponse:
+    state = existing_run(run_id)
+    return JSONResponse({**state, "live_available": live_available(run_id),
+                         "runtime_exists": (EXPLORER.store.root / run_id / "runtime").is_dir()},
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/runs/{run_id}/events")
+def run_events(run_id: str, after_seq: int = 0, limit: int = 250) -> JSONResponse:
+    existing_run(run_id)
+    try:
+        events = EXPLORER.store.read_events(run_id, after_seq=after_seq, limit=limit)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (LogFailure, OSError) as exc:
+        raise HTTPException(status_code=503, detail=f"저장 이벤트를 읽을 수 없습니다: {exc}") from exc
+    return JSONResponse({"run_id": run_id, "events": events,
+                         "next_seq": events[-1]["seq"] if events else after_seq,
+                         "has_more": len(events) == limit}, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/runs/{run_id}/live")
+def run_live(run_id: str) -> StreamingResponse:
+    existing_run(run_id)
+    subscriber = EXPLORER.subscribe_events(run_id)
+    def stream():
+        try:
+            if subscriber is None:
+                yield f"event: stream_end\ndata: {json.dumps({'run_id': run_id})}\n\n"
+                return
+            while True:
+                try:
+                    event = subscriber.get(timeout=0.5)
+                except queue.Empty:
+                    if not live_available(run_id):
+                        yield f"event: stream_end\ndata: {json.dumps({'run_id': run_id})}\n\n"
+                        return
+                    yield ": keepalive\n\n"
+                    continue
+                yield (f"id: {event['seq']}\nevent: update\ndata: "
+                       f"{json.dumps(event, ensure_ascii=False)}\n\n")
+        finally:
+            if subscriber is not None:
+                EXPLORER.unsubscribe_events(subscriber)
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+def run_file_root(run_id: str, source: str) -> tuple[Path, bool]:
+    existing_run(run_id)
+    if source not in {"runtime", "artifacts"}:
+        raise HTTPException(status_code=400, detail="source는 runtime 또는 artifacts여야 합니다.")
+    run_dir = EXPLORER.store.root / run_id
+    if run_dir.is_symlink() or not run_dir.resolve().is_relative_to(EXPLORER.store.root):
+        raise HTTPException(status_code=403, detail="세션 경계가 올바르지 않습니다.")
+    root = run_dir / source
+    if root.is_symlink() or not root.resolve(strict=False).is_relative_to(run_dir.resolve()):
+        raise HTTPException(status_code=403, detail="파일 경계가 올바르지 않습니다.")
+    return root, root.is_dir()
+
+
+@app.get("/api/runs/{run_id}/files")
+def run_files(run_id: str, source: str = "runtime") -> JSONResponse:
+    root, available = run_file_root(run_id, source)
+    if not available:
+        return JSONResponse({"run_id": run_id, "source": source, "available": False,
+                             "reason": "runtime_deleted" if source == "runtime" else "artifacts_unavailable",
+                             "files": []}, headers={"Cache-Control": "no-store"})
+    entries = []
+    stack = [root]
+    while stack and len(entries) < 2000:
+        folder = stack.pop()
+        with os.scandir(folder) as children:
+            for child in sorted(children, key=lambda item: item.name.lower()):
+                if len(entries) >= 2000:
+                    break
+                path = Path(child.path)
+                relative = path.relative_to(root).as_posix()
+                if child.is_symlink():
+                    entries.append({"path": relative, "kind": "link", "size": 0, "modified_at": None})
+                    continue
+                stat = child.stat(follow_symlinks=False)
+                directory = child.is_dir(follow_symlinks=False)
+                entries.append({"path": relative, "kind": "directory" if directory else "file",
+                                "size": stat.st_size if not directory else 0,
+                                "modified_at": stat.st_mtime})
+                if directory:
+                    stack.append(path)
+    return JSONResponse({"run_id": run_id, "source": source, "available": True,
+                         "files": entries, "truncated": bool(stack)}, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/runs/{run_id}/file")
+def run_file(run_id: str, source: str, path: str) -> JSONResponse:
+    root, available = run_file_root(run_id, source)
+    if not available:
+        raise HTTPException(status_code=410, detail="세션 runtime이 삭제되었습니다.")
+    try:
+        relative = safe_relative_path(path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    candidate = root / relative
+    if (not candidate.resolve(strict=False).is_relative_to(root.resolve())
+            or any(part.is_symlink() for part in (candidate, *candidate.parents) if part != root.parent)):
+        raise HTTPException(status_code=403, detail="파일 경계를 벗어났습니다.")
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+    stat = candidate.stat()
+    with candidate.open("rb") as stream:
+        body = stream.read(131073)
+    binary = b"\x00" in body
+    try:
+        content = None if binary else codecs.getincrementaldecoder("utf-8")("strict").decode(body[:131072], final=False)
+    except UnicodeDecodeError:
+        binary, content = True, None
+    return JSONResponse({"run_id": run_id, "source": source, "path": relative.as_posix(),
+                         "kind": "binary" if binary else "text", "content": content,
+                         "size": stat.st_size, "modified_at": stat.st_mtime,
+                         "truncated": stat.st_size > 131072}, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/runs/{run_id}/export")
+def run_export(run_id: str) -> Response:
+    existing_run(run_id)
+    run_dir = EXPLORER.store.root / run_id
+    if run_dir.is_symlink() or not run_dir.resolve().is_relative_to(EXPLORER.store.root):
+        raise HTTPException(status_code=403, detail="세션 경계가 올바르지 않습니다.")
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name in ("session.json", "events.jsonl"):
+            archive.write(run_dir / name, name)
+        artifact_root = run_dir / "artifacts"
+        if artifact_root.is_dir():
+            for file in artifact_root.rglob("*"):
+                if file.is_symlink():
+                    continue
+                if file.is_file() and file.resolve().is_relative_to(artifact_root.resolve()):
+                    archive.write(file, file.relative_to(run_dir).as_posix())
+    return Response(output.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="run-{run_id}.zip"',
+                             "Cache-Control": "no-store"})
 
 
 @app.post("/api/runs/{run_id}/stop")
@@ -698,6 +866,13 @@ def lab_start(request: Request) -> dict:
         return start_lab()
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/runs/{run_id}")
+def run_page(run_id: str) -> FileResponse:
+    existing_run(run_id)
+    return FileResponse(STATIC_DIR / "index.html", media_type="text/html",
+                        headers={"Cache-Control": "no-store"})
 
 
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="dashboard")

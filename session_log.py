@@ -253,6 +253,24 @@ class SessionStore:
             raise LogFailure("Corrupt session metadata")
         return data
 
+    def read_events(self, run_id: str, *, after_seq: int = 0, limit: int = 250) -> list[dict]:
+        """Read persisted events without reopening a writer or altering the run."""
+        run_id = validate_run_id(run_id)
+        self.read(run_id)
+        if type(after_seq) is not int or after_seq < 0 or type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("Invalid event cursor")
+        events = []
+        with (self.root / run_id / "events.jsonl").open("r", encoding="utf-8") as stream:
+            for line in stream:
+                event = json.loads(line)
+                if event.get("run_id") != run_id or type(event.get("seq")) is not int:
+                    raise LogFailure("Event log identity mismatch")
+                if event["seq"] > after_seq:
+                    events.append(event)
+                    if len(events) == limit:
+                        break
+        return events
+
     def repair_unowned_metadata(self, run_id: str) -> dict:
         """Rebuild a creation record only when no runtime or owned process remains.
 
