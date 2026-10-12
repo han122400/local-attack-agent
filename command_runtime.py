@@ -26,6 +26,15 @@ import psutil
 from session_log import LogFailure, SessionLog, safe_relative_path, validate_run_id
 
 
+def installed_chromium() -> str | None:
+    configured = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE")
+    if configured and Path(configured).is_file():
+        return configured
+    browser_root = Path.home() / "AppData" / "Local" / "ms-playwright"
+    matches = sorted(browser_root.glob("chromium_headless_shell-*/chrome-headless-shell-win64/chrome-headless-shell.exe"))
+    return str(matches[-1]) if matches else None
+
+
 WORKER_SOURCE = r'''import ast
 import asyncio
 import inspect
@@ -230,7 +239,6 @@ class CommandRuntime:
         server.bind(("127.0.0.1", 0))
         server.listen(1)
         server.settimeout(20)
-        from explorer import installed_chromium
         executable = installed_chromium() or ""
         args = [self.python, "-u", str(worker_path), "127.0.0.1", str(server.getsockname()[1]),
                 token, self.target, str(Path(__file__).resolve().parent), executable]
@@ -491,6 +499,10 @@ class CommandRuntime:
             thread.join(timeout=max(0.1, deadline - time.monotonic()))
         self._worker = None
         self.log.append("runtime_stopped", {})
+
+    def cancel(self) -> None:
+        """Signal in-flight work; finalization performs the owned-process stop."""
+        self._cancel.set()
 
     def export_evidence(self, run_id: str) -> list[dict]:
         self._check_run(run_id)

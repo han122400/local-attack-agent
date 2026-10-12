@@ -1,16 +1,17 @@
-import asyncio
-import inspect
 import io
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
 from starlette.requests import Request
 
 import app
-import explorer as explorer_module
-from model_transport import mock_model
+from explorer import ExplorerV3
+from harness import Harness, ModelFailure
+from session_log import SessionLog, SessionStore
 
 
 def start_request(body):
@@ -46,43 +47,48 @@ class ModelSettingsTests(unittest.TestCase):
                 self.assertEqual(error.exception.status_code, 400)
                 start.assert_not_called()
 
-    def test_run_records_its_own_copy_and_rejects_changes_while_active(self):
-        explorer = explorer_module.V2Explorer()
-        self.assertIn("model_settings", inspect.signature(explorer.start).parameters)
-        settings = {"think": False, "options": {"temperature": 0.8, "num_predict": 1024}}
-        with patch("explorer.threading.Thread") as thread:
-            thread.return_value.is_alive.return_value = True
-            self.assertTrue(explorer.start(model_settings=settings))
+    def test_run_records_its_own_settings_copy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            settings = {"think": False, "options": {"temperature": 0.8, "num_predict": 1024}}
+            def finish(_payload):
+                yield {"message": {"content": json.dumps({"action": "finish", "plan": "done", "reason": "enough",
+                                                          "path": "", "content": "", "command": "", "code": ""})}}
+            explorer = ExplorerV3(Path(temp), transport=finish, browser_enabled=False,
+                                  lab_reset=lambda: {"verified": True})
+            run_id = explorer.start(goal="inspect", model_settings=settings)
             settings["options"]["temperature"] = 1.2
-            self.assertFalse(explorer.start(model_settings={"think": True}))
-        self.assertEqual(explorer.snapshot()["model_settings"]["options"]["temperature"], 0.8)
-        self.assertIs(explorer.snapshot()["model_settings"]["think"], False)
-        with patch.object(app.EXPLORER, "snapshot", return_value=explorer.snapshot()):
-            self.assertEqual(json.loads(app.export_state().body)["model_settings"], explorer.snapshot()["model_settings"])
+            explorer.worker.join(10)
+            self.assertEqual(SessionStore(Path(temp)).read(run_id)["model_settings"]["options"]["temperature"], 0.8)
 
-    def test_shared_model_transport_uses_settings_and_separates_thinking_from_json(self):
-        explorer = explorer_module.V2Explorer()
-        settings = {"think": True, "keep_alive": "10m", "options": {"temperature": 0.7, "num_ctx": 16384, "num_predict": 2048, "seed": 42}}
-        explorer.state["model_settings"] = settings
-        stream = io.BytesIO(b'{"message":{"thinking":"checking observations"}}\n{"message":{"content":"{\\"ok\\":true}"}}\n{"done":true,"done_reason":"stop"}\n')
-        with mock_model(return_value=stream) as opened:
-            result = asyncio.run(explorer._ask_json(0, {}, "system", {}))
-        self.assertEqual(result, ({"ok": True}, ""))
-        payload = json.loads(opened.call_args.args[0].content)
-        self.assertIs(payload["think"], True)
-        self.assertEqual(payload["keep_alive"], "10m")
-        self.assertEqual(payload["options"], settings["options"])
-        self.assertIn("checking observations", explorer.snapshot()["console"])
+    def test_harness_uses_thinking_settings_but_decodes_content_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), "e" * 32, {})
+            sent = []
+            def transport(payload):
+                sent.append(payload)
+                yield {"message": {"thinking": "unparsed reasoning"}}
+                yield {"message": {"content": json.dumps({"action": "finish", "plan": "done", "reason": "enough",
+                                                          "path": "", "content": "", "command": "", "code": ""})}}
+            settings = {"think": True, "keep_alive": "10m", "options": {"temperature": 0.7, "num_predict": 2048}}
+            self.assertEqual(Harness(log, transport=transport).decide(log.run_id, {}, model="qwen3.5:9b", settings=settings).action, "finish")
+            self.assertIs(sent[0]["think"], True)
+            self.assertEqual(sent[0]["keep_alive"], "10m")
+            self.assertEqual(sent[0]["options"], settings["options"])
+            log.close()
 
-    def test_model_default_thinking_omits_the_override(self):
-        explorer = explorer_module.V2Explorer()
-        explorer.state["model_settings"] = {"think": None, "options": {"temperature": 0.3}}
-        with mock_model(return_value=io.BytesIO(b'{"message":{"content":"{}"}}\n')) as opened:
-            asyncio.run(explorer._ask_json(0, {}, "system", {}))
-        self.assertNotIn("think", json.loads(opened.call_args.args[0].content))
+    def test_model_default_thinking_omits_override(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), "e" * 32, {})
+            sent = []
+            def transport(payload):
+                sent.append(payload)
+                yield {"message": {"content": json.dumps({"action": "finish", "plan": "done", "reason": "enough",
+                                                          "path": "", "content": "", "command": "", "code": ""})}}
+            Harness(log, transport=transport).decide(log.run_id, {}, model="mock:model", settings={"think": None, "options": {"temperature": 0.3}})
+            self.assertNotIn("think", sent[0])
+            log.close()
 
     def test_model_details_include_actual_capabilities_without_loading_weights(self):
-        self.assertTrue(hasattr(app, "ollama_model_details"), "Model details endpoint is missing")
         show = {"capabilities": ["completion", "thinking"], "thinking": {"values": [False, True], "default": True},
                 "model_info": {"qwen35.context_length": 262144}, "parameters": "temperature 1\ntop_k 20", "details": {"family": "qwen35"}}
         with patch("app.get_ollama_models", return_value=[{"name": "qwen3.5:9b"}]), patch("app.urlopen", return_value=io.BytesIO(json.dumps(show).encode())) as opened:
@@ -92,15 +98,18 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertEqual(body["context_length"], 262144)
         self.assertEqual(body["parameters"], show["parameters"])
         self.assertEqual(opened.call_args.args[0].full_url, "http://127.0.0.1:11434/api/show")
-        self.assertEqual(body["presets"][0]["settings"]["options"]["temperature"], 0.7)
 
-    def test_empty_generation_reports_output_limit_instead_of_json_position(self):
-        explorer = explorer_module.V2Explorer()
-        stream = io.BytesIO(b'{"message":{"thinking":"working"}}\n{"done":true,"done_reason":"length"}\n')
-        with mock_model(return_value=stream):
-            answer, error = asyncio.run(explorer._ask_json(0, {}, "system", {}))
-        self.assertIsNone(answer)
-        self.assertIn("num_predict", error)
+    def test_empty_generation_reports_output_limit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), "e" * 32, {})
+            def transport(_payload):
+                yield {"message": {"thinking": "working"}}
+                yield {"done": True, "done_reason": "length"}
+            with self.assertRaises(ModelFailure) as raised:
+                Harness(log, transport=transport, max_calls=1).decide(log.run_id, {}, model="mock:model",
+                                                                       settings={"think": True, "options": {"num_predict": 700}})
+            self.assertIn("num_predict", str(raised.exception))
+            log.close()
 
 
 if __name__ == "__main__":

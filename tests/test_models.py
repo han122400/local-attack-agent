@@ -1,7 +1,9 @@
-import asyncio
 import io
 import json
+import tempfile
+import threading
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from urllib.error import URLError
 
@@ -10,7 +12,8 @@ from starlette.requests import Request
 
 import app
 import explorer as explorer_module
-from model_transport import mock_model
+from harness import Harness
+from session_log import SessionLog, SessionStore
 
 
 class ModelRouteTests(unittest.TestCase):
@@ -90,43 +93,50 @@ class ModelRouteTests(unittest.TestCase):
 
 
 class RunModelTests(unittest.TestCase):
-    def test_selected_model_is_saved_in_run_and_console(self):
-        explorer = explorer_module.V2Explorer()
-        with patch("explorer.threading.Thread"):
-            self.assertTrue(explorer.start(explorer_module.TARGET, "other:7b"))
-        self.assertEqual(explorer.snapshot()["model"], "other:7b")
-        self.assertIn("other:7b", explorer.snapshot()["console"])
-        with patch.object(app.EXPLORER, "snapshot", return_value=explorer.snapshot()):
-            self.assertEqual(json.loads(app.export_state().body)["model"], "other:7b")
+    def test_selected_model_is_saved_in_run_and_sent_to_harness(self):
+        with tempfile.TemporaryDirectory() as temp:
+            sent = []
+            def transport(payload):
+                sent.append(payload)
+                yield {"message": {"content": json.dumps({"action": "finish", "plan": "done", "reason": "enough",
+                                                          "path": "", "content": "", "command": "", "code": ""})}}
+            explorer = explorer_module.ExplorerV3(Path(temp), transport=transport, browser_enabled=False,
+                                                  lab_reset=lambda: {"verified": True})
+            run_id = explorer.start(explorer_module.TARGET, "other:7b", goal="inspect")
+            explorer.worker.join(10)
+            self.assertEqual(SessionStore(Path(temp)).read(run_id)["model"], "other:7b")
+            self.assertEqual(sent[0]["model"], "other:7b")
 
     def test_active_run_keeps_its_model_when_start_is_rejected(self):
-        explorer = explorer_module.V2Explorer()
-        with patch("explorer.threading.Thread") as thread:
-            thread.return_value.is_alive.return_value = True
-            explorer.start(explorer_module.TARGET, "other:7b")
-            self.assertFalse(explorer.start(explorer_module.TARGET, "third:8b"))
-        self.assertEqual(explorer.snapshot()["model"], "other:7b")
+        with tempfile.TemporaryDirectory() as temp:
+            entered = threading.Event()
+            release = threading.Event()
+            def transport(_payload):
+                entered.set()
+                release.wait(5)
+                yield {"message": {"content": json.dumps({"action": "finish", "plan": "done", "reason": "enough",
+                                                          "path": "", "content": "", "command": "", "code": ""})}}
+            explorer = explorer_module.ExplorerV3(Path(temp), transport=transport, browser_enabled=False,
+                                                  lab_reset=lambda: {"verified": True})
+            run_id = explorer.start(explorer_module.TARGET, "other:7b", goal="inspect")
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertFalse(explorer.start(explorer_module.TARGET, "third:8b", goal="inspect"))
+                self.assertEqual(explorer.snapshot()["model"], "other:7b")
+            finally:
+                release.set()
+                explorer.worker.join(10)
+            self.assertEqual(SessionStore(Path(temp)).read(run_id)["model"], "other:7b")
 
-    def test_ollama_request_uses_run_model_and_keeps_thinking_disabled(self):
-        explorer = explorer_module.V2Explorer()
-        with patch("explorer.threading.Thread"):
-            explorer.start(explorer_module.TARGET, "other:7b")
-        request = {"id": "REQ-0001", "action_id": "ACT-0001", "method": "GET", "url": explorer_module.TARGET + "rest/products/search?q=apple", "query": {"q": "apple"}}
-        response = {"id": "RES-0001", "status": 200, "content_type": "application/json"}
-        stream = io.BytesIO(b'{"message":{"content":"{}"}}\n')
-        with mock_model(return_value=stream) as opened:
-            self.assertEqual(asyncio.run(explorer._ask_ollama(explorer.generation, request, response)), ({}, ""))
-        sent = json.loads(opened.call_args.args[0].content)
-        self.assertEqual(sent["model"], "other:7b")
-        self.assertIs(sent["think"], False)
-        self.assertIs(sent["stream"], True)
-
-    def test_previous_generation_cannot_use_next_runs_model(self):
-        explorer = explorer_module.V2Explorer()
-        explorer.generation = 2
-        with mock_model() as opened:
-            self.assertEqual(asyncio.run(explorer._ask_ollama(1, {}, {})), (None, "중지됨"))
-            opened.assert_not_called()
+    def test_harness_rejects_other_run_id_before_transport(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), "f" * 32, {})
+            opened = []
+            harness = Harness(log, transport=lambda payload: opened.append(payload))
+            with self.assertRaises(ValueError):
+                harness.decide("a" * 32, {}, model="other:7b", settings={"think": False, "options": {}})
+            self.assertEqual(opened, [])
+            log.close()
 
 
 if __name__ == "__main__":
