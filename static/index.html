@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Juice Explorer v2 · 근거 기반 정찰</title>
+  <link rel="stylesheet" href="/style.css?v=20261012-ollama-ps">
+  <script src="/app.js?v=20261012-llm-planner" defer></script>
+  <script src="/ollama-status.js?v=20261012-ollama-ps" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+      <div class="brand-name">JUICE <strong>EXPLORER</strong><small>LOCAL AGENT / V2</small></div>
+      <div class="local-pill"><span></span>LOCAL ONLY</div>
+    </header>
+    <main>
+      <section class="hero">
+        <div>
+          <div class="eyebrow">BROWSER RECON · EVIDENCE · ONE CHANGE</div>
+          <h1>관찰에서 실험까지<br><em>근거를 따라갑니다.</em></h1>
+          <p>LLM이 화면과 요청을 관찰해 계획을 세우고, 실행 결과에 따라 다음 행동을 선택합니다.</p>
+        </div>
+      </section>
+      <section class="panel setup-panel">
+        <label for="targetInput">대상 URL <small>로컬 Juice Shop만 허용</small></label>
+        <div class="setup-controls">
+          <input id="targetInput" type="url" value="http://127.0.0.1:3000/" spellcheck="false">
+          <button id="startButton" class="button primary" type="button" disabled>▶ 시작</button>
+          <button id="stopButton" class="button secondary" type="button" disabled>중지</button>
+          <button id="resetButton" class="button secondary" type="button">초기화</button>
+          <a id="exportButton" class="button text-button" href="/api/export" download>결과 JSON ↓</a>
+        </div>
+        <div class="model-settings">
+          <label for="modelSelect">Ollama 모델 <small>선택한 모델로 새 실행 시작 · 실행 중 변경 불가</small></label>
+          <div class="setup-controls">
+            <select id="modelSelect" aria-describedby="modelStatus" disabled><option value="">모델 목록 불러오는 중…</option></select>
+            <button id="refreshModelsButton" class="button secondary" type="button">목록 새로고침</button>
+          </div>
+          <p id="modelStatus" class="model-status" role="status" aria-live="polite">설치된 모델을 확인합니다.</p>
+        </div>
+        <div class="lab-status-row">
+          <div class="lab-status-info" role="status" aria-live="polite">
+            <strong>실험환경 · Juice Shop</strong>
+            <span id="labStatus" class="lab-status-text">상태 확인 중…</span>
+            <small id="labError" class="result-error" hidden></small>
+          </div>
+          <a class="lab-link" href="http://127.0.0.1:3000/" target="_blank" rel="noopener">3000 포트 ↗</a>
+          <button id="labStartButton" class="button secondary" type="button" disabled>실험환경 켜기</button>
+        </div>
+      </section>
+      <section class="panel ollama-runtime" aria-labelledby="ollamaRuntimeHeading">
+        <div class="panel-heading">
+          <div><span class="section-kicker">OLLAMA PS</span><h2 id="ollamaRuntimeHeading">모델 CPU / GPU 상태</h2></div>
+          <button id="refreshOllamaPsButton" class="button secondary" type="button">상태 새로고침</button>
+        </div>
+        <p id="ollamaPsStatus" class="model-status" role="status" aria-live="polite">실행 상태를 확인합니다…</p>
+        <p class="console-note">PROCESSOR는 모델의 CPU/GPU 메모리 배치 비율입니다. GPU 연산 사용률과는 다릅니다.</p>
+        <div class="table-wrap">
+          <table aria-label="Ollama에 현재 로드된 모델">
+            <thead><tr><th scope="col">NAME</th><th scope="col">ID</th><th scope="col">SIZE</th><th scope="col">PROCESSOR</th><th scope="col">GPU MEMORY</th><th scope="col">CONTEXT</th><th scope="col">UNTIL</th></tr></thead>
+            <tbody id="ollamaPsRows"><tr class="empty-row"><td colspan="7">상태 확인 중…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="run-strip" aria-label="실행 상태">
+        <div class="run-status"><span id="statusDot" class="status-dot idle"></span><span id="statusText">대기 중</span></div>
+        <div class="run-target"><span>PHASE</span><code id="phaseText">대기</code></div>
+        <div class="run-target"><span>RUN</span><code id="runId">—</code></div>
+        <div class="run-target"><span>RUN MODEL</span><code id="runModel">—</code></div>
+      </section>
+      <section class="metrics" aria-label="실행 통계">
+        <article class="metric"><span>에이전트 행동</span><strong id="stepMetric">0 <small>/ 10</small></strong><div class="progress"><div id="progressFill"></div></div></article>
+        <article class="metric"><span>화면 · 입력</span><strong id="screenMetric">0 <small>· 0</small></strong><small>렌더링된 DOM 근거</small></article>
+        <article class="metric"><span>브라우저 요청</span><strong id="requestMetric">0</strong><small id="blockedMetric">차단 0 · 자동 리소스 포함</small></article>
+        <article class="metric"><span>가설 · 실험</span><strong id="experimentMetric">0 <small>· 0</small></strong><small>관찰 근거에 연결</small></article>
+      </section>
+      <section class="activity-grid">
+        <article class="panel live-panel">
+          <div class="panel-heading"><div><span class="section-kicker">CURRENT ACTION</span><h2>현재 진행</h2></div><span id="elapsed" class="elapsed">00:00</span></div>
+          <div class="live-message"><span class="pulse"></span><span id="message">시작을 누르면 브라우저 정찰을 시작합니다.</span></div>
+          <div class="latest-label">현재 단계</div><pre id="currentPhase" class="terminal">대기</pre>
+        </article>
+        <article class="panel process-panel">
+          <div class="panel-heading"><div><span class="section-kicker">V2 FLOW</span><h2>검증 흐름</h2></div></div>
+          <ol class="process-list">
+            <li><span>01</span><div><strong>관찰 · LLM 계획</strong><p>화면과 실제 요청을 보고 모델이 계획과 다음 행동을 정합니다.</p></div></li>
+            <li><span>02</span><div><strong>선택한 행동 실행</strong><p>관찰된 요소 조작 또는 조회 요청 실험을 실행합니다.</p></div></li>
+            <li><span>03</span><div><strong>결과 · 재계획</strong><p>실패와 응답 차이까지 모델에 전달해 계획을 갱신합니다.</p></div></li>
+          </ol>
+        </article>
+      </section>
+      <section class="panel results-panel" aria-label="LLM 탐색 계획">
+        <div class="panel-heading"><div><span class="section-kicker">LLM PLAN</span><h2>모델의 탐색 계획</h2></div><span id="decisionCount" class="count-pill">0 decisions</span></div>
+        <ol id="planList" class="agent-plan"><li>첫 화면을 관찰하면 LLM이 계획을 세웁니다.</li></ol>
+        <div id="decisionList" class="card-list"></div>
+      </section>
+      <section class="panel console-panel" aria-label="실시간 모델 및 실행 출력">
+        <div class="panel-heading"><div><span class="section-kicker">LIVE OUTPUT</span><h2>실시간 실행 출력</h2></div><span id="streamStatus" class="count-pill">대기</span></div>
+        <p class="console-note">think:false · 모델의 계획·선택 이유·가설과 실제 실행 상태가 실시간으로 표시됩니다.</p>
+        <div class="console-window"><div class="console-bar"><span class="console-lights" aria-hidden="true">● ● ●</span><span>juice-explorer / cmd</span></div><pre id="consoleOutput" role="log" aria-live="off">시작하면 여기에 출력됩니다.</pre></div>
+      </section>
+      <section class="panel results-panel">
+        <div class="panel-heading"><div><span class="section-kicker">OBSERVATIONS</span><h2>관찰 근거</h2></div><span id="evidenceCount" class="count-pill">0 records</span></div>
+        <div id="evidenceList" class="evidence-list empty-history">아직 관찰 기록이 없습니다.</div>
+      </section>
+      <section class="panel results-panel">
+        <div class="panel-heading"><div><span class="section-kicker">HYPOTHESES</span><h2>가설</h2></div><span id="hypothesisCount" class="count-pill">0 hypotheses</span></div>
+        <div id="hypothesisList" class="card-list empty-history">아직 가설이 없습니다.</div>
+      </section>
+      <section class="panel results-panel">
+        <div class="panel-heading"><div><span class="section-kicker">EXPERIMENTS</span><h2>기준 실행과 단일 변경</h2></div><span id="experimentCount" class="count-pill">0 experiments</span></div>
+        <div id="experimentList" class="card-list empty-history">아직 실험이 없습니다.</div>
+      </section>
+      <section class="panel history-panel">
+        <div class="panel-heading"><div><span class="section-kicker">EVENT LOG</span><h2>진행 기록</h2></div><span id="historyCount" class="count-pill">0 events</span></div>
+        <div id="history" class="history-list"><div class="empty-history">아직 실행 기록이 없습니다.</div></div>
+      </section>
+    </main>
+    <footer>LOCAL EXPLORATION LAB <span>·</span> OWASP JUICE SHOP <span>·</span> V2</footer>
+  </div>
+</body>
+</html>

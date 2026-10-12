@@ -1,0 +1,51 @@
+# Local Attack Agent
+
+로컬 Ollama 모델이 OWASP Juice Shop의 화면과 네트워크 관찰을 바탕으로 탐색 계획과 다음 행동을 선택하는 실험 프로젝트입니다. FastAPI 대시보드에서 계획, 모델 출력, 관찰 기록, 가설과 응답 비교 결과를 확인할 수 있습니다.
+
+현재 구현의 대상은 `http://127.0.0.1:3000/`으로 제한됩니다. 응답 차이는 관찰 결과로 기록하며 취약점 확정을 의미하지 않습니다.
+
+## 실행 환경
+
+- Python 3.10 이상
+- Docker Desktop
+- Ollama 및 설치된 로컬 모델
+- Playwright Chromium
+
+## 시작하기
+
+프로젝트 폴더에서 Python 의존성과 브라우저를 설치합니다.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m playwright install chromium
+```
+
+Juice Shop 실습 컨테이너를 준비합니다.
+
+```powershell
+docker pull bkimminich/juice-shop:v20.2.0
+docker run -d --name juice-lab -p 127.0.0.1:3000:3000 bkimminich/juice-shop:v20.2.0
+```
+
+컨테이너가 이미 있다면 `docker start juice-lab`으로 시작합니다. Ollama를 실행하고 `ollama list`에 모델이 있는지 확인한 뒤 대시보드를 시작합니다.
+
+```powershell
+.\.venv\Scripts\python.exe app.py
+```
+
+브라우저에서 <http://127.0.0.1:8765/>에 접속해 설치된 모델을 선택합니다. Ollama 연결 주소는 `http://127.0.0.1:11434`입니다.
+
+## 구성
+
+- `app.py`: FastAPI API와 실행 관리
+- `v2.py`: 브라우저 관찰, LLM 계획 실행, 가설 실험 및 응답 비교
+- `planning.py`: 계획 스키마, 모델 지시문, 결정 검증
+- `lab.py`: 로컬 Juice Shop 컨테이너 상태 확인과 시작
+- `static/`: 대시보드
+- `tests/`: 테스트
+- `Version/`: v1·v2 설계 문서
+
+## 개발 상태
+
+MVP 실험 단계입니다. 입력 요소 인식과 반복 행동 복구에는 알려진 한계가 있으며, 모델이 유효한 다음 행동을 선택하지 못하면 실행이 중단될 수 있습니다. 실행 데이터, 로그, 로컬 의존성은 Git 저장소에서 제외됩니다.
