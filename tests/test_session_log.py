@@ -1,8 +1,10 @@
 import json
+import os
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from session_log import SessionLog, LogFailure, SessionStore, ControllerLease
 
@@ -41,6 +43,28 @@ class SessionLogTests(unittest.TestCase):
             self.assertEqual(len(first["sha256"]), 64)
             self.assertEqual(json.loads((log.run_dir / "session.json").read_text(encoding="utf-8"))["cleanup_status"], "pending")
             self.assertFalse(list(log.run_dir.glob("*.tmp")))
+            log.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows file sharing behavior")
+    def test_metadata_replace_retries_transient_reader_sharing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {"phase": "running"})
+            original_replace = os.replace
+            attempts = []
+
+            def transient_replace(source, destination):
+                attempts.append((source, destination))
+                if len(attempts) < 3:
+                    error = PermissionError("reader holds metadata")
+                    error.winerror = 5
+                    raise error
+                return original_replace(source, destination)
+
+            with patch("session_log.os.replace", side_effect=transient_replace):
+                log.update(phase="finished")
+            self.assertEqual(len(attempts), 3)
+            self.assertFalse(log.failed)
+            self.assertEqual(SessionStore(Path(temp)).read(RUN_ID)["phase"], "finished")
             log.close()
 
     def test_artifact_path_escape_is_rejected(self):

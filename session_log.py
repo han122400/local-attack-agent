@@ -114,7 +114,17 @@ class SessionLog:
                 json.dump(self.metadata, stream, ensure_ascii=False, indent=2)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temp_path, self.session_path)
+            # On Windows a concurrent read briefly denies replacement of the
+            # destination. Keep the new complete file and retry only sharing
+            # errors; a persistent failure still fails the session writer.
+            for attempt in range(40):
+                try:
+                    os.replace(temp_path, self.session_path)
+                    break
+                except PermissionError as exc:
+                    if os.name != "nt" or getattr(exc, "winerror", None) not in (5, 32) or attempt == 39:
+                        raise
+                    time.sleep(0.025)
         except Exception as exc:
             self.failed = True
             raise LogFailure(f"Metadata write failed: {exc}") from exc
