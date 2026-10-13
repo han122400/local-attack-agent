@@ -20,7 +20,7 @@ FIELDS = [
 
 def default_model_settings():
     # Preserve the existing app behavior until a user edits the controls.
-    return {"think": False, "options": {"temperature": 0, "num_ctx": 8192, "num_predict": 700}}
+    return {"think": False, "options": {"temperature": 0, "num_ctx": 8192, "num_predict": 4096}}
 
 
 def settings_schema():
