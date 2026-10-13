@@ -23,6 +23,12 @@ const runStats={calls:0,executions:0,modelErrors:0,execErrors:0,tokens:0};
 let displayQueued=false, latestExecution=null;
 let fileSource='runtime', fileItems=[], selectedFile=null, selectedEvidence=null, evidenceItems=[];
 const collapsedDirs=new Set(['deps','tmp','browser']);
+const goalSuggestions={
+  structure:'설정된 대상 웹사이트에서 접근 가능한 페이지와 주요 기능의 구조를 파악해줘. 실제로 관찰한 링크, 화면과 이동 관계를 근거로 기능별 요약과 아직 확인하지 못한 영역을 정리해줘.',
+  inputs:'설정된 대상 웹사이트에서 검색, 필터와 입력 요소의 동작을 관찰해줘. 관찰한 화면을 바탕으로 확인할 요소와 비파괴적인 입력값을 스스로 선택하고, 입력 전후의 변화와 근거를 정리해줘. 해당 요소가 없으면 관찰한 범위와 함께 기록해줘.',
+  network:'설정된 대상 웹사이트의 화면과 스크립트, 네트워크 요청에서 API와 데이터 흐름을 파악해줘. 실제로 관찰한 경로, 요청 방식, 응답 상태와 데이터 형태를 정리하고, 코드에서 발견한 후보와 실제 호출이 확인된 항목을 구분해줘.'
+};
+const goalScope=' 탐색 범위는 설정된 대상 안으로 제한하고, 경로와 탐색 순서는 관찰 결과에 따라 스스로 결정해줘. 계정·데이터를 변경하는 동작은 수행하지 말고, 확인된 사실과 추정을 구분해줘.';
 
 const actionLabel=action=>({read_file:'파일 읽기',write_file:'파일 작성',run_command:'CMD 실행',run_python:'브라우저 코드 실행',finish:'탐색 종료'})[action]||'다음 행동 생성';
 const eventLabel=kind=>({run_created:'실험 시작',model_request:'모델 판단 시작',model_response:'모델 응답 완료',command_decoded:'실행 명령 확인',command_normalized:'중복 입력 정리',model_error:'모델 응답 오류',exec_started:'작업 실행',exec_finished:'작업 결과',file_changed:'파일 변경',process_started:'프로세스 시작',process_stopped:'프로세스 종료',runtime_created:'런타임 준비',runtime_destroyed:'런타임 삭제',run_finished_by_model:'모델 종료 판단',finalize_started:'실험 정리 시작',cleanup_step:'정리 진행',evidence_exported:'증거 보존',lab_reset:'실습환경 초기화',initial_lab_reset:'초기 상태 확인',run_finalized:'실험 종료',finalize_failed:'정리 실패',run_error:'실행기 오류'})[kind]||kind;
@@ -269,6 +275,10 @@ function initMain(){
   $('setupSection').hidden=historyMode; $('historySection').hidden=!historyMode;
   if(historyMode){setText('mainHeading','실험 기록');setText('mainLead','저장된 세션의 결과와 실행 로그를 확인합니다.');}
   $('startForm').addEventListener('submit',startRun);
+  for(const button of $('goalSuggestions').querySelectorAll('button[data-goal]'))button.addEventListener('click',()=>{
+    const input=$('goalInput');input.value=goalSuggestions[button.dataset.goal]+goalScope;
+    input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();input.setSelectionRange(input.value.length,input.value.length);
+  });
   for(const id of ['scenarioSelect','chainSelect'])$(id).addEventListener('change',updateStartControls);
   $('refreshModelsButton').addEventListener('click',loadReadiness);
   $('refreshReadinessButton').addEventListener('click',loadReadiness);
