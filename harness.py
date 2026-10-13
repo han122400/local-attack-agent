@@ -34,11 +34,13 @@ def _ollama_stream(payload: dict):
 
 
 class Harness:
-    def __init__(self, log: SessionLog, *, transport=None, max_calls: int = 40, stop_requested=None):
+    def __init__(self, log: SessionLog, *, transport=None, max_calls: int = 40,
+                 stop_requested=None, max_decode_attempts: int = 6):
         self.log = log
         self.run_id = log.run_id
         self.transport = transport or _ollama_stream
         self.max_calls = max_calls
+        self.max_decode_attempts = max_decode_attempts
         self.stop_requested = stop_requested or (lambda: False)
         self.calls = 0
 
@@ -56,7 +58,9 @@ class Harness:
         if "keep_alive" in selected:
             payload["keep_alive"] = selected["keep_alive"]
         last_error: ModelFailure | None = None
-        for _ in range(2):
+        # Retry recoverable format/output errors with feedback instead of failing the whole run
+        # after a single retry. The global model-call budget below is the real ceiling.
+        for _ in range(self.max_decode_attempts):
             if self.calls >= self.max_calls:
                 raise ModelFailure("budget", "Model call budget exhausted")
             if self.stop_requested():

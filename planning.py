@@ -6,6 +6,26 @@ from dataclasses import dataclass
 
 
 ACTIONS = ("read_file", "write_file", "run_command", "run_python", "finish")
+_INPUT_FIELDS = ("path", "content", "command", "code")
+
+
+def _command_branch(action: str, nonempty: tuple[str, ...], allow_empty: tuple[str, ...] = ()) -> dict:
+    """One per-action schema so the model cannot leave the required input empty or fill the
+    wrong field: unused payload fields are constrained to the empty string by the grammar."""
+    properties = {"action": {"type": "string", "const": action},
+                  "plan": {"type": "string", "minLength": 1},
+                  "reason": {"type": "string", "minLength": 1}}
+    for field in _INPUT_FIELDS:
+        if field in nonempty:
+            properties[field] = {"type": "string", "minLength": 1}
+        elif field in allow_empty:
+            properties[field] = {"type": "string"}
+        else:
+            properties[field] = {"type": "string", "const": ""}
+    return {"type": "object", "additionalProperties": False, "properties": properties,
+            "required": ["action", "plan", "reason", *_INPUT_FIELDS]}
+
+
 COMMAND_SCHEMA = {
     "type": "object", "additionalProperties": False,
     "properties": {
@@ -15,6 +35,13 @@ COMMAND_SCHEMA = {
         "command": {"type": "string"}, "code": {"type": "string"},
     },
     "required": ["action", "plan", "reason", "path", "content", "command", "code"],
+    "oneOf": [
+        _command_branch("read_file", ("path",)),
+        _command_branch("write_file", ("path",), allow_empty=("content",)),
+        _command_branch("run_command", ("command",)),
+        _command_branch("run_python", ("code",)),
+        _command_branch("finish", ()),
+    ],
 }
 
 SYSTEM_PROMPT = """You are investigating an authorized local web lab. Decide the next step yourself.
