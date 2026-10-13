@@ -200,7 +200,7 @@ class ExplorerV3:
             context = {"goal": metadata["goal"], "target": metadata["target"],
                        "runtime_path": str(runtime.runtime_dir), "python": runtime.python,
                        "browser_api": "run_python code has page/context/browser; top-level await or async main(page, context, browser)",
-                       "recent": recent[-8:],
+                       "recent": recent[-4:],
                        "remaining": {"seconds": max(0, int(deadline - time.monotonic())),
                                      "model_calls": budgets["model_calls"] - harness.calls,
                                      "tool_calls": budgets["tool_calls"] - tool_index}}
@@ -213,13 +213,15 @@ class ExplorerV3:
                 return "completed", command.reason
             execution = runtime.run(run_id, command.runtime_payload(), call_id=command.call_id,
                                     timeout=budgets["command_seconds"])
+            # Trim what we feed back so the growing history does not fill num_ctx (slows calls
+            # and truncates output). The full record is always in events.jsonl.
             record = asdict(execution)
-            record["stdout"] = record["stdout"][-6000:]
-            record["stderr"] = record["stderr"][-6000:]
-            record["exception"] = record["exception"][-2000:]
+            record["stdout"] = record["stdout"][-2000:]
+            record["stderr"] = record["stderr"][-2000:]
+            record["exception"] = record["exception"][-1000:]
             recent.append({"call_id": command.call_id, "plan": command.plan, "reason": command.reason,
                            "command": {"action": command.action, "path": command.path,
-                                       "command": command.command, "code": command.code[-3000:]},
+                                       "command": command.command, "code": command.code[-1000:]},
                            "result": record})
             log.update(last_exec_id=execution.exec_id, tool_calls=tool_index + 1)
         return "error", "Tool call budget exhausted"
