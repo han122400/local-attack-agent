@@ -156,15 +156,16 @@ async def main():
                 raise ValueError("get_json is restricted to the target origin " + target_origin)
             response = await context.request.get(url)
             return await response.json()
-        async def goto_and_render(url, timeout=15000):
-            """Navigate within the target origin and wait for the SPA route to render."""
+        async def goto_and_render(url, timeout=15000, settle_ms=1200):
+            """Navigate within the target origin and let the SPA route render.
+
+            Uses domcontentloaded + a short settle wait. networkidle is avoided on purpose:
+            this app keeps polling, so networkidle may never fire and would hang until timeout.
+            """
             if not _same_origin(url):
                 raise ValueError("goto_and_render is restricted to the target origin " + target_origin)
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=timeout)
-            except Exception:
-                pass
+            await page.wait_for_timeout(settle_ms)
             return page
         helpers = {"get_text": get_text, "get_json": get_json,
                    "goto_and_render": goto_and_render, "target_origin": target_origin}
