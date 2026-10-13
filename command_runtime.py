@@ -139,6 +139,35 @@ async def main():
                 await route.abort()
         await context.route("**/*", guard)
         page = await context.new_page()
+        target_origin = target_parts.scheme + "://" + target_parts.netloc
+        def _same_origin(url):
+            p = urlsplit(url)
+            return (p.scheme == target_parts.scheme and p.hostname == target_parts.hostname
+                    and p.port == target_parts.port)
+        async def get_text(url):
+            """GET a URL within the target origin and return its response text."""
+            if not _same_origin(url):
+                raise ValueError("get_text is restricted to the target origin " + target_origin)
+            response = await context.request.get(url)
+            return await response.text()
+        async def get_json(url):
+            """GET a URL within the target origin and return parsed JSON."""
+            if not _same_origin(url):
+                raise ValueError("get_json is restricted to the target origin " + target_origin)
+            response = await context.request.get(url)
+            return await response.json()
+        async def goto_and_render(url, timeout=15000):
+            """Navigate within the target origin and wait for the SPA route to render."""
+            if not _same_origin(url):
+                raise ValueError("goto_and_render is restricted to the target origin " + target_origin)
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=timeout)
+            except Exception:
+                pass
+            return page
+        helpers = {"get_text": get_text, "get_json": get_json,
+                   "goto_and_render": goto_and_render, "target_origin": target_origin}
         send(sock, {"type": "ready"})
         buffer = b""
         try:
@@ -157,7 +186,8 @@ async def main():
                     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                         async def run_user_code():
                             namespace = {"__name__": "__agent__", "__file__": str(source),
-                                         "browser": browser, "context": context, "page": page, "asyncio": asyncio}
+                                         "browser": browser, "context": context, "page": page,
+                                         "asyncio": asyncio, **helpers}
                             compiled = compile(source.read_text(encoding="utf-8"), str(source), "exec",
                                                flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
                             result = eval(compiled, namespace, namespace)

@@ -50,6 +50,10 @@ Available actions: read_file, write_file, run_command, run_python, finish.
 read_file/write_file paths are relative to your session runtime folder. run_command executes in that folder.
 run_python executes Python in a persistent Playwright browser worker. It exposes browser, context, page,
 and asyncio. Top-level await works. You may instead define async def main(page, context, browser).
+Prefer these ready async helpers over raw Playwright plumbing: await get_text(url) returns a URL's response
+text, await get_json(url) returns parsed JSON (use for /rest, /api, or .js bundles), await goto_and_render(url)
+navigates and waits for the SPA route to render. They work only within the target origin (target_origin).
+Write your own code only for what the helpers do not cover.
 The Python namespace is new on each call; the browser context/page and its cookies persist in this run.
 Use print() to report observations. Errors and output will be returned for your next decision.
 Choose routes, search terms, code, and investigation order from your observations and goal.
