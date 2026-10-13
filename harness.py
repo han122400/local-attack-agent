@@ -9,7 +9,7 @@ from dataclasses import replace
 import httpx2 as httpx
 
 from model_settings import validate_model_settings
-from planning import COMMAND_SCHEMA, SYSTEM_PROMPT, Command, validate_command
+from planning import COMMAND_SCHEMA, SYSTEM_PROMPT, Command, normalize_command_inputs, validate_command
 from session_log import SessionLog
 
 
@@ -71,6 +71,7 @@ class Harness:
             content: list[str] = []
             thinking: list[str] = []
             completion: dict = {}
+            raw = ""
             try:
                 for chunk in self.transport(payload):
                     if self.stop_requested():
@@ -93,11 +94,24 @@ class Harness:
                 self.log.append("model_response", {"call_id": call_id, "output": raw,
                                                    "thinking": "".join(thinking),
                                                    "elapsed": round(time.monotonic() - started, 3), **completion})
+                if completion.get("done_reason") == "length":
+                    limit = selected["options"].get("num_predict", "model default")
+                    raise ModelFailure("output_limit", f"Model reached the output limit (num_predict={limit}, "
+                                       f"eval_count={completion.get('eval_count', 'unknown')}, done_reason=length); "
+                                       "the response was not executed", call_id)
                 if not raw.strip():
                     reason = completion.get("done_reason", "unknown")
                     raise ModelFailure("format", f"Empty model content (done_reason={reason}); check num_predict/thinking", call_id)
                 try:
-                    command = validate_command(json.loads(raw))
+                    answer = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise ModelFailure("format", f"Invalid JSON Command: {exc}", call_id) from exc
+                try:
+                    answer, normalized_fields = normalize_command_inputs(answer)
+                    if normalized_fields:
+                        self.log.append("command_normalized", {"call_id": call_id, "action": answer.get("action"),
+                                                               "fields": normalized_fields})
+                    command = validate_command(answer)
                 except (ValueError, TypeError) as exc:
                     raise ModelFailure("format", f"Invalid Command: {exc}", call_id) from exc
                 self.log.append("command_decoded", {"call_id": call_id, "action": command.action,
@@ -107,12 +121,19 @@ class Harness:
                 self.log.append("model_error", {"call_id": call_id, "error_kind": exc.kind,
                                                 "message": str(exc), "elapsed": round(time.monotonic() - started, 3)})
                 last_error = exc
-                if exc.kind != "format" or self.calls >= self.max_calls:
+                if exc.kind not in {"format", "output_limit"} or self.calls >= self.max_calls:
                     raise
+                # Keep the failed answer available for correction without allowing a large
+                # response to consume the entire context. The full raw response is logged.
+                previous = raw if len(raw) <= 6000 else raw[:4000] + "\n[response middle omitted]\n" + raw[-2000:]
                 payload = {**payload, "messages": [*payload["messages"],
+                    {"role": "assistant", "content": previous},
                     {"role": "user", "content": "The previous response was invalid: " + str(exc)[:220]
-                     + ". Return one short, complete JSON Command. For run_python put Python in code; "
-                       "content must be empty. Keep the command concise enough to finish within the output limit."}]}
+                     + ". Return one short, complete JSON Command. Use only the payload for its action: "
+                       "run_python uses code; run_command uses command; write_file uses path/content; "
+                       "read_file uses path. Every action including finish requires nonempty plan and reason. "
+                       "Unused path/content/command/code fields must be empty strings. "
+                       "Produce one small step with concise code, without explanatory comments, within the same output limit."}]}
             except (httpx.HTTPError, OSError, TimeoutError, json.JSONDecodeError) as exc:
                 failure = ModelFailure("transport", str(exc)[:300], call_id)
                 self.log.append("model_error", {"call_id": call_id, "error_kind": failure.kind,

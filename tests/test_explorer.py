@@ -55,7 +55,7 @@ class V3ExplorerTests(unittest.TestCase):
             meta = SessionStore(Path(temp)).read(run_id)
             self.assertEqual(meta["run_result"], "error")
             self.assertEqual(meta["cleanup_status"], "succeeded")
-            self.assertIn("Model format", meta["finish_reason"])
+            self.assertIn("Model output_limit", meta["finish_reason"])
 
 
 if __name__ == "__main__":

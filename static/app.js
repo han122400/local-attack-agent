@@ -18,8 +18,131 @@ async function jsonRequest(url, options) {
 let activeRunId=null, canStart=false, modelReady=false, labReady=false, startPending=false;
 let currentRun=null, stream=null, lastSeq=0, readingEvents=false, pendingEvents=new Map();
 let timelineEvents=[], consoleRaw='', consoleChannel='', selectedCode=null;
+const modelCalls=new Map(), consoleEntries=[];
+const runStats={calls:0,executions:0,modelErrors:0,execErrors:0,tokens:0};
+let displayQueued=false, latestExecution=null;
 let fileSource='runtime', fileItems=[], selectedFile=null, selectedEvidence=null, evidenceItems=[];
 const collapsedDirs=new Set(['deps','tmp','browser']);
+
+const actionLabel=action=>({read_file:'파일 읽기',write_file:'파일 작성',run_command:'CMD 실행',run_python:'브라우저 코드 실행',finish:'탐색 종료'})[action]||'다음 행동 생성';
+const eventLabel=kind=>({run_created:'실험 시작',model_request:'모델 판단 시작',model_response:'모델 응답 완료',command_decoded:'실행 명령 확인',command_normalized:'중복 입력 정리',model_error:'모델 응답 오류',exec_started:'작업 실행',exec_finished:'작업 결과',file_changed:'파일 변경',process_started:'프로세스 시작',process_stopped:'프로세스 종료',runtime_created:'런타임 준비',runtime_destroyed:'런타임 삭제',run_finished_by_model:'모델 종료 판단',finalize_started:'실험 정리 시작',cleanup_step:'정리 진행',evidence_exported:'증거 보존',lab_reset:'실습환경 초기화',initial_lab_reset:'초기 상태 확인',run_finalized:'실험 종료',finalize_failed:'정리 실패',run_error:'실행기 오류'})[kind]||kind;
+
+// Decode string fields for display while the JSON is still arriving. These
+// drafts never authorize execution; only command_decoded marks validation.
+function readModelFields(raw){
+  try{const value=JSON.parse(raw);if(value&&typeof value==='object'&&!Array.isArray(value))return value;}catch{}
+  const fields={};let i=0;
+  const whitespace=()=>{while(/\s/.test(raw[i]||'')&&i<raw.length)i++;};
+  function string(){
+    if(raw[i++]!=='"')return null;
+    let value='';
+    while(i<raw.length){
+      const char=raw[i++];
+      if(char==='"')return {value,complete:true};
+      if(char!=='\\'){value+=char;continue;}
+      if(i>=raw.length)break;
+      const escape=raw[i++], simple={'n':'\n','r':'\r','t':'\t','b':'\b','f':'\f','"':'"','\\':'\\','/':'/'};
+      if(escape==='u'){
+        const hex=raw.slice(i,i+4);if(!/^[0-9a-f]{4}$/i.test(hex))break;
+        value+=String.fromCharCode(parseInt(hex,16));i+=4;
+      }else if(Object.hasOwn(simple,escape))value+=simple[escape];else break;
+    }
+    return {value,complete:false};
+  }
+  whitespace();if(raw[i++]!=='{')return fields;
+  while(i<raw.length){
+    whitespace();if(raw[i]===','){i++;whitespace();}
+    if(raw[i]!=='"')break;
+    const key=string();if(!key?.complete)break;
+    whitespace();if(raw[i++]!==':')break;whitespace();
+    if(raw[i]!=='"')break;
+    const value=string();
+    if(['action','plan','reason','path','content','command','code'].includes(key.value))fields[key.value]=value.value;
+    if(!value.complete)break;
+  }
+  return fields;
+}
+
+function modelErrorLabel(call){
+  if(call.done_reason==='length'||call.error_kind==='output_limit')return '출력 한도';
+  return {format:'응답 형식 오류',transport:'모델 연결 오류',timed_out:'모델 시간 초과',cancelled:'생성 중단',budget:'호출 예산 소진'}[call.error_kind]||'모델 오류';
+}
+function callStatus(call){
+  if(call.error)return `${modelErrorLabel(call)} · 실행되지 않음`;
+  if(call.result)return call.result.exit_code===0?'실행 완료':'실행 오류';
+  if(call.executing)return '실행 중';
+  if(call.decoded)return call.action==='finish'?'종료 판단':'명령 확인됨';
+  return '생성 중 · 실행 전 초안';
+}
+function getCall(id){
+  if(!modelCalls.has(id)){
+    const call={id,raw:'',thinking:'',fields:{},outputChannels:new Set()};modelCalls.set(id,call);
+    consoleEntries.push({kind:'model',call});
+  }
+  return modelCalls.get(id);
+}
+function readableCall(call){
+  const fields={...readModelFields(call.raw),...call.fields};
+  const lines=[`\n── ${call.id} · ${callStatus(call)} ──`];
+  if(fields.action)lines.push(`행동: ${actionLabel(fields.action)}`);
+  if(fields.plan)lines.push(`계획: ${fields.plan}`);
+  if(fields.reason)lines.push(`이유: ${fields.reason}`);
+  if(fields.path)lines.push(`파일: ${fields.path}`);
+  if(fields.code)lines.push(`\nPython 코드\n${fields.code}`);
+  else if(fields.command)lines.push(`\nCMD 명령\n${fields.command}`);
+  else if(fields.content)lines.push(`\n작성할 내용\n${fields.content}`);
+  if(call.error){
+    if(call.done_reason==='length'||call.error_kind==='output_limit')lines.push(`\n출력 한도 ${call.eval_count||call.limit||'—'}토큰에 도달했습니다. 이 응답의 코드는 실행되지 않았습니다.`);
+    else lines.push(`\n${modelErrorLabel(call)}: ${call.error}`);
+  }
+  if(call.thinking)lines.push(`\nThinking\n${call.thinking}`);
+  return lines.join('\n')+'\n';
+}
+function queueDisplay(){
+  if(displayQueued)return;displayQueued=true;
+  requestAnimationFrame(()=>{
+    displayQueued=false;
+    const raw=$('rawOutputToggle')?.checked;
+    consoleRaw=consoleEntries.map(entry=>entry.kind==='model'
+      ?raw?`\n[${entry.call.id} · 모델 원문]\n${entry.call.raw}\n${entry.call.error?'오류: '+entry.call.error+'\n':''}`:readableCall(entry.call)
+      :`\n[${entry.channel}] ${entry.text}`).join('').slice(-200000);
+    setText('consoleCount',`${consoleRaw.length.toLocaleString()}자`);
+    renderConsole();renderAgentStatus();
+  });
+}
+function renderAgentStatus(){
+  setText('callMetric',runStats.calls);setText('execMetric',runStats.executions);
+  setText('errorMetric',runStats.modelErrors+runStats.execErrors);setText('errorBreakdown',`모델 ${runStats.modelErrors} · 실행 ${runStats.execErrors}`);
+  setText('tokenMetric',runStats.tokens.toLocaleString());
+  if(currentRun?.budgets){setText('callBudget',`최대 ${currentRun.budgets.model_calls}회`);setText('execBudget',`최대 ${currentRun.budgets.tool_calls}회`);}
+  const calls=[...modelCalls.values()],latest=calls.at(-1);
+  if(latest){
+    const fields={...readModelFields(latest.raw),...latest.fields};
+    setText('currentPlan',fields.plan||'다음 행동을 생성하고 있습니다.');setText('currentReason',fields.reason||'선택 이유를 기다립니다.');
+    setText('actionStatus',callStatus(latest));$('actionStatus').className=`status-badge ${latest.error?'bad':latest.result?.exit_code===0?'ok':'warn'}`;
+  }
+  setText('decisionCount',`${runStats.calls}회 · 최근 5회`);
+  if(calls.length){
+    const parent=$('decisionList'),opened=new Set([...parent.querySelectorAll('details[open]')].map(item=>item.dataset.call));parent.replaceChildren();
+    for(const call of calls.slice(-5).reverse()){
+      const fields={...readModelFields(call.raw),...call.fields},row=textNode('article','','decision-card');
+      const heading=textNode('div','','decision-head');heading.append(textNode('strong',`${call.id} · ${actionLabel(fields.action)}`),textNode('span',callStatus(call),call.error?'error-text':'subtle'));
+      row.append(heading,textNode('p',fields.plan||'계획 생성 중','decision-plan'));
+      if(fields.reason)row.append(textNode('p',fields.reason,'reason-text'));
+      if(call.error)row.append(textNode('p',call.done_reason==='length'?`${call.eval_count||call.limit}토큰 한도로 응답이 잘렸습니다. 실행 0회.`:call.error,'decision-error'));
+      const code=fields.code||fields.command||fields.content;
+      if(code){const detail=document.createElement('details');detail.dataset.call=call.id;detail.open=opened.has(call.id);detail.append(textNode('summary',`${call.exec_id||'실행 전'} · ${fields.code?'Python 코드':fields.command?'CMD 명령':'파일 내용'} 보기`),textNode('pre',code,'code-preview'));row.append(detail);}
+      parent.append(row);
+    }
+  }
+  if(latestExecution){
+    const result=latestExecution;
+    setText('observationStatus',`${result.exec_id} · ${result.exit_code===0?'성공':'오류'} · ${result.elapsed??'—'}초`);
+    const failure=result.exception?.trim().split('\n').at(-1);
+    setText('latestObservation',[failure,result.stdout,result.stderr].filter(Boolean).join('\n').slice(0,2400)||`${actionLabel(result.action)} 완료${result.path?'\n'+result.path:''} · 출력 없음`);
+    $('observationStatus').classList.toggle('error-text',result.exit_code!==0);
+  }
+}
 
 function updateSidebar(list) {
   activeRunId=validRunId(list.active_run_id) ? list.active_run_id : null;
@@ -170,10 +293,10 @@ function renderRunHeader(state){
   setText('runElapsed',`${Math.floor(seconds/60)}분 ${seconds%60}초`);
   const phase=statusText(state.phase), result=state.run_result?statusText(state.run_result):'탐색 중';
   setText('runStatus',`${result} · ${phase} · 정리 ${statusText(state.cleanup_status)} · 초기화 ${statusText(state.lab_reset_status)}`);
-  $('runStatus').className=`status-badge ${state.phase==='finished'&&state.run_result==='completed'?'ok':state.phase==='recovery_required'?'bad':'warn'}`;
+  $('runStatus').className=`status-badge ${state.phase==='finished'&&state.run_result==='completed'?'ok':state.phase==='recovery_required'||state.run_result==='error'?'bad':'warn'}`;
   $('stopButton').hidden=!state.live_available || state.phase==='finalizing' || state.phase==='resetting';
   $('recoverButton').hidden=state.phase!=='recovery_required'&&state.cleanup_status!=='failed'&&state.lab_reset_status!=='failed';
-  setText('runError',state.cleanup_error||'');
+  setText('runError',state.cleanup_error||(state.run_result==='error'?state.finish_reason:'')||'');
   const summary=$('resultSummary'); summary.replaceChildren();
   for(const [key,value] of [['실험 결과',state.run_result||'진행 중'],['종료 이유',state.finish_reason||'—'],
     ['로그',state.log_status],['런타임 정리',state.cleanup_status],['Juice Shop 초기화',state.lab_reset_status]]){
@@ -181,6 +304,7 @@ function renderRunHeader(state){
   }
   setText('settingsValue',JSON.stringify({run_id:state.run_id,target:state.target,goal:state.goal,model:state.model,
     model_settings:state.model_settings,budgets:state.budgets,scenario_source:state.scenario_source,chain_mode:state.chain_mode},null,2));
+  renderAgentStatus();
   $('exportLink').href=`/api/runs/${runId}/export`;
   if(!state.live_available&&stream){stream.close();stream=null;setText('connectionStatus','저장 기록');refreshEvents();}
   if(!state.live_available&&!stream)setText('connectionStatus','저장 기록');
@@ -235,7 +359,10 @@ function connectLive(){
 
 function eventDescription(event){
   const identity=[event.call_id,event.exec_id].filter(Boolean).join(' · ');
-  const detail=event.plan||event.reason||event.action||event.step||event.error||event.message||event.path||'';
+  let detail=event.plan||event.reason||event.message||event.error||event.path||event.step||(event.action?actionLabel(event.action):event.status?statusText(event.status):'');
+  if(event.kind==='model_response')detail=`${event.eval_count??'—'}토큰 · ${event.elapsed??'—'}초 · ${event.done_reason==='length'?'출력 한도에서 잘림':'응답 수신'}`;
+  if(event.kind==='exec_finished')detail=`${actionLabel(event.action)} · 종료 코드 ${event.exit_code??'—'} · ${event.elapsed??'—'}초${event.exception?' · '+event.exception.split('\n').filter(Boolean).at(-1):''}`;
+  if(event.kind==='command_normalized')detail=`중복 필드 정리: ${(event.fields||[]).join(', ')}`;
   return `${identity}${identity&&detail?' · ':''}${String(detail).slice(0,260)}` || '기록됨';
 }
 
@@ -244,7 +371,8 @@ function renderTimeline(){
   for(const event of timelineEvents){
     const row=document.createElement('button');row.type='button';row.className='timeline-row';
     row.append(textNode('time',new Date(event.at*1000).toLocaleTimeString('ko-KR')),
-      textNode('span',event.kind,'kind'),textNode('span',eventDescription(event),'body'));
+      textNode('span',eventLabel(event.kind),'kind'),textNode('span',eventDescription(event),'body'));
+    row.dataset.kind=event.kind;
     if(event.exec_id)row.addEventListener('click',()=>showExecution(event,row));
     parent.append(row);
   }
@@ -255,10 +383,14 @@ function showExecution(event,row){
   for(const item of $('timeline').querySelectorAll('.selected'))item.classList.remove('selected');
   row.classList.add('selected');
   const matching=[...timelineEvents].reverse().find(item=>item.exec_id===event.exec_id&&item.kind==='exec_finished')||event;
-  const detail={call_id:matching.call_id,exec_id:matching.exec_id,action:matching.action,
-    exit_code:matching.exit_code,elapsed:matching.elapsed,stdout:matching.stdout,
-    stderr:matching.stderr,exception:matching.exception,artifact_path:matching.artifact_path};
-  setText('executionText',JSON.stringify(detail,null,2));$('executionDetail').hidden=false;
+  const detail=[`${matching.call_id||'—'} · ${matching.exec_id||'—'} · ${actionLabel(matching.action)}`,
+    `종료 코드: ${matching.exit_code??'진행 중'} · 소요 시간: ${matching.elapsed??'—'}초`];
+  if(matching.path||matching.cwd)detail.push(`작업 경로: ${matching.path||matching.cwd}`);
+  if(matching.stdout)detail.push(`\n표준 출력\n${matching.stdout}`);
+  if(matching.stderr)detail.push(`\n오류 출력\n${matching.stderr}`);
+  if(matching.exception)detail.push(`\n예외\n${matching.exception}`);
+  if(matching.output_truncated)detail.push('\n출력 일부가 잘렸습니다. 전체 저장 기록을 확인하세요.');
+  setText('executionText',detail.join('\n'));$('executionDetail').hidden=false;
   selectedCode=typeof matching.artifact_path==='string'&&matching.artifact_path.startsWith('artifacts/')
     ?matching.artifact_path.slice('artifacts/'.length):null;
   $('openCodeButton').hidden=!selectedCode;
@@ -266,15 +398,15 @@ function showExecution(event,row){
 
 function appendConsole(chunk,channel){
   if(!chunk)return;
-  if(channel!==consoleChannel){consoleRaw+=`\n[${channel}] `;consoleChannel=channel;}
-  consoleRaw+=chunk;
-  if(consoleRaw.length>200000)consoleRaw=consoleRaw.slice(-200000);
-  setText('consoleCount',`${consoleRaw.length.toLocaleString()}자 · 화면 보관 범위`);
-  renderConsole();
+  const last=consoleEntries.at(-1);
+  if(last?.kind==='text'&&last.channel===channel)last.text=(last.text+chunk).slice(-200000);
+  else consoleEntries.push({kind:'text',channel,text:chunk.slice(-200000)});
+  if(consoleEntries.length>500)consoleEntries.shift();
+  queueDisplay();
 }
 
 function renderConsole(){
-  const box=$('consoleOutput'),atBottom=box.scrollTop+box.clientHeight>=box.scrollHeight-28;
+  const box=$('consoleOutput'),previousTop=box.scrollTop,atBottom=box.scrollTop+box.clientHeight>=box.scrollHeight-28;
   const search=$('consoleSearch').value;
   box.replaceChildren();
   if(!search)box.textContent=consoleRaw;
@@ -290,15 +422,38 @@ function renderConsole(){
     box.append(document.createTextNode(consoleRaw.slice(cursor)));
   }
   if($('autoScrollToggle').checked&&atBottom)box.scrollTop=box.scrollHeight;
-  else if(consoleRaw) $('newOutputButton').hidden=false;
+  else if(consoleRaw){box.scrollTop=previousTop;$('newOutputButton').hidden=false;}
 }
 
 function applyEvent(event){
-  if(event.kind==='model_delta')appendConsole(event.text,event.channel==='thinking'?'Ollama thinking':'Ollama');
-  else if(event.kind==='exec_output'||event.kind==='worker_output')appendConsole(event.text,event.channel||'output');
-  else if(event.kind==='model_request')appendConsole(`\n${event.call_id} · 모델 판단 시작\n`,'system');
-  else if(event.kind==='exec_started')appendConsole(`\n${event.exec_id} · ${event.action} · ${event.cwd||''}\n`,'system');
-  else if(event.kind==='exec_finished')appendConsole(`\n${event.exec_id} · 종료 코드 ${event.exit_code??'—'}${event.exception?' · '+event.exception.slice(-300):''}\n`,'system');
+  if(event.kind==='model_request'){
+    const call=getCall(event.call_id);call.limit=event.settings?.options?.num_predict;runStats.calls++;queueDisplay();
+  }else if(event.kind==='model_delta'){
+    const call=getCall(event.call_id);
+    if(event.channel==='thinking')call.thinking=(call.thinking+event.text).slice(-50000);
+    else call.raw=(call.raw+event.text).slice(0,200000);
+    queueDisplay();
+  }else if(event.kind==='model_response'){
+    const call=getCall(event.call_id);call.raw=String(event.output||'').slice(0,200000);
+    call.done_reason=event.done_reason;call.eval_count=event.eval_count;runStats.tokens+=event.eval_count||0;queueDisplay();
+  }else if(event.kind==='command_decoded'){
+    const call=getCall(event.call_id);call.decoded=true;call.action=event.action;
+    call.fields={action:event.action,plan:event.plan,reason:event.reason};queueDisplay();
+  }else if(event.kind==='model_error'){
+    const call=getCall(event.call_id);call.error=event.message;call.error_kind=event.error_kind;runStats.modelErrors++;queueDisplay();
+  }else if(event.kind==='command_normalized')appendConsole(`${event.call_id} · 동일한 중복 필드를 정리했습니다: ${(event.fields||[]).join(', ')}\n`,'응답 정리');
+  else if(event.kind==='exec_output'||event.kind==='worker_output'){
+    if(event.call_id)getCall(event.call_id).outputChannels.add(event.channel);
+    appendConsole(event.text,event.channel||'output');
+  }
+  else if(event.kind==='exec_started'){
+    const call=getCall(event.call_id);call.executing=true;call.exec_id=event.exec_id;runStats.executions++;
+    appendConsole(`${event.exec_id} · ${actionLabel(event.action)}\n작업 경로: ${event.cwd||'—'}\n`,'실행');
+  }else if(event.kind==='exec_finished'){
+    const call=getCall(event.call_id);call.result=event;latestExecution=event;if(event.exit_code!==0)runStats.execErrors++;
+    for(const channel of ['stdout','stderr'])if(event[channel]&&!call.outputChannels.has(channel))appendConsole(event[channel],channel);
+    appendConsole(`${event.exec_id} · ${event.exit_code===0?'완료':'실행 오류'} · 종료 코드 ${event.exit_code??'—'} · ${event.elapsed??'—'}초${event.exception?'\n'+event.exception:''}${event.output_truncated?'\n출력 일부 잘림':''}\n`,'실행 결과');
+  }
   else if(event.kind==='finalize_failed'||event.kind==='run_error')appendConsole(`\n${event.kind}: ${event.error||event.message||''}\n`,'system');
   if(!['model_delta','exec_output','worker_output'].includes(event.kind)){
     timelineEvents.push(event);if(timelineEvents.length>350)timelineEvents.shift();renderTimeline();
@@ -389,8 +544,9 @@ function initRun(){
     try{await jsonRequest(`/api/runs/${runId}/reset`,{method:'POST'});await loadRunState();}
     catch(error){setText('runError',error.message);}finally{$('recoverButton').disabled=false;}
   });
-  $('openCodeButton').addEventListener('click',()=>{if(selectedCode)selectFile('artifacts',selectedCode);});
+  $('openCodeButton').addEventListener('click',()=>{if(selectedCode){selectFile('artifacts',selectedCode);$('filePreview').scrollIntoView({block:'center'});}});
   $('consoleSearch').addEventListener('input',renderConsole);
+  $('rawOutputToggle').addEventListener('change',()=>{setText('outputModeNote',$('rawOutputToggle').checked?'모델의 JSON 원문입니다. 실행 출력은 그대로 표시합니다.':'계획·이유·코드를 풀어 표시합니다. 생성 중인 코드는 실행 전 초안입니다.');queueDisplay();});
   $('wrapToggle').addEventListener('change',()=> $('consoleOutput').classList.toggle('wrap',$('wrapToggle').checked));
   $('autoScrollToggle').addEventListener('change',()=>{if($('autoScrollToggle').checked){$('newOutputButton').hidden=true;$('consoleOutput').scrollTop=$('consoleOutput').scrollHeight;}});
   $('consoleOutput').addEventListener('scroll',()=>{

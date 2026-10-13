@@ -147,17 +147,21 @@ class BrowserUiScenarios(unittest.TestCase):
         payload = starts[0]
         run_id = payload["run_id"]
         page.wait_for_url(f"{self.base}/runs/{run_id}")
+        page.locator("#runId", has_text=run_id).wait_for()
         self.assertEqual(page.locator("#runId").inner_text(), run_id)
         self.assertTrue(self.explorer.worker.is_alive())
         duplicate = page.request.post(f"{self.base}/api/start", data=json.dumps({"goal":"duplicate","model":"mock:model"}),
                                       headers={"Content-Type":"application/json"})
         self.assertEqual(duplicate.status, 409)
         page.reload()
+        page.locator("#runId", has_text=run_id).wait_for()
         self.assertEqual(page.locator("#runId").inner_text(), run_id)
         page.goto(self.base)
+        page.locator(f'#currentRunLink[href="/runs/{run_id}"]').wait_for()
         self.assertTrue(page.locator("#startButton").is_disabled())
         self.assertEqual(page.locator("#currentRunLink").get_attribute("href"), f"/runs/{run_id}")
         page.go_back()
+        page.locator("#runId", has_text=run_id).wait_for()
         self.assertEqual(page.locator("#runId").inner_text(), run_id)
         page.locator("#settingsTab").click()
         self.assertIn(run_id, page.locator("#settingsValue").inner_text())
@@ -181,6 +185,7 @@ class BrowserUiScenarios(unittest.TestCase):
         lost_page.route("**/api/start", lose_response)
         lost_page.locator("#startButton").click()
         lost_page.wait_for_url(f"{self.base}/runs/*")
+        lost_page.locator("#runId", has_text=lost_ids[0]).wait_for()
         self.assertEqual(lost_page.locator("#runId").inner_text(), lost_ids[0])
         self.assertEqual(len(self.explorer.store.list_runs()), 2)
         self.release_start.set()
@@ -250,7 +255,7 @@ class BrowserUiScenarios(unittest.TestCase):
         self.assertGreater(page.locator("#consoleOutput mark").count(), 0)
         self.assertEqual(page.evaluate("window.__xss"), None)
         self.assertEqual(page.locator("#timeline script, #timeline img").count(), 0)
-        page.locator("#timeline .timeline-row", has_text="exec_finished").last.click()
+        page.locator('#timeline .timeline-row[data-kind="exec_finished"]').last.click()
         self.assertIn("EXEC-0002", page.locator("#executionText").inner_text())
         self.assertIn("CALL-0002", page.locator("#executionText").inner_text())
         page.locator("#openCodeButton").click()
@@ -320,6 +325,59 @@ class BrowserUiScenarios(unittest.TestCase):
         self.assertTrue(page.locator("#newOutputButton").is_visible())
         page.locator("#newOutputButton").click()
         self.assertTrue(page.locator("#autoScrollToggle").is_checked())
+        self.assertFalse(self.page_errors)
+
+    def test_05_model_output_is_readable_and_failed_generation_is_not_execution(self):
+        run_id = "e" * 32
+        log = self.explorer.store.create(run_id, {
+            "goal": "출력 가독성 확인", "model": "mock:model", "phase": "finished",
+            "run_result": "error", "cleanup_status": "succeeded", "log_status": "finalized",
+            "lab_reset_status": "succeeded", "finish_reason": "Model output_limit",
+            "budgets": {"model_calls": 40, "tool_calls": 80}, "started_at": 1, "finished_at": 2})
+        payload = {"action":"run_python", "plan":"페이지 제목을 관찰합니다", "reason":"실제 출력으로 확인합니다",
+                   "code":"print('first')\nprint('second')", "path":"", "content":"", "command":""}
+        raw = json.dumps(payload, ensure_ascii=False)
+        log.append("model_request", {"call_id":"CALL-0001", "settings":{"options":{"num_predict":1024}}})
+        for part in (raw[:35], raw[35:90], raw[90:]):
+            log.append("model_delta", {"call_id":"CALL-0001", "channel":"content", "text":part})
+        log.append("model_response", {"call_id":"CALL-0001", "output":raw, "done_reason":"stop", "eval_count":80})
+        log.append("command_decoded", {"call_id":"CALL-0001", "action":"run_python", "plan":payload["plan"], "reason":payload["reason"]})
+        log.append("exec_started", {"call_id":"CALL-0001", "exec_id":"EXEC-0001", "action":"run_python"})
+        log.append("exec_output", {"call_id":"CALL-0001", "exec_id":"EXEC-0001", "channel":"stdout", "text":"실제 관찰 결과\n"})
+        log.append("exec_finished", {"call_id":"CALL-0001", "exec_id":"EXEC-0001", "action":"run_python", "exit_code":0, "elapsed":0.5, "stdout":"실제 관찰 결과\n"})
+        log.append("model_request", {"call_id":"CALL-0002", "settings":{"options":{"num_predict":1024}}})
+        partial = '{"action":"run_python","plan":"다음 관찰","code":"print(\\"unfinished'
+        log.append("model_delta", {"call_id":"CALL-0002", "channel":"content", "text":partial})
+        log.append("model_response", {"call_id":"CALL-0002", "output":partial, "done_reason":"length", "eval_count":1024})
+        log.append("model_error", {"call_id":"CALL-0002", "error_kind":"output_limit", "message":"Output limit reached (1024 tokens)"})
+        file_reply = json.dumps({"action":"read_file", "plan":"저장 파일 확인", "reason":"내용 관찰",
+                                 "path":"work/note.txt", "content":"", "command":"", "code":""})
+        log.append("model_request", {"call_id":"CALL-0003"})
+        log.append("model_response", {"call_id":"CALL-0003", "output":file_reply, "done_reason":"stop", "eval_count":25})
+        log.append("command_decoded", {"call_id":"CALL-0003", "action":"read_file", "plan":"저장 파일 확인", "reason":"내용 관찰"})
+        log.append("exec_started", {"call_id":"CALL-0003", "exec_id":"EXEC-0002", "action":"read_file"})
+        log.append("exec_finished", {"call_id":"CALL-0003", "exec_id":"EXEC-0002", "action":"read_file",
+                                     "exit_code":0, "elapsed":0.1, "stdout":"파일 읽기 실제 출력"})
+        log.close()
+        page = self.page
+        page.goto(f"{self.base}/runs/{run_id}")
+        page.locator("#decisionList", has_text="페이지 제목을 관찰합니다").wait_for(timeout=5000)
+        readable = page.locator("#consoleOutput").inner_text()
+        self.assertIn("print('first')\nprint('second')", readable)
+        self.assertEqual(readable.count("실제 관찰 결과"), 1)
+        self.assertIn("파일 읽기 실제 출력", readable)
+        self.assertIn('print("unfinished', readable)
+        self.assertNotIn('"action":', readable)
+        self.assertIn("실행되지 않음", readable)
+        self.assertIn("출력 한도", page.locator("#decisionList").inner_text())
+        self.assertEqual("3", page.locator("#callMetric").inner_text())
+        self.assertEqual("2", page.locator("#execMetric").inner_text())
+        page.locator("#rawOutputToggle").check()
+        page.locator("#consoleOutput", has_text='"action":').wait_for()
+        self.assertIn('"action":', page.locator("#consoleOutput").inner_text())
+        page.locator("#rawOutputToggle").uncheck()
+        page.locator("#consoleOutput", has_text="Python 코드").wait_for()
+        self.assertNotIn('"action":', page.locator("#consoleOutput").inner_text())
         self.assertFalse(self.page_errors)
 
 
