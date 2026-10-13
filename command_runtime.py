@@ -150,10 +150,12 @@ async def main():
                     continue
                 exec_id = message["exec_id"]
                 source = Path(message["path"])
+                limit = message.get("timeout")
+                timed_out = False
                 with open(message["stdout_path"], "w", encoding="utf-8", buffering=1) as out, \
                      open(message["stderr_path"], "w", encoding="utf-8", buffering=1) as err:
                     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                        try:
+                        async def run_user_code():
                             namespace = {"__name__": "__agent__", "__file__": str(source),
                                          "browser": browser, "context": context, "page": page, "asyncio": asyncio}
                             compiled = compile(source.read_text(encoding="utf-8"), str(source), "exec",
@@ -166,7 +168,19 @@ async def main():
                                 result = entry(page, context, browser)
                                 if inspect.isawaitable(result):
                                     await result
+                        try:
+                            # Cancel the user coroutine on timeout WITHOUT killing this worker,
+                            # so the browser survives for the next command.
+                            if isinstance(limit, (int, float)) and limit > 0:
+                                await asyncio.wait_for(run_user_code(), limit)
+                            else:
+                                await run_user_code()
                             exit_code, detail = 0, ""
+                        except asyncio.TimeoutError:
+                            timed_out = True
+                            exit_code = None
+                            detail = "Browser code timed out"
+                            print(detail, file=sys.stderr, flush=True)
                         except BaseException:
                             detail = traceback.format_exc()
                             print(detail, file=sys.stderr, flush=True)
@@ -174,7 +188,7 @@ async def main():
                         out.flush()
                         err.flush()
                 send(sock, {"type": "result", "exec_id": exec_id, "exit_code": exit_code,
-                            "exception": detail[-4000:]})
+                            "timed_out": timed_out, "exception": detail[-4000:]})
         finally:
             await context.close()
             await browser.close()
@@ -521,8 +535,23 @@ class CommandRuntime:
                 result.path = str(self.runtime_dir)
                 result.exit_code = self._run_command(script, exec_id, timeout)
             elif action == "run_python":
-                if not self._browser_enabled or self._worker is None or self._worker.poll() is not None:
+                if not self._browser_enabled:
                     raise RuntimeError("Browser worker is unavailable")
+                if self._worker is None or self._worker.poll() is not None:
+                    # A prior worker was hard-killed (unresponsive timeout) or crashed. Bring a
+                    # fresh browser back so the session keeps working; browser state resets.
+                    if self._worker is not None:
+                        self._unregister(self._worker)
+                        self._worker = None
+                    if self._conn is not None:
+                        try:
+                            self._conn.close()
+                        except OSError:
+                            pass
+                        self._conn = None
+                    self._control_buffer = b""
+                    self.log.append("browser_respawn", {"exec_id": exec_id, "reason": "worker_unavailable"})
+                    self._start_browser_worker()
                 code = command["code"]
                 if not isinstance(code, str) or not code.strip():
                     raise ValueError("Python code required")
@@ -539,13 +568,19 @@ class CommandRuntime:
                 def poll_output():
                     self._tail_python_output(paths, offsets, decoders, exec_id)
                 self._send_control({"type": "execute", "exec_id": exec_id, "path": str(source),
-                                    "stdout_path": str(paths["stdout"]), "stderr_path": str(paths["stderr"])})
-                reply = self._wait_control(timeout, on_poll=poll_output)
+                                    "stdout_path": str(paths["stdout"]), "stderr_path": str(paths["stderr"]),
+                                    "timeout": timeout})
+                # The worker cancels the code at `timeout` and reports back; give it extra grace
+                # so we only hard-kill (and lose the browser) when the worker is truly unresponsive.
+                reply = self._wait_control(timeout + 10, on_poll=poll_output)
                 self._tail_python_output(paths, offsets, decoders, exec_id, final=True)
                 if reply.get("type") != "result" or reply.get("exec_id") != exec_id:
                     raise RuntimeError("Browser worker response mismatch")
                 result.exit_code = reply.get("exit_code")
                 result.exception = reply.get("exception", "")
+                if reply.get("timed_out"):
+                    result.timed_out = True
+                    result.exit_code = None
                 time.sleep(0.05)
             elif action == "finish":
                 result.exit_code = 0

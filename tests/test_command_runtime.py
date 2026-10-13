@@ -163,6 +163,54 @@ class BrowserWorkerTests(unittest.TestCase):
                 runtime.destroy(RUN_ID, 10)
                 log.close()
 
+    def test_run_python_timeout_cancels_code_but_keeps_browser(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {"goal": "inspect"})
+            runtime = CommandRuntime(Path(temp), log)
+            try:
+                runtime.start_session(RUN_ID)
+                runtime.run(RUN_ID, {"action": "run_python",
+                    "code": "await page.goto('data:text/html,<h1>alive</h1>')"})
+                # A hanging command must time out by cancelling the coroutine, NOT by killing
+                # the worker: the browser (and its state) stays usable afterwards.
+                slow = runtime.run(RUN_ID, {"action": "run_python",
+                    "code": "await asyncio.sleep(10)"}, timeout=1)
+                self.assertTrue(slow.timed_out, slow.exception)
+                self.assertIsNone(slow.exit_code)
+                self.assertTrue(runtime.inspect(RUN_ID)["browser_alive"])
+                after = runtime.run(RUN_ID, {"action": "run_python",
+                    "code": "print(await page.locator('h1').inner_text())"})
+                self.assertEqual(after.exit_code, 0, after.exception)
+                self.assertIn("alive", after.stdout)
+            finally:
+                runtime.stop(RUN_ID, 10)
+                runtime.destroy(RUN_ID, 10)
+                log.close()
+
+    def test_run_python_respawns_browser_after_worker_death(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {"goal": "inspect"})
+            runtime = CommandRuntime(Path(temp), log)
+            try:
+                runtime.start_session(RUN_ID)
+                runtime.run(RUN_ID, {"action": "run_python", "code": "pass"})
+                # Simulate a hard-killed / crashed worker.
+                worker = runtime._worker
+                worker.kill()
+                worker.wait(timeout=5)
+                # The next run_python transparently respawns a fresh browser instead of
+                # failing "unavailable" for the rest of the session.
+                recovered = runtime.run(RUN_ID, {"action": "run_python",
+                    "code": "await page.goto('data:text/html,<h1>back</h1>')\n"
+                            "print(await page.locator('h1').inner_text())"})
+                self.assertEqual(recovered.exit_code, 0, recovered.exception)
+                self.assertIn("back", recovered.stdout)
+                self.assertTrue(runtime.inspect(RUN_ID)["browser_alive"])
+            finally:
+                runtime.stop(RUN_ID, 10)
+                runtime.destroy(RUN_ID, 10)
+                log.close()
+
 
 if __name__ == "__main__":
     unittest.main()
