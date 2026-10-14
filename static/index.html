@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Juice Explorer · 로컬 실험</title>
-  <link rel="stylesheet" href="/style.css?v=3-goals">
-  <script src="/app.js?v=3-goals" defer></script>
+  <link rel="stylesheet" href="/style.css?v=3-event-types">
+  <script src="/app.js?v=3-event-types" defer></script>
 </head>
 <body>
   <button id="menuToggle" class="menu-toggle" type="button" aria-controls="sidebar" aria-expanded="false">☰ 메뉴</button>
@@ -55,7 +55,7 @@
               <label>Temperature<input id="temperatureInput" type="number" min="0" max="2" step="0.05" value="0"></label>
               <label>컨텍스트 토큰<input id="contextInput" type="number" min="512" max="262144" step="1" value="8192"></label>
               <label>출력 토큰<input id="predictInput" type="number" min="1" max="65536" step="1" value="4096"></label>
-              <label>탐색 시간 · 초<input id="secondsInput" type="number" min="1" max="3600" step="1" value="600"></label>
+              <label>탐색 시간 · 초<input id="secondsInput" type="number" min="1" max="3600" step="1" value="1200"></label>
               <label>모델 호출<input id="modelCallsInput" type="number" min="1" max="500" step="1" value="40"></label>
               <label>도구 호출<input id="toolCallsInput" type="number" min="1" max="500" step="1" value="80"></label>
               <label>명령 1회 · 초<input id="commandSecondsInput" type="number" min="1" max="3600" step="1" value="30"></label>
@@ -82,8 +82,9 @@
       <section id="observePanel" role="tabpanel" class="tab-panel">
         <div class="run-metrics" aria-label="실험 통계">
           <article class="metric"><span>모델 판단</span><strong id="callMetric">0</strong><small id="callBudget">호출 기록 기준</small></article>
-          <article class="metric"><span>실행한 작업</span><strong id="execMetric">0</strong><small id="execBudget">파일·CMD·브라우저 코드</small></article>
-          <article class="metric"><span>오류</span><strong id="errorMetric">0</strong><small id="errorBreakdown">모델 0 · 실행 0</small></article>
+          <article class="metric"><span>실행한 작업</span><strong id="execMetric">0</strong><small id="workBreakdown">성공 0 · 실패 0 · 시간 초과 0 · 중단 0</small><small id="execBudget">파일·CMD·브라우저 코드</small></article>
+          <article class="metric"><span>모델 응답 실패</span><strong id="modelFailureMetric">0</strong><small>형식 불일치 · 출력 잘림 · 시간 초과</small></article>
+          <article class="metric"><span>시스템 오류</span><strong id="systemErrorMetric">0</strong><small id="systemErrorNote">실행기 · 연결 · 저장 · 정리</small></article>
           <article class="metric"><span>생성 토큰</span><strong id="tokenMetric">0</strong><small>Ollama 응답의 실제 사용량</small></article>
         </div>
         <div class="activity-grid">
@@ -95,7 +96,7 @@
           <p id="outputModeNote" class="field-note">계획·이유·코드를 풀어 표시합니다. 생성 중인 코드는 실행 전 초안입니다.</p><div class="console-window"><div class="console-bar"><span class="console-lights" aria-hidden="true">● ● ●</span><span>juice-explorer / live</span><small>최근 20만 자 · 전체 기록은 ZIP에 보존</small></div><pre id="consoleOutput" class="console-output wrap" role="log" aria-live="off"></pre></div>
         </section>
         <section class="panel"><div class="section-head"><div><span class="section-kicker">MODEL DECISIONS</span><h2>모델 판단 기록</h2></div><span id="decisionCount" class="subtle">0회</span></div><div id="decisionList" class="decision-list"><p class="field-note">첫 계획이 생성되면 판단과 결과를 연결해 보여줍니다.</p></div></section>
-        <section class="panel"><div class="section-head"><h2>실행 타임라인</h2><span id="eventCount" class="subtle">0건</span></div><div id="timeline" class="timeline"></div><div id="executionDetail" class="execution-detail" hidden><h3>선택한 실행</h3><pre id="executionText"></pre><button id="openCodeButton" class="button secondary" type="button" hidden>실행 당시 코드 보기</button></div></section>
+        <section class="panel"><div class="section-head"><h2>실행 타임라인</h2><span id="eventCount" class="subtle">0건</span></div><label class="event-filter">분류 <select id="eventCategoryFilter"><option value="all">전체</option><option value="model">모델</option><option value="execution">작업 실행</option><option value="observation">관찰</option><option value="system">시스템</option><option value="lifecycle">세션 관리</option></select></label><div id="timeline" class="timeline"></div><div id="executionDetail" class="execution-detail" hidden><h3>선택한 이벤트</h3><pre id="executionText"></pre><button id="openCodeButton" class="button secondary" type="button" hidden>실행 당시 코드 보기</button></div></section>
         <div class="work-grid">
           <section class="panel file-panel"><div class="section-head"><h2 id="fileHeading">런타임 파일</h2><span id="fileCount" class="subtle">—</span></div><div id="fileList" class="file-list" role="tree"></div></section>
           <section class="panel detail-panel"><h2>파일 내용 · 읽기 전용</h2><p id="fileMeta" class="field-note">파일을 선택하세요.</p><pre id="filePreview" class="code-preview">선택한 파일의 텍스트 미리보기가 여기에 표시됩니다.</pre></section>

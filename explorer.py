@@ -22,7 +22,7 @@ from session_log import ControllerLease, LogFailure, SessionLog, SessionStore, v
 TARGET = "http://127.0.0.1:3000/"
 MODEL = "qwen3.5:2b"
 RUNS_ROOT = Path(__file__).resolve().parent / "runs"
-DEFAULT_BUDGETS = {"seconds": 600, "model_calls": 40, "tool_calls": 80,
+DEFAULT_BUDGETS = {"seconds": 1200, "model_calls": 40, "tool_calls": 80,
                    "command_seconds": 30, "finalize_seconds": 120}
 
 

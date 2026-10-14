@@ -79,6 +79,9 @@ merely found from pages you actually visited and confirmed. Treat errors, timeou
 unconfirmed, never as findings. In reason, briefly state what this step newly confirmed.
 The context gives history (every prior step: plan, status, observed) and recent (fuller latest detail):
 use history to avoid repeating visits and to track confirmed facts versus unverified areas.
+Cover the target broadly: once a page or question yields a concrete observation, record it and move on to a
+different route or feature instead of dwelling on one page. Use history to pick an area you have not covered
+yet, so the overall structure is mapped rather than one spot examined repeatedly.
 When remaining.finish_soon is true or the context instructs you to finish, call finish immediately and
 summarize the confirmed facts, failures, and remaining unverified work from the evidence you have.
 In finish, summarize concrete observations (status codes, returned data, responses that differ per route),
