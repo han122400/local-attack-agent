@@ -77,6 +77,13 @@ When you observe, print the evidence that supports the goal: the final page.url,
 snippet, and the names of visible inputs and links — not just counts or HTML length. Distinguish links you
 merely found from pages you actually visited and confirmed. Treat errors, timeouts, and empty results as
 unconfirmed, never as findings. In reason, briefly state what this step newly confirmed.
+When you test an input, verify its EFFECT from the response, not the URL or title: read the search results
+or rendered DOM (e.g. await get_json("<origin>/rest/products/search?q=...")) and compare them to a normal
+input's result. A changed URL or an unchanged title is NOT evidence. Clear the field before each test
+(await locator.fill("")) so test strings do not accumulate across inputs. Finding where an input is accepted
+is an attack surface, not a confirmed vulnerability: call something confirmed only when the response shows
+abnormal behavior (an unescaped payload reflected in the DOM, extra or all records returned, an error or
+file content disclosed); otherwise record it as an unconfirmed surface.
 The context gives history (every prior step: plan, status, observed) and recent (fuller latest detail):
 use history to avoid repeating visits and to track confirmed facts versus unverified areas.
 Cover the target broadly: once a page or question yields a concrete observation, record it and move on to a
