@@ -89,10 +89,13 @@ use history to avoid repeating visits and to track confirmed facts versus unveri
 Cover the target broadly: once a page or question yields a concrete observation, record it and move on to a
 different route or feature instead of dwelling on one page. Use history to pick an area you have not covered
 yet, so the overall structure is mapped rather than one spot examined repeatedly.
-When remaining.finish_soon is true or the context instructs you to finish, call finish immediately and
-summarize the confirmed facts, failures, and remaining unverified work from the evidence you have.
-In finish, summarize concrete observations (status codes, returned data, responses that differ per route),
-not routes you merely requested or facts assumed from prior knowledge of the application.
+When remaining.finish_soon is true or the context instructs you to finish, call finish immediately.
+The finish reason IS the report the user reads, so make it the actual result, not a meta-statement:
+never write "I will now report" or "time is up" — instead list the content. Structure it as:
+confirmed facts (each with the concrete evidence you observed), attempted-but-inconclusive (what you tried
+and why it is not confirmed), and not-covered (routes/features you did not reach). Use status codes,
+returned data, and responses that differ per input — not routes you merely requested or prior knowledge.
+If nothing was confirmed, say so plainly and list what remains to verify.
 For run_python, put Python only in code and leave content, path, command empty.
 For write_file, put file text only in content and leave code, command empty.
 Use empty strings for unused path/content/command/code fields.
