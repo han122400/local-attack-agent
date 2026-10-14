@@ -171,7 +171,8 @@ class ExplorerV3:
         except Exception as exc:
             result, reason = "error", f"Executor or lifecycle failure: {exc}"
             try:
-                log.append("run_error", {"error_kind": "executor", "message": str(exc)[:500]})
+                log.append("run_error", {"error_kind": "executor", "message": str(exc)[:500],
+                                         "exception_type": type(exc).__name__})
             except LogFailure:
                 pass
         finally:
@@ -192,24 +193,43 @@ class ExplorerV3:
         harness = Harness(log, transport=self.transport, max_calls=budgets["model_calls"],
                           stop_requested=self.stop_event.is_set)
         recent: list[dict] = []
+        history: list[dict] = []       # compact one-line memory of every step; survives recent trimming
+        durations: list[float] = []    # recent decide() wall times, to reserve time for a final summary
         for tool_index in range(budgets["tool_calls"]):
             if self.stop_event.is_set():
+                log.update(findings=history)
                 return "stopped", "User stopped the run"
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log.update(findings=history)
                 return "timed_out", "Run time budget exhausted"
+            avg_call = sum(durations[-3:]) / len(durations[-3:]) if durations else 45.0
+            finish_soon = remaining < max(avg_call * 1.5, 45)
             context = {"goal": metadata["goal"], "target": metadata["target"],
                        "runtime_path": str(runtime.runtime_dir), "python": runtime.python,
-                       "browser_api": "run_python code has page/context/browser; top-level await or async main(page, context, browser)",
-                       "recent": recent[-4:],
-                       "remaining": {"seconds": max(0, int(deadline - time.monotonic())),
+                       "browser_api": "run_python code has page/context/browser and helpers "
+                                      "get_text/get_json/goto_and_render; top-level await or async main(page, context, browser)",
+                       # Cumulative memory of all prior steps so the model does not forget or repeat
+                       # earlier visits; recent holds fuller detail for the latest steps.
+                       "history": history[-30:],
+                       "recent": recent[-2:],
+                       "remaining": {"seconds": max(0, int(remaining)),
                                      "model_calls": budgets["model_calls"] - harness.calls,
-                                     "tool_calls": budgets["tool_calls"] - tool_index}}
+                                     "tool_calls": budgets["tool_calls"] - tool_index,
+                                     "avg_call_seconds": round(avg_call, 1), "finish_soon": finish_soon}}
+            if finish_soon:
+                context["instruction"] = ("Time is almost up. Call finish now and summarize the facts you "
+                                          "actually confirmed, the failures, and what remains unverified, "
+                                          "using history and recent. Do not start new exploration.")
+            started = time.monotonic()
             command = harness.decide(run_id, context, model=metadata["model"],
                                      settings=metadata["model_settings"], deadline=deadline)
+            durations.append(time.monotonic() - started)
             log.update(plan=command.plan, reason=command.reason, last_call_id=command.call_id)
             if command.action == "finish":
                 log.append("run_finished_by_model", {"call_id": command.call_id, "reason": command.reason,
                                                      "plan": command.plan})
+                log.update(findings=history)
                 return "completed", command.reason
             execution = runtime.run(run_id, command.runtime_payload(), call_id=command.call_id,
                                     timeout=budgets["command_seconds"])
@@ -223,7 +243,20 @@ class ExplorerV3:
                            "command": {"action": command.action, "path": command.path,
                                        "command": command.command, "code": command.code[-1000:]},
                            "result": record})
-            log.update(last_exec_id=execution.exec_id, tool_calls=tool_index + 1)
+            # One-line step digest for cumulative memory. ok/error/timeout stays explicit so failures
+            # and empty results remain unconfirmed rather than being read as findings.
+            if execution.timed_out:
+                status, observed = "timeout", "timed out"
+            elif execution.exit_code == 0:
+                status = "ok"
+                observed = (execution.stdout or "").strip()[-240:] or "(no output)"
+            else:
+                status = "error"
+                observed = (execution.exception or execution.stderr or "").strip()[-200:] or "(failed)"
+            history.append({"step": tool_index + 1, "action": command.action,
+                            "plan": command.plan[:140], "status": status, "observed": observed})
+            log.update(last_exec_id=execution.exec_id, tool_calls=tool_index + 1, findings=history)
+        log.update(findings=history)
         return "error", "Tool call budget exhausted"
 
     def _finalize(self, run_id: str, log: SessionLog, runtime: CommandRuntime,
@@ -296,7 +329,8 @@ class ExplorerV3:
                     failed["log_status"] = "failed"
                 if log.metadata.get("phase") == "resetting" or log.metadata.get("lab_reset_status") == "running":
                     failed["lab_reset_status"] = "failed"
-                log.append("finalize_failed", {"error": str(exc)[:500]})
+                log.append("finalize_failed", {"error": str(exc)[:500], "exception_type": type(exc).__name__,
+                                               "component": "lab" if log.metadata.get("phase") == "resetting" else "session"})
                 log.update(**failed)
             except Exception:
                 pass

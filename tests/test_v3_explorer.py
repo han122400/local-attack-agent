@@ -42,6 +42,30 @@ class ExplorerLoopTests(unittest.TestCase):
             self.assertIn("hello", json.dumps(prompts[2]))
             self.assertTrue(explorer.can_start()[0])
 
+    def test_history_memory_accumulates_and_findings_are_preserved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            answers = iter([model_reply("write_file", path="work/a.txt", content="alpha"),
+                            model_reply("run_command", command="echo beta"),
+                            model_reply("finish")])
+            prompts = []
+            def transport(payload):
+                prompts.append(json.loads(payload["messages"][1]["content"]))
+                yield next(answers)
+                yield {"done": True, "done_reason": "stop"}
+            explorer = ExplorerV3(Path(temp), transport=transport, browser_enabled=False,
+                                  lab_reset=lambda: {"verified": True, "probe": "mock"})
+            run_id = explorer.start(goal="inspect local app", model="mock:model")
+            explorer.worker.join(10)
+            # The finish decision must see both prior steps in cumulative history.
+            finish_ctx = prompts[2]
+            self.assertEqual([h["action"] for h in finish_ctx["history"]], ["write_file", "run_command"])
+            self.assertEqual(finish_ctx["history"][0]["status"], "ok")
+            self.assertIn("finish_soon", finish_ctx["remaining"])
+            # Findings (the step memory) are preserved in session.json.
+            meta = SessionStore(Path(temp)).read(run_id)
+            self.assertEqual(meta["run_result"], "completed")
+            self.assertEqual([f["action"] for f in meta["findings"]], ["write_file", "run_command"])
+
     def test_unsupported_modes_rejected_without_creating_run(self):
         with tempfile.TemporaryDirectory() as temp:
             explorer = ExplorerV3(Path(temp), browser_enabled=False)
