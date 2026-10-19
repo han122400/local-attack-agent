@@ -218,7 +218,7 @@ class BrowserUiScenarios(unittest.TestCase):
         b_page.reload()
         b_page.locator("#timeline .timeline-row").first.wait_for()
         self.assertEqual(b_page.locator("#timeline .timeline-row").count(), before)
-        self.assertEqual(sum(item["kind"] not in {"model_delta", "exec_output", "worker_output"}
+        self.assertEqual(sum(item["kind"] != "model_delta"
                              for item in saved_events), before)
 
         # Recreate the controller from disk to exercise the app restart path.
@@ -316,7 +316,9 @@ class BrowserUiScenarios(unittest.TestCase):
         page.locator("#wrapToggle").check()
         console = page.locator("#consoleOutput")
         console.evaluate("item => item.scrollTop=0")
-        page.locator("#autoScrollToggle").uncheck()
+        # Scrolling up disables auto-follow asynchronously; wait for that event
+        # instead of clicking a checkbox while its handler is changing state.
+        page.wait_for_function("!document.getElementById('autoScrollToggle').checked")
         before = console.evaluate("item => item.scrollTop")
         self.release_more.set()
         self.wait_run(run_id)
@@ -378,6 +380,62 @@ class BrowserUiScenarios(unittest.TestCase):
         page.locator("#rawOutputToggle").uncheck()
         page.locator("#consoleOutput", has_text="Python 코드").wait_for()
         self.assertNotIn('"action":', page.locator("#consoleOutput").inner_text())
+        self.assertFalse(self.page_errors)
+
+    def test_06_failure_categories_metrics_filters_and_replay(self):
+        run_id = "f" * 32
+        log = self.explorer.store.create(run_id, {
+            "goal": "분류 검증", "model": "mock:model", "phase": "finished", "run_result": "completed",
+            "cleanup_status": "succeeded", "log_status": "finalized", "lab_reset_status": "succeeded",
+            "budgets": {"model_calls": 40, "tool_calls": 80}, "started_at": 1, "finished_at": 2})
+        results = [
+            {"exit_code": 0, "stdout": "HTTP 404 and 403 are observations"},
+            {"exit_code": 1, "failure_source": "generated_code", "cause_code": "python_exception",
+             "exception_type": "SyntaxError", "exception": "SyntaxError: invalid code", "retryable": True},
+            {"exit_code": None, "timed_out": True},
+            {"exit_code": None, "cancelled": True},
+            {"exit_code": 1, "failure_source": "system", "cause_code": "browser_worker_exited",
+             "exception": "Worker connection closed", "retryable": True},
+        ]
+        for index, result in enumerate(results, 1):
+            ids = {"call_id": f"CALL-{index:04d}", "exec_id": f"EXEC-{index:04d}", "action": "run_python"}
+            log.append("model_request", {"call_id": ids["call_id"]})
+            log.append("exec_started", ids)
+            if result.get("stdout"):
+                log.append("exec_output", {**ids, "channel": "stdout", "text": result["stdout"]})
+            log.append("exec_finished", {**ids, **result})
+        for index, error in enumerate(("format", "transport", "cancelled"), 6):
+            log.append("model_request", {"call_id": f"CALL-{index:04d}"})
+            log.append("model_error", {"call_id": f"CALL-{index:04d}", "error_kind": error, "message": error})
+        log.append("run_finalized", {"run_result": "completed"})
+        log.close()
+        page = self.page
+        page.goto(f"{self.base}/runs/{run_id}")
+        page.locator('#timeline [data-kind="run_finalized"]').wait_for()
+        for selector, expected in (("#execMetric", "5"), ("#modelFailureMetric", "1"), ("#systemErrorMetric", "2")):
+            self.assertEqual(page.locator(selector).inner_text(), expected)
+        self.assertIn("성공 1 · 실패 1 · 시간 초과 1 · 중단 1 · 시스템 문제 1", page.locator("#workBreakdown").inner_text())
+        page.locator("#eventCategoryFilter").select_option("execution")
+        self.assertEqual(page.locator('#timeline [data-category="system"]').count(), 0)
+        page.locator('#timeline [data-kind="exec_finished"][data-outcome="failed"]').click()
+        self.assertIn("python_exception", page.locator("#executionText").inner_text())
+        self.assertIn("SyntaxError", page.locator("#executionText").inner_text())
+        page.locator("#eventCategoryFilter").select_option("system")
+        self.assertEqual(page.locator("#timeline .timeline-row").count(), 2)
+        page.locator('#timeline [data-kind="exec_finished"]').click()
+        self.assertIn("browser_worker_exited", page.locator("#executionText").inner_text())
+        page.locator("#eventCategoryFilter").select_option("observation")
+        self.assertIn("HTTP 404 and 403", page.locator("#timeline").inner_text())
+        page.reload()
+        page.locator('#timeline [data-kind="run_finalized"]').wait_for()
+        self.assertEqual(page.locator("#systemErrorMetric").inner_text(), "2")
+        screenshots = os.environ.get("V3_UI_SCREENSHOTS")
+        for name, size in (("desktop", {"width":1440, "height":1000}), ("mobile", {"width":390, "height":844})):
+            page.set_viewport_size(size)
+            page.locator(".run-metrics").scroll_into_view_if_needed()
+            if screenshots:
+                page.screenshot(path=str(Path(screenshots) / f"event-categories-{name}.png"), animations="disabled")
+            self.assertEqual(page.evaluate("document.documentElement.scrollWidth"), size["width"])
         self.assertFalse(self.page_errors)
 
 

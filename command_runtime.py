@@ -167,8 +167,40 @@ async def main():
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
             await page.wait_for_timeout(settle_ms)
             return page
-        helpers = {"get_text": get_text, "get_json": get_json,
-                   "goto_and_render": goto_and_render, "target_origin": target_origin}
+        async def http_get(url):
+            """GET within the target origin and return a structured observation that never raises on
+            non-JSON: status, ok, content type, length, a body snippet, and parsed json or a parse_error."""
+            if not _same_origin(url):
+                raise ValueError("http_get is restricted to the target origin " + target_origin)
+            response = await context.request.get(url)
+            body = await response.text()
+            ctype = response.headers.get("content-type", "")
+            result = {"url": url, "status": response.status, "ok": response.ok,
+                      "content_type": ctype, "length": len(body), "body": body[:2000]}
+            if "json" in ctype:
+                try:
+                    result["json"] = json.loads(body)
+                except Exception as exc:
+                    result["parse_error"] = str(exc)[:200]
+            return result
+        async def list_inputs():
+            """Return the page's visible inputs (index/tag/type/name/id/label/value) and nearby button
+            labels, so you can pick the right field instead of guessing with a raw selector."""
+            return await page.evaluate("""() => {
+              const vis = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+              const label = el => (el.getAttribute('aria-label') || el.getAttribute('placeholder')
+                || (el.labels && el.labels[0] ? el.labels[0].textContent : '') || el.getAttribute('name') || '').trim().slice(0, 80);
+              const inputs = [...document.querySelectorAll('input,textarea,select')].filter(vis).slice(0, 30).map((el, i) => ({
+                index: i, tag: el.tagName.toLowerCase(), type: el.getAttribute('type') || '',
+                name: el.getAttribute('name') || '', id: el.id || '', label: label(el), value: (el.value || '').slice(0, 40) }));
+              const buttons = [...document.querySelectorAll('button,[role=button],input[type=submit]')].filter(vis).slice(0, 20)
+                .map(el => (el.getAttribute('aria-label') || el.textContent || el.value || '').trim().slice(0, 40)).filter(Boolean);
+              return { inputs, buttons };
+            }""")
+        helpers = {"get_text": get_text, "get_json": get_json, "http_get": http_get,
+                   "goto_and_render": goto_and_render, "list_inputs": list_inputs,
+                   "target_origin": target_origin}
         send(sock, {"type": "ready"})
         buffer = b""
         try:
@@ -182,6 +214,7 @@ async def main():
                 source = Path(message["path"])
                 limit = message.get("timeout")
                 timed_out = False
+                failure_source, cause_code, exception_type = None, None, None
                 with open(message["stdout_path"], "w", encoding="utf-8", buffering=1) as out, \
                      open(message["stderr_path"], "w", encoding="utf-8", buffering=1) as err:
                     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -189,13 +222,19 @@ async def main():
                             namespace = {"__name__": "__agent__", "__file__": str(source),
                                          "browser": browser, "context": context, "page": page,
                                          "asyncio": asyncio, **helpers}
-                            compiled = compile(source.read_text(encoding="utf-8"), str(source), "exec",
-                                               flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                            tree = ast.parse(source.read_text(encoding="utf-8"), str(source))
+                            # If the code already calls main() at top level, do not auto-call it again;
+                            # otherwise the user's main ran twice and its output was duplicated.
+                            def _is_main_call(stmt):
+                                v = stmt.value.value if isinstance(getattr(stmt, "value", None), ast.Await) else getattr(stmt, "value", None)
+                                return isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "main"
+                            called_main = any(isinstance(s, ast.Expr) and _is_main_call(s) for s in tree.body)
+                            compiled = compile(tree, str(source), "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
                             result = eval(compiled, namespace, namespace)
                             if inspect.isawaitable(result):
                                 await result
                             entry = namespace.get("main")
-                            if callable(entry):
+                            if callable(entry) and not called_main:
                                 result = entry(page, context, browser)
                                 if inspect.isawaitable(result):
                                     await result
@@ -209,17 +248,23 @@ async def main():
                             exit_code, detail = 0, ""
                         except asyncio.TimeoutError:
                             timed_out = True
+                            failure_source, cause_code = "execution", "execution_timeout"
                             exit_code = None
                             detail = "Browser code timed out"
                             print(detail, file=sys.stderr, flush=True)
-                        except BaseException:
+                        except BaseException as exc:
+                            exception_type = type(exc).__name__
+                            failure_source = "generated_code" if browser.is_connected() else "system"
+                            cause_code = "python_exception" if browser.is_connected() else "browser_disconnected"
                             detail = traceback.format_exc()
                             print(detail, file=sys.stderr, flush=True)
                             exit_code = 1
                         out.flush()
                         err.flush()
                 send(sock, {"type": "result", "exec_id": exec_id, "exit_code": exit_code,
-                            "timed_out": timed_out, "exception": detail[-4000:]})
+                            "timed_out": timed_out, "exception": detail[-4000:],
+                            "failure_source": failure_source, "cause_code": cause_code,
+                            "exception_type": exception_type})
         finally:
             await context.close()
             await browser.close()
@@ -244,6 +289,10 @@ class ExecutionResult:
     cancelled: bool = False
     output_truncated: bool = False
     artifact_path: str = ""
+    failure_source: str | None = None
+    cause_code: str | None = None
+    exception_type: str | None = None
+    retryable: bool | None = None
 
 
 class CommandRuntime:
@@ -537,17 +586,20 @@ class CommandRuntime:
         exec_id = f"EXEC-{self._exec_counter:04d}"
         action = command.get("action", "") if isinstance(command, dict) else ""
         result = ExecutionResult(exec_id=exec_id, action=action)
+        stage = "input"
         began = time.monotonic()
         self._call_by_exec[exec_id] = call_id
         self.log.append("exec_started", {"exec_id": exec_id, "call_id": call_id, "action": action,
                                          "cwd": str(self.runtime_dir)})
         try:
             if action == "read_file":
+                stage = "file_api"
                 path = self._file_path(command["path"], writing=False)
                 result.path = str(path)
                 result.stdout = path.read_text(encoding="utf-8")[:65536]
                 result.exit_code = 0
             elif action == "write_file":
+                stage = "file_api"
                 path = self._file_path(command["path"], writing=True)
                 result.path = str(path)
                 content = command["content"]
@@ -561,11 +613,16 @@ class CommandRuntime:
                 script = command["command"]
                 if not isinstance(script, str) or not script.strip():
                     raise ValueError("Command text required")
+                stage = "executor"
                 snapshot = self.log.preserve_bytes(f"commands/{exec_id}.cmd", script.encode("utf-8"))
                 result.artifact_path = snapshot["path"]
                 result.path = str(self.runtime_dir)
                 result.exit_code = self._run_command(script, exec_id, timeout)
+                if result.exit_code != 0:
+                    result.failure_source, result.cause_code = "command", "command_exit_nonzero"
+                    result.retryable = True
             elif action == "run_python":
+                stage = "executor"
                 if not self._browser_enabled:
                     raise RuntimeError("Browser worker is unavailable")
                 if self._worker is None or self._worker.poll() is not None:
@@ -583,9 +640,11 @@ class CommandRuntime:
                     self._control_buffer = b""
                     self.log.append("browser_respawn", {"exec_id": exec_id, "reason": "worker_unavailable"})
                     self._start_browser_worker()
+                stage = "input"
                 code = command["code"]
                 if not isinstance(code, str) or not code.strip():
                     raise ValueError("Python code required")
+                stage = "executor"
                 source = self.runtime_dir / "tools" / f"{exec_id}.py"
                 source.write_text(code, encoding="utf-8")
                 snapshot = self.log.preserve_bytes(f"code/{exec_id}.py", code.encode("utf-8"))
@@ -609,6 +668,11 @@ class CommandRuntime:
                     raise RuntimeError("Browser worker response mismatch")
                 result.exit_code = reply.get("exit_code")
                 result.exception = reply.get("exception", "")
+                result.failure_source = reply.get("failure_source")
+                result.cause_code = reply.get("cause_code")
+                result.exception_type = reply.get("exception_type")
+                if result.exit_code != 0:
+                    result.retryable = True
                 if reply.get("timed_out"):
                     result.timed_out = True
                     result.exit_code = None
@@ -621,6 +685,9 @@ class CommandRuntime:
             result.timed_out = True
             result.exception = str(exc)
             result.exit_code = None
+            result.failure_source = "system" if action == "run_python" else "execution"
+            result.cause_code = "browser_worker_unresponsive" if action == "run_python" else "execution_timeout"
+            result.retryable = True
             if action == "run_python" and self._worker is not None:
                 self._kill_tree(self._worker, self._owned[self._worker.pid])
                 self._unregister(self._worker)
@@ -629,12 +696,19 @@ class CommandRuntime:
             result.cancelled = True
             result.exception = str(exc)
             result.exit_code = None
+            result.failure_source, result.cause_code, result.retryable = "control", "execution_cancelled", False
         except LogFailure:
             self._cancel.set()
             raise
         except Exception as exc:
             result.exception = str(exc)
             result.exit_code = 1
+            result.exception_type = type(exc).__name__
+            input_failure = stage == "input" or (stage == "file_api" and isinstance(
+                exc, (ValueError, KeyError, FileNotFoundError, PermissionError, UnicodeError)))
+            result.failure_source = "input" if input_failure else "system"
+            result.cause_code = "invalid_execution_input" if input_failure else "executor_failure"
+            result.retryable = True
         finally:
             self._active_exec_id = None
             output = self._output.pop(exec_id, {})

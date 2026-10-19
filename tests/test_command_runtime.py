@@ -3,6 +3,7 @@ import unittest
 import sys
 import time
 import os
+from unittest.mock import patch
 from pathlib import Path
 
 import psutil
@@ -57,7 +58,21 @@ class RuntimeTests(unittest.TestCase):
     def test_timeout_stops_command_and_children(self):
         result = self.runtime.run(RUN_ID, {"action": "run_command", "command": "ping -n 10 127.0.0.1 > NUL"}, timeout=0.2)
         self.assertTrue(result.timed_out)
+        self.assertEqual(result.cause_code, "execution_timeout")
         self.assertFalse(self.runtime.inspect(RUN_ID)["managed_processes"])
+
+    def test_failed_command_system_failure_and_cancel_have_distinct_events(self):
+        failed = self.runtime.run(RUN_ID, {"action": "run_command", "command": "exit 7"})
+        broken = self.runtime.run(RUN_ID, {"action": "run_python", "code": "print(1)"})
+        with patch.object(self.runtime, "_run_command", side_effect=InterruptedError("user stop")):
+            stopped = self.runtime.run(RUN_ID, {"action": "run_command", "command": "echo test"})
+        events = {e["exec_id"]: e for e in self.log.read_events() if e["kind"] == "exec_finished"}
+        self.assertEqual(events[failed.exec_id]["outcome"], "failed")
+        self.assertEqual(events[failed.exec_id]["cause_code"], "command_exit_nonzero")
+        self.assertEqual(events[broken.exec_id]["category"], "system")
+        self.assertEqual(events[broken.exec_id]["outcome"], "system_error")
+        self.assertEqual(events[stopped.exec_id]["outcome"], "cancelled")
+        self.assertFalse(events[stopped.exec_id]["retryable"])
 
     def test_stop_terminates_child_after_cmd_parent_exits(self):
         source = ("import pathlib,subprocess,sys\n"
@@ -100,6 +115,27 @@ class RuntimeTests(unittest.TestCase):
 
 
 class BrowserWorkerTests(unittest.TestCase):
+    def test_generated_exception_and_dead_worker_have_distinct_origins(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            runtime = CommandRuntime(Path(temp), log)
+            try:
+                runtime.start_session(RUN_ID)
+                bad = runtime.run(RUN_ID, {"action": "run_python", "code": "x = {"})
+                self.assertEqual(bad.failure_source, "generated_code")
+                self.assertEqual(bad.exception_type, "SyntaxError")
+                self.assertEqual(bad.cause_code, "python_exception")
+                self.assertTrue(runtime.inspect(RUN_ID)["browser_alive"])
+                died = runtime.run(RUN_ID, {"action": "run_python", "code": "import os\nos._exit(7)"})
+                self.assertEqual(died.failure_source, "system")
+                events = {e["exec_id"]: e for e in log.read_events() if e["kind"] == "exec_finished"}
+                self.assertEqual(events[bad.exec_id]["category"], "execution")
+                self.assertEqual(events[died.exec_id]["category"], "system")
+            finally:
+                runtime.stop(RUN_ID, 10)
+                runtime.destroy(RUN_ID, 10)
+                log.close()
+
     def test_new_session_has_no_prior_cookie_or_runtime_tool(self):
         with tempfile.TemporaryDirectory() as temp:
             first_id, second_id = "1" * 32, "2" * 32

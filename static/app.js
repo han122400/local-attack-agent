@@ -19,14 +19,15 @@ let activeRunId=null, canStart=false, modelReady=false, labReady=false, startPen
 let currentRun=null, stream=null, lastSeq=0, readingEvents=false, pendingEvents=new Map();
 let timelineEvents=[], consoleRaw='', consoleChannel='', selectedCode=null;
 const modelCalls=new Map(), consoleEntries=[];
-const runStats={calls:0,executions:0,modelErrors:0,execErrors:0,tokens:0};
+const runStats={calls:0,executions:0,modelErrors:0,systemErrors:0,unknownFailures:0,succeeded:0,failed:0,timed_out:0,cancelled:0,system_error:0,tokens:0};
 let displayQueued=false, latestExecution=null;
 let fileSource='runtime', fileItems=[], selectedFile=null, selectedEvidence=null, evidenceItems=[];
 const collapsedDirs=new Set(['deps','tmp','browser']);
 const goalSuggestions={
   structure:'설정된 대상 웹사이트에서 접근 가능한 페이지와 주요 기능의 구조를 파악해줘. 실제로 관찰한 링크, 화면과 이동 관계를 근거로 기능별 요약과 아직 확인하지 못한 영역을 정리해줘.',
   inputs:'설정된 대상 웹사이트에서 검색, 필터와 입력 요소의 동작을 관찰해줘. 관찰한 화면을 바탕으로 확인할 요소와 비파괴적인 입력값을 스스로 선택하고, 입력 전후의 변화와 근거를 정리해줘. 해당 요소가 없으면 관찰한 범위와 함께 기록해줘.',
-  network:'설정된 대상 웹사이트의 화면과 스크립트, 네트워크 요청에서 API와 데이터 흐름을 파악해줘. 실제로 관찰한 경로, 요청 방식, 응답 상태와 데이터 형태를 정리하고, 코드에서 발견한 후보와 실제 호출이 확인된 항목을 구분해줘.'
+  network:'설정된 대상 웹사이트의 화면과 스크립트, 네트워크 요청에서 API와 데이터 흐름을 파악해줘. 실제로 관찰한 경로, 요청 방식, 응답 상태와 데이터 형태를 정리하고, 코드에서 발견한 후보와 실제 호출이 확인된 항목을 구분해줘.',
+  inputs_active:'설정된 대상 웹사이트에서 검색, 필터와 입력 요소의 동작을 관찰해줘. 관찰한 화면을 바탕으로 확인할 요소와 파괴적인 입력값을 스스로 선택하고, 입력 전후의 변화를 응답·DOM 근거로 정리해줘. 입력마다 필드를 비우고 테스트하고, 해당 요소가 없으면 관찰한 범위와 함께 기록해줘. 결과는 한국어로 정리해줘.'
 };
 const goalScope=' 탐색 범위는 설정된 대상 안으로 제한하고, 경로와 탐색 순서는 관찰 결과에 따라 스스로 결정해줘. 계정·데이터를 변경하는 동작은 수행하지 말고, 확인된 사실과 추정을 구분해줘.';
 
@@ -69,13 +70,41 @@ function readModelFields(raw){
   return fields;
 }
 
+const categoryLabel=value=>({model:'모델',execution:'작업 실행',observation:'관찰',system:'시스템',lifecycle:'세션 관리'})[value]||value;
+const outcomeLabel=value=>({succeeded:'성공',failed:'실패',timed_out:'시간 초과',cancelled:'중단',system_error:'시스템 오류로 실행 불가',exhausted:'예산 소진',recorded:'기록',observed:'관찰',received:'수신',started:'시작'})[value]||value;
+function classifyEvent(event){
+  if(event.event_schema===1)return event;
+  // Compatibility for servers still serving old records. Output text is never
+  // inspected for error words or HTTP status codes.
+  let category='lifecycle',outcome='recorded';
+  if(event.kind.startsWith('model_')||event.kind.startsWith('command_'))category='model';
+  if(['exec_started','exec_finished','file_changed'].includes(event.kind))category='execution';
+  if(['exec_output','observation','http_response'].includes(event.kind)){category='observation';outcome='observed';}
+  if(/^(runtime_|process_|browser_|worker_output)/.test(event.kind))category='system';
+  if(event.kind==='exec_finished'){
+    outcome=event.cancelled?'cancelled':event.failure_source==='system'?'system_error':event.timed_out?'timed_out':event.exit_code===0?'succeeded':'failed';
+    if(outcome==='system_error')category='system';
+  }
+  if(event.kind==='model_error'){
+    outcome=event.error_kind==='cancelled'?'cancelled':event.error_kind==='budget'?'exhausted':event.error_kind==='timed_out'?'timed_out':'failed';
+    if(event.error_kind==='transport')category='system';
+    if(['cancelled','budget'].includes(event.error_kind))category='lifecycle';
+  }
+  if(['run_error','finalize_failed'].includes(event.kind)){category='system';outcome='failed';}
+  return {...event,category,outcome};
+}
+function executionLabel(result){return result.outcome==='failed'?'작업 실패':outcomeLabel(result.outcome);}
+function eventTitle(event){
+  if(event.kind==='model_error')return event.category==='system'?'모델 연결 오류':event.outcome==='cancelled'?'모델 생성 중단':event.outcome==='exhausted'?'모델 예산 소진':'모델 응답 실패';
+  return {exec_output:'관찰 출력',worker_output:'프로세스 출력',browser_respawn:'브라우저 복구'}[event.kind]||eventLabel(event.kind);
+}
 function modelErrorLabel(call){
   if(call.done_reason==='length'||call.error_kind==='output_limit')return '출력 한도';
   return {format:'응답 형식 오류',transport:'모델 연결 오류',timed_out:'모델 시간 초과',cancelled:'생성 중단',budget:'호출 예산 소진'}[call.error_kind]||'모델 오류';
 }
 function callStatus(call){
-  if(call.error)return `${modelErrorLabel(call)} · 실행되지 않음`;
-  if(call.result)return call.result.exit_code===0?'실행 완료':'실행 오류';
+  if(call.error)return `${call.errorCategory==='system'?'시스템 오류':call.errorOutcome==='cancelled'?'생성 중단':call.errorOutcome==='exhausted'?'예산 소진':modelErrorLabel(call)} · 실행되지 않음`;
+  if(call.result)return executionLabel(call.result);
   if(call.executing)return '실행 중';
   if(call.decoded)return call.action==='finish'?'종료 판단':'명령 확인됨';
   return '생성 중 · 실행 전 초안';
@@ -118,13 +147,15 @@ function queueDisplay(){
 }
 function renderAgentStatus(){
   setText('callMetric',runStats.calls);setText('execMetric',runStats.executions);
-  setText('errorMetric',runStats.modelErrors+runStats.execErrors);setText('errorBreakdown',`모델 ${runStats.modelErrors} · 실행 ${runStats.execErrors}`);
+  setText('modelFailureMetric',runStats.modelErrors);setText('systemErrorMetric',runStats.systemErrors);
+  setText('workBreakdown',`성공 ${runStats.succeeded} · 실패 ${runStats.failed} · 시간 초과 ${runStats.timed_out} · 중단 ${runStats.cancelled}${runStats.system_error?' · 시스템 문제 '+runStats.system_error:''}`);
+  setText('systemErrorNote',currentRun?.log_status==='failed'?'로그 저장 실패 · 오류 집계가 불완전할 수 있습니다.':runStats.unknownFailures?`과거 실패 ${runStats.unknownFailures}건은 원인 미분류`:'실행기 · 연결 · 저장 · 정리');
   setText('tokenMetric',runStats.tokens.toLocaleString());
   if(currentRun?.budgets){setText('callBudget',`최대 ${currentRun.budgets.model_calls}회`);setText('execBudget',`최대 ${currentRun.budgets.tool_calls}회`);}
   const calls=[...modelCalls.values()],latest=calls.at(-1);
   if(latest){
     const fields={...readModelFields(latest.raw),...latest.fields};
-    setText('currentPlan',fields.plan||'다음 행동을 생성하고 있습니다.');setText('currentReason',fields.reason||'선택 이유를 기다립니다.');
+    setText('currentPlan',fields.plan||(latest.error?'유효한 계획을 생성하지 못했습니다.':'다음 행동을 생성하고 있습니다.'));setText('currentReason',fields.reason||(latest.error?callStatus(latest):'선택 이유를 기다립니다.'));
     setText('actionStatus',callStatus(latest));$('actionStatus').className=`status-badge ${latest.error?'bad':latest.result?.exit_code===0?'ok':'warn'}`;
   }
   setText('decisionCount',`${runStats.calls}회 · 최근 5회`);
@@ -143,7 +174,7 @@ function renderAgentStatus(){
   }
   if(latestExecution){
     const result=latestExecution;
-    setText('observationStatus',`${result.exec_id} · ${result.exit_code===0?'성공':'오류'} · ${result.elapsed??'—'}초`);
+    setText('observationStatus',`${result.exec_id} · ${executionLabel(result)} · ${result.elapsed??'—'}초`);
     const failure=result.exception?.trim().split('\n').at(-1);
     setText('latestObservation',[failure,result.stdout,result.stderr].filter(Boolean).join('\n').slice(0,2400)||`${actionLabel(result.action)} 완료${result.path?'\n'+result.path:''} · 출력 없음`);
     $('observationStatus').classList.toggle('error-text',result.exit_code!==0);
@@ -371,30 +402,41 @@ function eventDescription(event){
   const identity=[event.call_id,event.exec_id].filter(Boolean).join(' · ');
   let detail=event.plan||event.reason||event.message||event.error||event.path||event.step||(event.action?actionLabel(event.action):event.status?statusText(event.status):'');
   if(event.kind==='model_response')detail=`${event.eval_count??'—'}토큰 · ${event.elapsed??'—'}초 · ${event.done_reason==='length'?'출력 한도에서 잘림':'응답 수신'}`;
-  if(event.kind==='exec_finished')detail=`${actionLabel(event.action)} · 종료 코드 ${event.exit_code??'—'} · ${event.elapsed??'—'}초${event.exception?' · '+event.exception.split('\n').filter(Boolean).at(-1):''}`;
+  if(event.kind==='exec_finished')detail=`${executionLabel(event)} · ${actionLabel(event.action)} · 종료 코드 ${event.exit_code??'—'} · ${event.elapsed??'—'}초${event.exception?' · '+event.exception.split('\n').filter(Boolean).at(-1):''}`;
+  if(['exec_output','worker_output'].includes(event.kind))detail=event.text||'';
   if(event.kind==='command_normalized')detail=`중복 필드 정리: ${(event.fields||[]).join(', ')}`;
   return `${identity}${identity&&detail?' · ':''}${String(detail).slice(0,260)}` || '기록됨';
 }
 
 function renderTimeline(){
   const parent=$('timeline');parent.replaceChildren();
-  for(const event of timelineEvents){
+  const selected=$('eventCategoryFilter').value;
+  const visible=timelineEvents.filter(event=>selected==='all'||event.category===selected);
+  for(const event of visible){
     const row=document.createElement('button');row.type='button';row.className='timeline-row';
     row.append(textNode('time',new Date(event.at*1000).toLocaleTimeString('ko-KR')),
-      textNode('span',eventLabel(event.kind),'kind'),textNode('span',eventDescription(event),'body'));
-    row.dataset.kind=event.kind;
-    if(event.exec_id)row.addEventListener('click',()=>showExecution(event,row));
+      textNode('span',eventTitle(event),'kind'),textNode('span',eventDescription(event),'body'));
+    row.dataset.kind=event.kind;row.dataset.category=event.category;row.dataset.outcome=event.outcome;
+    row.title=`${categoryLabel(event.category)} · ${outcomeLabel(event.outcome)}`;
+    row.addEventListener('click',()=>showExecution(event,row));
     parent.append(row);
   }
-  setText('eventCount',`${timelineEvents.length}건 · 최근 기록`);
+  setText('eventCount',`${visible.length}건 · 최근 ${timelineEvents.length}건 중`);
 }
 
 function showExecution(event,row){
   for(const item of $('timeline').querySelectorAll('.selected'))item.classList.remove('selected');
   row.classList.add('selected');
-  const matching=[...timelineEvents].reverse().find(item=>item.exec_id===event.exec_id&&item.kind==='exec_finished')||event;
-  const detail=[`${matching.call_id||'—'} · ${matching.exec_id||'—'} · ${actionLabel(matching.action)}`,
-    `종료 코드: ${matching.exit_code??'진행 중'} · 소요 시간: ${matching.elapsed??'—'}초`];
+  const matching=event.exec_id&&event.category==='execution'?[...timelineEvents].reverse().find(item=>item.exec_id===event.exec_id&&item.kind==='exec_finished')||event:event;
+  const detail=[`${matching.call_id||'—'} · ${matching.exec_id||'—'} · ${matching.action?actionLabel(matching.action):eventTitle(matching)}`];
+  if(matching.kind==='exec_finished')detail.push(`종료 코드: ${matching.exit_code??'없음'} · 소요 시간: ${matching.elapsed??'—'}초`);
+  detail.push(`분류: ${categoryLabel(matching.category)} · 결과: ${outcomeLabel(matching.outcome)}`);
+  if(matching.component)detail.push(`발생 위치: ${matching.component}`);
+  if(matching.cause_code)detail.push(`원인 코드: ${matching.cause_code}`);
+  if(matching.failure_source)detail.push(`실패 원인 구분: ${matching.failure_source}`);
+  if(matching.exception_type)detail.push(`예외 종류: ${matching.exception_type}`);
+  detail.push(`재시도: ${matching.retryable===true?'수정·복구 후 가능 (자동 재시도 아님)':matching.retryable===false?'자동 재시도 대상 아님':'미지정'}`);
+  if(matching.message||matching.error||matching.text)detail.push(`\n원문 메시지\n${matching.message||matching.error||matching.text}`);
   if(matching.path||matching.cwd)detail.push(`작업 경로: ${matching.path||matching.cwd}`);
   if(matching.stdout)detail.push(`\n표준 출력\n${matching.stdout}`);
   if(matching.stderr)detail.push(`\n오류 출력\n${matching.stderr}`);
@@ -436,6 +478,8 @@ function renderConsole(){
 }
 
 function applyEvent(event){
+  event=classifyEvent(event);
+  if(event.category==='system'&&['failed','system_error'].includes(event.outcome)){runStats.systemErrors++;queueDisplay();}
   if(event.kind==='model_request'){
     const call=getCall(event.call_id);call.limit=event.settings?.options?.num_predict;runStats.calls++;queueDisplay();
   }else if(event.kind==='model_delta'){
@@ -450,7 +494,9 @@ function applyEvent(event){
     const call=getCall(event.call_id);call.decoded=true;call.action=event.action;
     call.fields={action:event.action,plan:event.plan,reason:event.reason};queueDisplay();
   }else if(event.kind==='model_error'){
-    const call=getCall(event.call_id);call.error=event.message;call.error_kind=event.error_kind;runStats.modelErrors++;queueDisplay();
+    const call=getCall(event.call_id);call.error=event.message;call.error_kind=event.error_kind;call.errorCategory=event.category;call.errorOutcome=event.outcome;
+    if(event.category==='model'&&['failed','timed_out'].includes(event.outcome))runStats.modelErrors++;
+    queueDisplay();
   }else if(event.kind==='command_normalized')appendConsole(`${event.call_id} · 동일한 중복 필드를 정리했습니다: ${(event.fields||[]).join(', ')}\n`,'응답 정리');
   else if(event.kind==='exec_output'||event.kind==='worker_output'){
     if(event.call_id)getCall(event.call_id).outputChannels.add(event.channel);
@@ -460,12 +506,14 @@ function applyEvent(event){
     const call=getCall(event.call_id);call.executing=true;call.exec_id=event.exec_id;runStats.executions++;
     appendConsole(`${event.exec_id} · ${actionLabel(event.action)}\n작업 경로: ${event.cwd||'—'}\n`,'실행');
   }else if(event.kind==='exec_finished'){
-    const call=getCall(event.call_id);call.result=event;latestExecution=event;if(event.exit_code!==0)runStats.execErrors++;
+    const call=getCall(event.call_id);call.result=event;latestExecution=event;
+    if(event.outcome==='failed'&&(!event.failure_source||event.failure_source==='unknown'))runStats.unknownFailures++;
+    if(['succeeded','failed','timed_out','cancelled','system_error'].includes(event.outcome))runStats[event.outcome]++;
     for(const channel of ['stdout','stderr'])if(event[channel]&&!call.outputChannels.has(channel))appendConsole(event[channel],channel);
-    appendConsole(`${event.exec_id} · ${event.exit_code===0?'완료':'실행 오류'} · 종료 코드 ${event.exit_code??'—'} · ${event.elapsed??'—'}초${event.exception?'\n'+event.exception:''}${event.output_truncated?'\n출력 일부 잘림':''}\n`,'실행 결과');
+    appendConsole(`${event.exec_id} · ${executionLabel(event)} · 종료 코드 ${event.exit_code??'—'} · ${event.elapsed??'—'}초${event.exception?'\n'+event.exception:''}${event.output_truncated?'\n출력 일부 잘림':''}\n`,'실행 결과');
   }
   else if(event.kind==='finalize_failed'||event.kind==='run_error')appendConsole(`\n${event.kind}: ${event.error||event.message||''}\n`,'system');
-  if(!['model_delta','exec_output','worker_output'].includes(event.kind)){
+  if(event.kind!=='model_delta'){
     timelineEvents.push(event);if(timelineEvents.length>350)timelineEvents.shift();renderTimeline();
   }
   if(event.kind==='file_changed'&&fileSource==='runtime')loadFiles();
@@ -543,6 +591,7 @@ async function loadEvidenceFiles(){
 
 function initRun(){
   $('mainView').hidden=true;$('runView').hidden=false;
+  $('eventCategoryFilter').addEventListener('change',renderTimeline);
   for(const name of ['observe','evidence','settings'])$(`${name}Tab`).addEventListener('click',()=>showTab(name));
   $('stopButton').addEventListener('click',async()=>{
     $('stopButton').disabled=true;

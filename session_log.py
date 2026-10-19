@@ -14,6 +14,8 @@ import time
 import uuid
 from pathlib import Path, PureWindowsPath
 
+from event_classification import classify_event, event_view
+
 
 RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
@@ -148,7 +150,8 @@ class SessionLog:
             values = fields or {}
             if any(key in values for key in ("run_id", "seq", "kind", "at")):
                 raise ValueError("Event identity fields are reserved")
-            event = {"run_id": self.run_id, "seq": self._seq + 1, "kind": kind, "at": time.time(), **values}
+            event = {"run_id": self.run_id, "seq": self._seq + 1, "kind": kind, "at": time.time(),
+                     **values, **classify_event(kind, values)}
             try:
                 with self.events_path.open("a", encoding="utf-8", newline="\n") as stream:
                     stream.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
@@ -215,7 +218,7 @@ class SessionLog:
                 if event["run_id"] != self.run_id:
                     raise LogFailure("Event run_id mismatch")
                 if event["seq"] > after_seq:
-                    result.append(event)
+                    result.append(event_view(event))
                     if len(result) >= limit:
                         break
         return result
@@ -276,7 +279,7 @@ class SessionStore:
                 if event.get("run_id") != run_id or type(event.get("seq")) is not int:
                     raise LogFailure("Event log identity mismatch")
                 if event["seq"] > after_seq:
-                    events.append(event)
+                    events.append(event_view(event))
                     if len(events) == limit:
                         break
         return events
