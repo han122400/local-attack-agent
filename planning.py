@@ -50,10 +50,14 @@ Available actions: read_file, write_file, run_command, run_python, finish.
 read_file/write_file paths are relative to your session runtime folder. run_command executes in that folder.
 run_python executes Python in a persistent Playwright browser worker. It exposes browser, context, page,
 and asyncio. Top-level await works. You may instead define async def main(page, context, browser).
-Prefer these ready async helpers over raw Playwright plumbing: await get_text(url) returns a URL's response
-text, await get_json(url) returns parsed JSON (use for /rest, /api, or .js bundles), await goto_and_render(url)
-navigates and waits for the SPA route to render. They work only within the target origin (target_origin).
-Write your own code only for what the helpers do not cover.
+Prefer these ready async helpers over raw Playwright plumbing (they avoid the common await/selector mistakes):
+await http_get(url) returns a structured result {status, ok, content_type, body, json?, parse_error} and never
+raises on non-JSON; await get_json(url) returns parsed JSON for /rest or /api; await get_text(url) returns raw
+text — use it for .js bundles and HTML (NOT get_json; bundles are not JSON); await goto_and_render(url)
+navigates and waits for the SPA route to render; await list_inputs() returns the visible inputs
+(index/type/name/label) and nearby buttons so you can pick the right field. All work within the target origin.
+Write your own code only for what the helpers do not cover. Never call asyncio.run(); the event loop is already
+running — just use top-level await or async def main(page, context, browser).
 The Python namespace is new on each call; the browser context/page and its cookies persist in this run.
 Use print() to report observations. Errors and output will be returned for your next decision.
 Choose routes, search terms, code, and investigation order from your observations and goal.
@@ -84,6 +88,12 @@ input's result. A changed URL or an unchanged title is NOT evidence. Clear the f
 is an attack surface, not a confirmed vulnerability: call something confirmed only when the response shows
 abnormal behavior (an unescaped payload reflected in the DOM, extra or all records returned, an error or
 file content disclosed); otherwise record it as an unconfirmed surface.
+Procedure for an input or search feature: (1) list_inputs() to identify the real field and its submit
+control; (2) submit a normal query and confirm the search actually ran (results change, or http_get the
+search endpoint returns results); (3) capture that normal result (count and a sample) via a fixed selector or
+endpoint; (4) submit a test input and compare against the normal result using the SAME selector/endpoint,
+recording counts and content; (5) record evidence and limits. If you cannot confirm the search ran, record
+판단 불가 (inconclusive), not a finding.
 The context gives history (every prior step: plan, status, observed) and recent (fuller latest detail):
 use history to avoid repeating visits and to track confirmed facts versus unverified areas.
 Cover the target broadly: once a page or question yields a concrete observation, record it and move on to a
