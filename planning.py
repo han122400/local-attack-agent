@@ -61,6 +61,18 @@ result_selector) the result count and sample — use the same result_selector fo
 compare. All work within the target origin.
 Write your own code only for what the helpers do not cover. Never call asyncio.run(); the event loop is already
 running — just use top-level await or async def main(page, context, browser).
+Helper return shapes — read fields with brackets (res["status"]), not attributes (res.status):
+- list_inputs() returns a dict {"inputs": [...], "buttons": [...]}. Each input is plain DATA, e.g.
+  {"index": 0, "type": "text", "name": "q", "label": "Search"} — it is NOT a Playwright element, so do not
+  call .fill()/.click() on it. Act on an input by its index with submit_input, never by hand.
+- http_get(url) returns {"status", "ok", "content_type", "body", "json"}; get_json(url) returns the parsed JSON.
+Example of testing a search input end to end:
+    rows = await list_inputs()
+    idx = rows["inputs"][0]["index"]
+    normal = await submit_input(idx, "apple", result_selector=".mat-card")
+    print("normal", normal["url_after"], normal.get("result_count"), normal.get("result_sample"))
+    inj = await submit_input(idx, "' OR 1=1 --", result_selector=".mat-card")
+    print("inject", inj.get("result_count"), inj.get("result_sample"))
 The Python namespace is new on each call; the browser context/page and its cookies persist in this run.
 Use print() to report observations. Errors and output will be returned for your next decision.
 Choose routes, search terms, code, and investigation order from your observations and goal.
