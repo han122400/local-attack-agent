@@ -76,6 +76,7 @@
     <main id="runView" class="content run-content" hidden>
       <header class="page-head run-head"><p class="eyebrow">LIVE INVESTIGATION</p><h1>실험 관찰</h1><p id="runGoal" class="run-goal">실험 기록</p>
         <div class="run-meta"><span>모델 <strong id="runModel">—</strong></span><span>run_id <code id="runId">—</code></span><span>경과 <strong id="runElapsed">—</strong></span></div>
+        <div class="context-bar" id="contextBar" hidden title="모델에 전달되는 컨텍스트 크기(문자 예산 대비). 넘치면 오래된 기억을 압축합니다."><span class="context-bar-label">컨텍스트</span><div class="context-bar-track"><div class="context-bar-fill" id="contextBarFill"></div></div><span id="contextBarText" class="context-bar-text">—</span></div>
         <div class="run-controls"><span id="runStatus" class="status-badge">확인 중</span><span id="connectionStatus">저장 기록 조회 중</span><button id="stopButton" class="button secondary" type="button" hidden>중단</button><button id="recoverButton" class="button secondary" type="button" hidden>복구 재시도</button></div>
         <p id="runError" class="error-text" role="alert"></p>
       </header>

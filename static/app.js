@@ -32,7 +32,7 @@ const goalSuggestions={
 const goalScope=' 탐색 범위는 설정된 대상 안으로 제한하고, 경로와 탐색 순서는 관찰 결과에 따라 스스로 결정해줘. 계정·데이터를 변경하는 동작은 수행하지 말고, 확인된 사실과 추정을 구분해줘.';
 
 const actionLabel=action=>({read_file:'파일 읽기',write_file:'파일 작성',run_command:'CMD 실행',run_python:'브라우저 코드 실행',finish:'탐색 종료'})[action]||'다음 행동 생성';
-const eventLabel=kind=>({run_created:'실험 시작',model_request:'모델 판단 시작',model_response:'모델 응답 완료',command_decoded:'실행 명령 확인',command_normalized:'중복 입력 정리',model_error:'모델 응답 오류',exec_started:'작업 실행',exec_finished:'작업 결과',file_changed:'파일 변경',process_started:'프로세스 시작',process_stopped:'프로세스 종료',runtime_created:'런타임 준비',runtime_destroyed:'런타임 삭제',run_finished_by_model:'모델 종료 판단',finalize_started:'실험 정리 시작',cleanup_step:'정리 진행',evidence_exported:'증거 보존',lab_reset:'실습환경 초기화',initial_lab_reset:'초기 상태 확인',run_finalized:'실험 종료',finalize_failed:'정리 실패',run_error:'실행기 오류'})[kind]||kind;
+const eventLabel=kind=>({run_created:'실험 시작',model_request:'모델 판단 시작',model_response:'모델 응답 완료',command_decoded:'실행 명령 확인',command_normalized:'중복 입력 정리',model_error:'모델 응답 오류',exec_started:'작업 실행',exec_finished:'작업 결과',file_changed:'파일 변경',process_started:'프로세스 시작',process_stopped:'프로세스 종료',runtime_created:'런타임 준비',runtime_destroyed:'런타임 삭제',run_finished_by_model:'모델 종료 판단',finalize_started:'실험 정리 시작',cleanup_step:'정리 진행',evidence_exported:'증거 보존',lab_reset:'실습환경 초기화',initial_lab_reset:'초기 상태 확인',run_finalized:'실험 종료',finalize_failed:'정리 실패',run_error:'실행기 오류',context_compacted:'컨텍스트 압축'})[kind]||kind;
 
 // Decode string fields for display while the JSON is still arriving. These
 // drafts never authorize execution; only command_decoded marks validation.
@@ -338,6 +338,9 @@ function renderRunHeader(state){
   $('stopButton').hidden=!state.live_available || state.phase==='finalizing' || state.phase==='resetting';
   $('recoverButton').hidden=state.phase!=='recovery_required'&&state.cleanup_status!=='failed'&&state.lab_reset_status!=='failed';
   setText('runError',state.cleanup_error||(state.run_result==='error'?state.finish_reason:'')||'');
+  const cUsed=state.context_chars, cBudget=state.context_budget;
+  if(cUsed&&cBudget){const pct=Math.min(100,Math.round(cUsed/cBudget*100));$('contextBar').hidden=false;const fill=$('contextBarFill');fill.style.width=pct+'%';fill.className='context-bar-fill'+(pct>=90?' bad':pct>=70?' warn':'');setText('contextBarText',`${pct}% · ${(cUsed/1000).toFixed(1)}k/${Math.round(cBudget/1000)}k자`);}
+  else $('contextBar').hidden=true;
   const summary=$('resultSummary'); summary.replaceChildren();
   for(const [key,value] of [['실험 결과',state.run_result||'진행 중'],['종료 이유',state.finish_reason||'—'],
     ['로그',state.log_status],['런타임 정리',state.cleanup_status],['Juice Shop 초기화',state.lab_reset_status]]){

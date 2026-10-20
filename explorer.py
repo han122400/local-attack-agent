@@ -25,6 +25,19 @@ RUNS_ROOT = Path(__file__).resolve().parent / "runs"
 DEFAULT_BUDGETS = {"seconds": 1200, "model_calls": 40, "tool_calls": 80,
                    "command_seconds": 30, "finalize_seconds": 120}
 
+# Char budget for the assembled model context (a proxy for num_ctx, since tokens are only known after a
+# call). When exceeded, the oldest structured history is dropped and a context_compacted event is emitted.
+CONTEXT_CHAR_BUDGET = 16000
+
+
+def _digest(text: str, limit: int = 240) -> str:
+    """Head+tail digest so a long output keeps its start AND end, not only the trailing noise."""
+    text = " ".join((text or "").split())
+    if len(text) <= limit:
+        return text
+    head = limit * 2 // 3
+    return (text[:head] + " … " + text[-(limit - head - 3):]).strip()
+
 
 def safe_target(target: str, allowed_origin: str = TARGET) -> str:
     if not isinstance(target, str) or not target or any(char in target for char in "\x00\r\n\\"):
@@ -193,7 +206,8 @@ class ExplorerV3:
         harness = Harness(log, transport=self.transport, max_calls=budgets["model_calls"],
                           stop_requested=self.stop_event.is_set)
         recent: list[dict] = []
-        history: list[dict] = []       # compact one-line memory of every step; survives recent trimming
+        history: list[dict] = []       # structured memory of every step; survives recent trimming
+        seen: dict[str, int] = {}      # observation digest -> step that first produced it (repetition)
         durations: list[float] = []    # recent decide() wall times, to reserve time for a final summary
         for tool_index in range(budgets["tool_calls"]):
             if self.stop_event.is_set():
@@ -205,22 +219,42 @@ class ExplorerV3:
                 return "timed_out", "Run time budget exhausted"
             avg_call = sum(durations[-3:]) / len(durations[-3:]) if durations else 45.0
             finish_soon = remaining < max(avg_call * 1.5, 45)
-            context = {"goal": metadata["goal"], "target": metadata["target"],
+
+            def build_context(window: int) -> dict:
+                ctx = {"goal": metadata["goal"], "target": metadata["target"],
                        "runtime_path": str(runtime.runtime_dir), "python": runtime.python,
-                       "browser_api": "run_python code has page/context/browser and helpers "
-                                      "get_text/get_json/goto_and_render; top-level await or async main(page, context, browser)",
-                       # Cumulative memory of all prior steps so the model does not forget or repeat
-                       # earlier visits; recent holds fuller detail for the latest steps.
-                       "history": history[-30:],
-                       "recent": recent[-2:],
+                       "browser_api": "run_python has page/context/browser and helpers get_text/get_json/"
+                                      "http_get/goto_and_render/list_inputs/submit_input; top-level await.",
+                       # history = structured memory of all prior steps (avoid forgetting/repeating);
+                       # recent = fuller detail for the latest steps.
+                       "history": history[-window:], "recent": recent[-2:],
                        "remaining": {"seconds": max(0, int(remaining)),
                                      "model_calls": budgets["model_calls"] - harness.calls,
                                      "tool_calls": budgets["tool_calls"] - tool_index,
                                      "avg_call_seconds": round(avg_call, 1), "finish_soon": finish_soon}}
+                return ctx
+
+            # Compaction: keep the assembled context under a char budget (token proxy) by dropping the
+            # oldest structured history first; emit an event and expose usage so the UI can show it.
+            window = min(len(history), 30)
+            context = build_context(window)
+            context_chars = len(json.dumps(context, ensure_ascii=False))
+            while context_chars > CONTEXT_CHAR_BUDGET and window > 1:
+                window -= 1
+                context = build_context(window)
+                context_chars = len(json.dumps(context, ensure_ascii=False))
+            dropped = min(len(history), 30) - window
+            if dropped > 0:
+                log.append("context_compacted", {"dropped": dropped, "kept_steps": window, "chars": context_chars})
+            self._recent_state.update(context_chars=context_chars, context_budget=CONTEXT_CHAR_BUDGET)
+            log.update(context_chars=context_chars, context_budget=CONTEXT_CHAR_BUDGET)
+            if history and history[-1].get("repeat_of"):
+                context["note"] = ("Your last step repeated an earlier observation with no new evidence. "
+                                   "Try a different route, feature, or approach — do not repeat it.")
             if finish_soon:
-                context["instruction"] = ("Time is almost up. Call finish now and summarize the facts you "
-                                          "actually confirmed, the failures, and what remains unverified, "
-                                          "using history and recent. Do not start new exploration.")
+                context["instruction"] = ("Time is almost up. Call finish now with the actual result: the "
+                                          "confirmed facts (each with its evidence), the failures, and what "
+                                          "remains unverified, from history and recent. No new exploration.")
             started = time.monotonic()
             command = harness.decide(run_id, context, model=metadata["model"],
                                      settings=metadata["model_settings"], deadline=deadline)
@@ -233,28 +267,32 @@ class ExplorerV3:
                 return "completed", command.reason
             execution = runtime.run(run_id, command.runtime_payload(), call_id=command.call_id,
                                     timeout=budgets["command_seconds"])
-            # Trim what we feed back so the growing history does not fill num_ctx (slows calls
-            # and truncates output). The full record is always in events.jsonl.
             record = asdict(execution)
-            record["stdout"] = record["stdout"][-2000:]
-            record["stderr"] = record["stderr"][-2000:]
-            record["exception"] = record["exception"][-1000:]
+            record["stdout"] = record["stdout"][-1500:]
+            record["stderr"] = record["stderr"][-800:]
+            record["exception"] = record["exception"][-800:]
             recent.append({"call_id": command.call_id, "plan": command.plan, "reason": command.reason,
                            "command": {"action": command.action, "path": command.path,
-                                       "command": command.command, "code": command.code[-1000:]},
+                                       "command": command.command, "code": command.code[-800:]},
                            "result": record})
-            # One-line step digest for cumulative memory. ok/error/timeout stays explicit so failures
-            # and empty results remain unconfirmed rather than being read as findings.
+            # Structured memory: keep the model's claim (plan/reason) separate from the actual observation,
+            # and code-success (status) separate from investigation-success (evidence present).
             if execution.timed_out:
-                status, observed = "timeout", "timed out"
+                status, observed, error = "timeout", "", "code timed out"
             elif execution.exit_code == 0:
-                status = "ok"
-                observed = (execution.stdout or "").strip()[-240:] or "(no output)"
+                status, observed, error = "ok", _digest(execution.stdout), ""
             else:
-                status = "error"
-                observed = (execution.exception or execution.stderr or "").strip()[-200:] or "(failed)"
-            history.append({"step": tool_index + 1, "action": command.action,
-                            "plan": command.plan[:140], "status": status, "observed": observed})
+                status, observed, error = "error", "", _digest(execution.exception or execution.stderr, 200)
+            repeat_of = seen.get(observed) if observed else None
+            if observed and repeat_of is None:
+                seen[observed] = tool_index + 1
+            entry = {"step": tool_index + 1, "action": command.action, "plan": command.plan[:140],
+                     "claim": command.reason[:200], "status": status,
+                     "observed": observed or "(no evidence)", "error": error,
+                     "evidence": bool(observed) and status == "ok"}
+            if repeat_of is not None:
+                entry["repeat_of"] = repeat_of
+            history.append(entry)
             log.update(last_exec_id=execution.exec_id, tool_calls=tool_index + 1, findings=history)
         log.update(findings=history)
         return "error", "Tool call budget exhausted"

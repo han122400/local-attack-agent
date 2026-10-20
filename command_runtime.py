@@ -198,9 +198,41 @@ async def main():
                 .map(el => (el.getAttribute('aria-label') || el.textContent || el.value || '').trim().slice(0, 40)).filter(Boolean);
               return { inputs, buttons };
             }""")
+        async def submit_input(index, value, result_selector=None, settle_ms=1200):
+            """Fill the visible input at `index` (from list_inputs), submit with Enter, wait, and return a
+            structured result: url before/after, title, and — if result_selector is given — the count and a
+            sample of matching elements. Use the SAME result_selector for the normal and the test input to
+            compare counts/content. Avoids the fragile fill/select/submit code written by hand."""
+            filled = await page.evaluate("""([i, val]) => {
+              const vis = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+              const el = [...document.querySelectorAll('input,textarea,select')].filter(vis)[i];
+              if (!el) return false;
+              el.focus(); el.value = val;
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+              return true;
+            }""", [index, value])
+            if not filled:
+                return {"index": index, "value": value, "submitted": False, "error": "no visible input at index"}
+            url_before = page.url
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(settle_ms)
+            result = {"index": index, "value": value, "submitted": True, "url_before": url_before,
+                      "url_after": page.url, "url_changed": page.url != url_before, "title": await page.title()}
+            if result_selector:
+                found = await page.evaluate("""sel => {
+                  const els = [...document.querySelectorAll(sel)];
+                  return { count: els.length, sample: els.slice(0, 5).map(e => (e.textContent || '').trim().slice(0, 80)) };
+                }""", result_selector)
+                result["result_count"] = found["count"]
+                result["result_sample"] = found["sample"]
+            else:
+                result["text_sample"] = await page.evaluate("() => (document.body ? document.body.innerText : '').slice(0, 400)")
+            return result
         helpers = {"get_text": get_text, "get_json": get_json, "http_get": http_get,
                    "goto_and_render": goto_and_render, "list_inputs": list_inputs,
-                   "target_origin": target_origin}
+                   "submit_input": submit_input, "target_origin": target_origin}
         send(sock, {"type": "ready"})
         buffer = b""
         try:
