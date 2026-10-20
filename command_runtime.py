@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 
 import psutil
 
+from code_checks import check_generated_code
 from session_log import LogFailure, SessionLog, safe_relative_path, validate_run_id
 
 
@@ -682,33 +683,43 @@ class CommandRuntime:
                 snapshot = self.log.preserve_bytes(f"code/{exec_id}.py", code.encode("utf-8"))
                 result.artifact_path = snapshot["path"]
                 result.path = str(source)
-                paths = {name: self.runtime_dir / "tmp" / f"{exec_id}.{name}" for name in ("stdout", "stderr")}
-                for path in paths.values():
-                    path.touch()
-                offsets = {name: 0 for name in paths}
-                decoders = {name: codecs.getincrementaldecoder("utf-8")("replace") for name in paths}
-                def poll_output():
-                    self._tail_python_output(paths, offsets, decoders, exec_id)
-                self._send_control({"type": "execute", "exec_id": exec_id, "path": str(source),
-                                    "stdout_path": str(paths["stdout"]), "stderr_path": str(paths["stderr"]),
-                                    "timeout": timeout})
-                # The worker cancels the code at `timeout` and reports back; give it extra grace
-                # so we only hard-kill (and lose the browser) when the worker is truly unresponsive.
-                reply = self._wait_control(timeout + 10, on_poll=poll_output)
-                self._tail_python_output(paths, offsets, decoders, exec_id, final=True)
-                if reply.get("type") != "result" or reply.get("exec_id") != exec_id:
-                    raise RuntimeError("Browser worker response mismatch")
-                result.exit_code = reply.get("exit_code")
-                result.exception = reply.get("exception", "")
-                result.failure_source = reply.get("failure_source")
-                result.cause_code = reply.get("cause_code")
-                result.exception_type = reply.get("exception_type")
-                if result.exit_code != 0:
-                    result.retryable = True
-                if reply.get("timed_out"):
-                    result.timed_out = True
-                    result.exit_code = None
-                time.sleep(0.05)
+                problems = check_generated_code(code)
+                if problems:
+                    # Catch the recurring mistakes before running: feed a precise error back instead of a
+                    # raw traceback, and skip the browser round-trip entirely.
+                    stage = "input"
+                    result.exit_code = 1
+                    result.failure_source, result.cause_code, result.retryable = "generated_code", "static_check", True
+                    result.exception = "Static check failed before running:\n- " + "\n- ".join(problems)
+                    self._add_output(exec_id, "stderr", result.exception + "\n")
+                else:
+                    paths = {name: self.runtime_dir / "tmp" / f"{exec_id}.{name}" for name in ("stdout", "stderr")}
+                    for path in paths.values():
+                        path.touch()
+                    offsets = {name: 0 for name in paths}
+                    decoders = {name: codecs.getincrementaldecoder("utf-8")("replace") for name in paths}
+                    def poll_output():
+                        self._tail_python_output(paths, offsets, decoders, exec_id)
+                    self._send_control({"type": "execute", "exec_id": exec_id, "path": str(source),
+                                        "stdout_path": str(paths["stdout"]), "stderr_path": str(paths["stderr"]),
+                                        "timeout": timeout})
+                    # The worker cancels the code at `timeout` and reports back; give it extra grace
+                    # so we only hard-kill (and lose the browser) when the worker is truly unresponsive.
+                    reply = self._wait_control(timeout + 10, on_poll=poll_output)
+                    self._tail_python_output(paths, offsets, decoders, exec_id, final=True)
+                    if reply.get("type") != "result" or reply.get("exec_id") != exec_id:
+                        raise RuntimeError("Browser worker response mismatch")
+                    result.exit_code = reply.get("exit_code")
+                    result.exception = reply.get("exception", "")
+                    result.failure_source = reply.get("failure_source")
+                    result.cause_code = reply.get("cause_code")
+                    result.exception_type = reply.get("exception_type")
+                    if result.exit_code != 0:
+                        result.retryable = True
+                    if reply.get("timed_out"):
+                        result.timed_out = True
+                        result.exit_code = None
+                    time.sleep(0.05)
             elif action == "finish":
                 result.exit_code = 0
             else:

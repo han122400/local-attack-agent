@@ -121,10 +121,15 @@ class BrowserWorkerTests(unittest.TestCase):
             runtime = CommandRuntime(Path(temp), log)
             try:
                 runtime.start_session(RUN_ID)
-                bad = runtime.run(RUN_ID, {"action": "run_python", "code": "x = {"})
+                # A runtime error passes the static check and is caught by the worker.
+                bad = runtime.run(RUN_ID, {"action": "run_python", "code": "raise ValueError('boom')"})
                 self.assertEqual(bad.failure_source, "generated_code")
-                self.assertEqual(bad.exception_type, "SyntaxError")
+                self.assertEqual(bad.exception_type, "ValueError")
                 self.assertEqual(bad.cause_code, "python_exception")
+                # A syntax error is caught before running, by the static check.
+                static = runtime.run(RUN_ID, {"action": "run_python", "code": "x = {"})
+                self.assertEqual(static.failure_source, "generated_code")
+                self.assertEqual(static.cause_code, "static_check")
                 self.assertTrue(runtime.inspect(RUN_ID)["browser_alive"])
                 died = runtime.run(RUN_ID, {"action": "run_python", "code": "import os\nos._exit(7)"})
                 self.assertEqual(died.failure_source, "system")
