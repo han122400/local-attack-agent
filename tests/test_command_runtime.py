@@ -141,6 +141,44 @@ class BrowserWorkerTests(unittest.TestCase):
                 runtime.destroy(RUN_ID, 10)
                 log.close()
 
+    def test_stop_terminates_browser_processes_that_escaped_the_job(self):
+        # Chromium children break away from the worker's Windows Job Object, so
+        # TerminateJobObject does not reach them. stop() must still terminate them,
+        # otherwise an orphaned chrome-headless-shell keeps chrome_debug.log open and
+        # destroy() cannot delete the runtime directory.
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            runtime = CommandRuntime(Path(temp), log)
+            runtime.start_session(RUN_ID)
+            try:
+                runtime.run(RUN_ID, {"action": "run_python", "code": "print(await page.title())"})
+                worker_pid = runtime._worker.pid
+                before = {}
+                for child in psutil.Process(worker_pid).children(recursive=True):
+                    if "chrome" in (child.name() or "").lower():
+                        before[child.pid] = child.create_time()
+                self.assertTrue(before, "expected chromium child processes to exist")
+                runtime.stop(RUN_ID, 10)
+                survivors = []
+                for pid, created in before.items():
+                    try:
+                        if abs(psutil.Process(pid).create_time() - created) < 0.5:
+                            survivors.append(pid)
+                    except psutil.NoSuchProcess:
+                        pass
+                self.assertEqual(survivors, [], f"chromium processes survived stop(): {survivors}")
+                runtime.destroy(RUN_ID, 10)
+            finally:
+                try:
+                    runtime.stop(RUN_ID, 5)
+                except Exception:
+                    pass
+                try:
+                    runtime.destroy(RUN_ID, 5)
+                except Exception:
+                    pass
+                log.close()
+
     def test_new_session_has_no_prior_cookie_or_runtime_tool(self):
         with tempfile.TemporaryDirectory() as temp:
             first_id, second_id = "1" * 32, "2" * 32

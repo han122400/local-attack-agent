@@ -339,6 +339,7 @@ class CommandRuntime:
         self._owned: dict[int, dict] = {}
         self._jobs: dict[int, object] = {}
         self._worker: subprocess.Popen | None = None
+        self._browser_procs: dict[int, float] = {}
         self._conn: socket.socket | None = None
         self._control_buffer = b""
         self._active_exec_id: str | None = None
@@ -449,6 +450,57 @@ class CommandRuntime:
             pass
         process.wait(timeout=5)
 
+    def _capture_browser_tree(self) -> None:
+        """Record the live worker's Chromium descendants by PID and creation time.
+
+        On Windows the chrome-headless-shell processes break away from the worker's Job
+        Object, so TerminateJobObject does not reach them. We remember their identities
+        while the worker is alive so stop() can terminate the survivors even after the
+        worker itself has died (os._exit, crash) and can no longer be walked for children.
+        """
+        worker = self._worker
+        if worker is None or worker.poll() is not None:
+            return
+        try:
+            for child in psutil.Process(worker.pid).children(recursive=True):
+                try:
+                    if "chrome" in (child.name() or "").lower():
+                        self._browser_procs[child.pid] = child.create_time()
+                except psutil.NoSuchProcess:
+                    pass
+        except psutil.Error:
+            pass
+
+    def _kill_browser_procs(self, deadline: float) -> None:
+        """Terminate tracked Chromium processes that escaped the Job Object and survive.
+
+        PID identity is confirmed by creation time so a reused PID belonging to an
+        unrelated process is never killed.
+        """
+        targets = []
+        for pid, created in list(self._browser_procs.items()):
+            try:
+                proc = psutil.Process(pid)
+                if abs(proc.create_time() - created) > 0.5:
+                    continue  # PID reused by an unrelated process
+                targets.extend(proc.children(recursive=True))
+                targets.append(proc)
+            except psutil.Error:
+                pass
+        for proc in targets:
+            try:
+                proc.terminate()
+            except psutil.Error:
+                pass
+        _, alive = psutil.wait_procs(targets, timeout=max(0.5, deadline - time.monotonic()))
+        for proc in alive:
+            try:
+                proc.kill()
+            except psutil.Error:
+                pass
+        psutil.wait_procs(alive, timeout=max(0.5, deadline - time.monotonic()))
+        self._browser_procs.clear()
+
     def _start_browser_worker(self) -> None:
         worker_path = self.runtime_dir / "tools" / "_browser_worker.py"
         worker_path.write_text(WORKER_SOURCE, encoding="utf-8")
@@ -477,6 +529,7 @@ class CommandRuntime:
             if ready.get("type") != "ready":
                 raise RuntimeError("Browser worker did not become ready")
             self.log.append("browser_ready", {"pid": process.pid, "target": self.target})
+            self._capture_browser_tree()
         except Exception:
             self._kill_tree(process, self._owned[process.pid])
             self._unregister(process)
@@ -719,6 +772,9 @@ class CommandRuntime:
                     if reply.get("timed_out"):
                         result.timed_out = True
                         result.exit_code = None
+                    # Chromium spawns its render/GPU children lazily as the page is used;
+                    # refresh the tracked set after each run so stop() can reach them.
+                    self._capture_browser_tree()
                     time.sleep(0.05)
             elif action == "finish":
                 result.exit_code = 0
@@ -775,6 +831,15 @@ class CommandRuntime:
             except OSError:
                 pass
         deadline = time.monotonic() + timeout
+        # Let a live worker close the browser itself first: its finally runs
+        # context.close()/browser.close(), which is the clean way to make the escaped
+        # Chromium children exit and release their file handles. Hard termination below
+        # is the fallback for a hung or already-dead worker.
+        if worker is not None and worker.poll() is None and self._conn is not None:
+            try:
+                worker.wait(timeout=max(0.1, min(timeout, 4)))
+            except subprocess.TimeoutExpired:
+                pass
         errors = []
         for pid, record in list(self._owned.items()):
             try:
@@ -816,6 +881,12 @@ class CommandRuntime:
                 worker.wait(timeout=max(0.1, deadline - time.monotonic()))
             except subprocess.TimeoutExpired as exc:
                 errors.append(exc)
+        # Kill any Chromium process that escaped the Job Object and outlived the worker,
+        # so the runtime directory (and its chrome_debug.log) can be deleted afterwards.
+        try:
+            self._kill_browser_procs(deadline)
+        except Exception as exc:
+            errors.append(exc)
         for thread in self._output_threads:
             thread.join(timeout=max(0.1, deadline - time.monotonic()))
         self._worker = None
