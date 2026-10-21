@@ -338,14 +338,17 @@ function renderRunHeader(state){
   $('stopButton').hidden=!state.live_available || state.phase==='finalizing' || state.phase==='resetting';
   $('recoverButton').hidden=state.phase!=='recovery_required'&&state.cleanup_status!=='failed'&&state.lab_reset_status!=='failed';
   setText('runError',state.cleanup_error||(state.run_result==='error'?state.finish_reason:'')||'');
-  const cUsed=state.context_chars, cBudget=state.context_budget;
-  if(cUsed&&cBudget){const pct=Math.min(100,Math.round(cUsed/cBudget*100));$('contextBar').hidden=false;const fill=$('contextBarFill');fill.style.width=pct+'%';fill.className='context-bar-fill'+(pct>=90?' bad':pct>=70?' warn':'');setText('contextBarText',`${pct}% · ${(cUsed/1000).toFixed(1)}k/${Math.round(cBudget/1000)}k자`);}
+  let ctxPct=null, ctxText='';
+  if(state.prompt_tokens&&state.num_ctx){ctxPct=Math.min(100,Math.round(state.prompt_tokens/state.num_ctx*100));ctxText=`${ctxPct}% · ${state.prompt_tokens}/${state.num_ctx}토큰`;}
+  else if(state.context_chars&&state.context_budget){ctxPct=Math.min(100,Math.round(state.context_chars/state.context_budget*100));ctxText=`${ctxPct}% · ${(state.context_chars/1000).toFixed(1)}k/${Math.round(state.context_budget/1000)}k자`;}
+  if(ctxPct!==null){$('contextBar').hidden=false;const fill=$('contextBarFill');fill.style.width=ctxPct+'%';fill.className='context-bar-fill'+(ctxPct>=90?' bad':ctxPct>=70?' warn':'');setText('contextBarText',ctxText);}
   else $('contextBar').hidden=true;
   const summary=$('resultSummary'); summary.replaceChildren();
   for(const [key,value] of [['실험 결과',state.run_result||'진행 중'],['종료 이유',state.finish_reason||'—'],
     ['로그',state.log_status],['런타임 정리',state.cleanup_status],['Juice Shop 초기화',state.lab_reset_status]]){
     summary.append(textNode('dt',key),textNode('dd',value||'—'));
   }
+  setText('reportText',state.report||'보고서가 아직 생성되지 않았습니다.');
   setText('settingsValue',JSON.stringify({run_id:state.run_id,target:state.target,goal:state.goal,model:state.model,
     model_settings:state.model_settings,budgets:state.budgets,scenario_source:state.scenario_source,chain_mode:state.chain_mode},null,2));
   renderAgentStatus();

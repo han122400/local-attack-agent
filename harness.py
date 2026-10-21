@@ -43,6 +43,7 @@ class Harness:
         self.max_decode_attempts = max_decode_attempts
         self.stop_requested = stop_requested or (lambda: False)
         self.calls = 0
+        self.last_prompt_tokens = None   # prompt_eval_count of the most recent model call (real num_ctx usage)
 
     def decide(self, run_id: str, context: dict, *, model: str, settings: dict,
                deadline: float | None = None) -> Command:
@@ -98,6 +99,8 @@ class Harness:
                 self.log.append("model_response", {"call_id": call_id, "output": raw,
                                                    "thinking": "".join(thinking),
                                                    "elapsed": round(time.monotonic() - started, 3), **completion})
+                if completion.get("prompt_eval_count") is not None:
+                    self.last_prompt_tokens = completion["prompt_eval_count"]
                 if completion.get("done_reason") == "length":
                     limit = selected["options"].get("num_predict", "model default")
                     raise ModelFailure("output_limit", f"Model reached the output limit (num_predict={limit}, "

@@ -16,6 +16,7 @@ from command_runtime import CommandRuntime
 from harness import Harness, ModelFailure
 from lab import reset_lab
 from model_settings import default_model_settings, validate_model_settings
+from planning import SYSTEM_PROMPT
 from session_log import ControllerLease, LogFailure, SessionLog, SessionStore, validate_run_id
 
 
@@ -25,9 +26,17 @@ RUNS_ROOT = Path(__file__).resolve().parent / "runs"
 DEFAULT_BUDGETS = {"seconds": 1200, "model_calls": 40, "tool_calls": 80,
                    "command_seconds": 30, "finalize_seconds": 120}
 
-# Char budget for the assembled model context (a proxy for num_ctx, since tokens are only known after a
-# call). When exceeded, the oldest structured history is dropped and a context_compacted event is emitted.
-CONTEXT_CHAR_BUDGET = 16000
+# The full prompt (system + context) must fit num_ctx with room left for the model's output. We budget the
+# CONTEXT (the user message) in chars — a token proxy, since tokens are only known after a call — after
+# subtracting the system prompt and reserving ~35% of num_ctx for output. When the context exceeds this
+# budget the oldest structured history is dropped and a context_compacted event is emitted.
+_CHARS_PER_TOKEN = 3.3        # rough for mixed Korean/English/code
+_PROMPT_FRACTION = 0.65       # share of num_ctx used for the prompt (rest reserved for output)
+
+
+def context_char_budget(num_ctx: int) -> int:
+    total_prompt_chars = int(max(1024, num_ctx) * _CHARS_PER_TOKEN * _PROMPT_FRACTION)
+    return max(2000, total_prompt_chars - len(SYSTEM_PROMPT))
 
 
 def _digest(text: str, limit: int = 240) -> str:
@@ -37,6 +46,32 @@ def _digest(text: str, limit: int = 240) -> str:
         return text
     head = limit * 2 // 3
     return (text[:head] + " … " + text[-(limit - head - 3):]).strip()
+
+
+def compose_report(findings: list[dict], run_result: str, model_reason: str) -> str:
+    """Deterministic report built from the preserved findings, so every run ends with an actual result
+    (confirmed observations / inconclusive / failures) even when the model never produced a finish summary."""
+    findings = findings or []
+    evidence = [f for f in findings if f.get("evidence")]
+    inconclusive = [f for f in findings if f.get("status") == "ok" and not f.get("evidence")]
+    failed = [f for f in findings if f.get("status") in ("error", "timeout")]
+    lines = [f"결과: {run_result} · 스텝 {len(findings)}개 "
+             f"(증거 {len(evidence)} · 미확정 {len(inconclusive)} · 실패 {len(failed)})"]
+    if model_reason:
+        lines.append(f"모델 종료 요약: {model_reason}")
+    if evidence:
+        lines.append("확인된 관찰:")
+        for f in evidence[:12]:
+            lines.append(f"  - [{f['step']}] {f.get('plan', '')} → {str(f.get('observed', ''))[:140]}")
+    else:
+        lines.append("확인된(증거 있는) 관찰 없음.")
+    if inconclusive:
+        steps = ", ".join(str(f["step"]) for f in inconclusive[:8])
+        lines.append(f"미확정(코드는 실행됐으나 증거 불충분): {len(inconclusive)}건 (스텝 {steps}).")
+    if failed:
+        steps = ", ".join(str(f["step"]) for f in failed[:8])
+        lines.append(f"실패/타임아웃: {len(failed)}건 (스텝 {steps}).")
+    return "\n".join(lines)
 
 
 def safe_target(target: str, allowed_origin: str = TARGET) -> str:
@@ -205,6 +240,8 @@ class ExplorerV3:
         deadline = time.monotonic() + budgets["seconds"]
         harness = Harness(log, transport=self.transport, max_calls=budgets["model_calls"],
                           stop_requested=self.stop_event.is_set)
+        num_ctx = (metadata.get("model_settings", {}).get("options", {}) or {}).get("num_ctx", 8192)
+        budget = context_char_budget(num_ctx)
         recent: list[dict] = []
         history: list[dict] = []       # structured memory of every step; survives recent trimming
         seen: dict[str, int] = {}      # observation digest -> step that first produced it (repetition)
@@ -239,15 +276,18 @@ class ExplorerV3:
             window = min(len(history), 30)
             context = build_context(window)
             context_chars = len(json.dumps(context, ensure_ascii=False))
-            while context_chars > CONTEXT_CHAR_BUDGET and window > 1:
+            while context_chars > budget and window > 1:
                 window -= 1
                 context = build_context(window)
                 context_chars = len(json.dumps(context, ensure_ascii=False))
             dropped = min(len(history), 30) - window
             if dropped > 0:
                 log.append("context_compacted", {"dropped": dropped, "kept_steps": window, "chars": context_chars})
-            self._recent_state.update(context_chars=context_chars, context_budget=CONTEXT_CHAR_BUDGET)
-            log.update(context_chars=context_chars, context_budget=CONTEXT_CHAR_BUDGET)
+            # Expose both the char budget (pre-call proxy) and the real token usage of the last call.
+            usage = {"context_chars": context_chars, "context_budget": budget,
+                     "prompt_tokens": harness.last_prompt_tokens, "num_ctx": num_ctx}
+            self._recent_state.update(**usage)
+            log.update(**usage)
             if history and history[-1].get("repeat_of"):
                 context["note"] = ("Your last step repeated an earlier observation with no new evidence. "
                                    "Try a different route, feature, or approach — do not repeat it.")
@@ -304,6 +344,14 @@ class ExplorerV3:
         budget = configured.get("finalize_seconds", DEFAULT_BUDGETS["finalize_seconds"])
         budget = budget if type(budget) is int and budget > 0 else DEFAULT_BUDGETS["finalize_seconds"]
         deadline = time.monotonic() + budget
+        # Deterministic report from the preserved findings, so a timed-out/stopped run still ends with an
+        # actual result instead of only a deadline message. Best-effort; the full record stays on disk.
+        try:
+            report = compose_report(log.metadata.get("findings") or [], run_result, reason)
+            log.update(report=report)
+            self._recent_state.update(report=report)
+        except LogFailure:
+            pass
         def remaining(cap: float) -> float:
             left = deadline - time.monotonic()
             if left <= 0:
