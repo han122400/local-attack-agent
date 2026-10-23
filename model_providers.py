@@ -155,6 +155,9 @@ def _request_payload(payload: dict, info: dict) -> dict:
     think = payload.get("think")
     if think is not None and "reasoning" in supported:
         request["reasoning"] = {"enabled": think} if type(think) is bool else {"effort": think}
+    # Prefer the cheapest provider for this model. The same model is priced very differently per
+    # provider, and input tokens (re-sent context each step) dominate cost on multi-step runs.
+    request["provider"] = {"sort": "price"}
     if "structured_outputs" in supported:
         # Use the portable object schema; action-specific invariants remain enforced by validate_command.
         schema = {key: value for key, value in payload["format"].items() if key != "oneOf"}
@@ -163,7 +166,8 @@ def _request_payload(payload: dict, info: dict) -> dict:
                                           for name, prop in schema["properties"].items()}}
         request["response_format"] = {"type": "json_schema", "json_schema": {
             "name": "investigation_command", "strict": True, "schema": schema}}
-        request["provider"] = {"require_parameters": True}
+        # Only route to providers that honour every parameter we send (schema, reasoning, sampling).
+        request["provider"]["require_parameters"] = True
     elif "response_format" in supported:
         request["response_format"] = {"type": "json_object"}
     return request

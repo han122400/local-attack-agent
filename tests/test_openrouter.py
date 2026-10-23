@@ -149,6 +149,8 @@ class OpenRouterTests(unittest.TestCase):
         self.assertEqual(seen[0]["temperature"], 0.3)
         self.assertEqual(seen[0]["response_format"]["type"], "json_schema")
         self.assertNotIn("oneOf", seen[0]["response_format"]["json_schema"]["schema"])
+        # Route to the cheapest provider that still honours the parameters we send.
+        self.assertEqual(seen[0]["provider"], {"sort": "price", "require_parameters": True})
         self.assertNotIn("options", seen[0])
         self.assertNotIn("num_ctx", seen[0])
         events = log.read_events()
