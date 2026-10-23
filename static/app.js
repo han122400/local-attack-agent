@@ -26,6 +26,13 @@ const runStats={calls:0,executions:0,modelErrors:0,systemErrors:0,unknownFailure
 let displayQueued=false, latestExecution=null;
 let fileSource='runtime', fileItems=[], selectedFile=null, selectedEvidence=null, evidenceItems=[];
 const collapsedDirs=new Set(['deps','tmp','browser']);
+
+// Persist the operator's dashboard inputs (goal text, provider/model, per-model settings) in the
+// browser so a reload or app restart does not wipe them. Per-viewer convenience only; wrapped so a
+// private window or blocked storage degrades to defaults instead of throwing.
+const DASH_KEY='juice-explorer:dashboard:v1';
+function loadDash(){ try{ return JSON.parse(localStorage.getItem(DASH_KEY))||{}; }catch{ return {}; } }
+function saveDash(patch){ try{ localStorage.setItem(DASH_KEY, JSON.stringify({...loadDash(),...patch})); }catch{ /* storage unavailable */ } }
 const goalSuggestions={
   structure:'설정된 대상 웹사이트에서 접근 가능한 페이지와 주요 기능의 구조를 파악해줘. 실제로 관찰한 링크, 화면과 이동 관계를 근거로 기능별 요약과 아직 확인하지 못한 영역을 정리해줘.',
   inputs:'설정된 대상 웹사이트에서 검색, 필터와 입력 요소의 동작을 관찰해줘. 관찰한 화면을 바탕으로 확인할 요소와 비파괴적인 입력값을 스스로 선택하고, 입력 전후의 변화와 근거를 정리해줘. 해당 요소가 없으면 관찰한 범위와 함께 기록해줘.',
@@ -283,7 +290,10 @@ function currentModelSettingsValues() {
 }
 
 function rememberModelSettings() {
-  if(configuredSettingsKey)modelSettingsDrafts.set(configuredSettingsKey,currentModelSettingsValues());
+  if(configuredSettingsKey){
+    modelSettingsDrafts.set(configuredSettingsKey,currentModelSettingsValues());
+    saveDash({settings:Object.fromEntries(modelSettingsDrafts)});
+  }
 }
 
 function configureModelControls() {
@@ -408,6 +418,14 @@ function initMain(){
   $('setupSection').hidden=historyMode; $('historySection').hidden=!historyMode;
   if(historyMode){setText('mainHeading','실험 기록');setText('mainLead','저장된 세션의 결과와 실행 로그를 확인합니다.');}
   $('startForm').addEventListener('submit',startRun);
+  // Restore the last-used inputs before loadReadiness runs, so the saved model is picked up as the
+  // "previous" selection and the saved per-model settings are applied by configureModelControls.
+  const saved=loadDash();
+  for(const [key,value] of Object.entries(saved.settings||{}))modelSettingsDrafts.set(key,value);
+  if(saved.provider)$('providerSelect').value=saved.provider;
+  if(saved.model)selectedModelName=saved.model;
+  if(typeof saved.goal==='string')$('goalInput').value=saved.goal;
+  $('goalInput').addEventListener('input',()=>saveDash({goal:$('goalInput').value}));
   for(const button of $('goalSuggestions').querySelectorAll('button[data-goal]'))button.addEventListener('click',()=>{
     const input=$('goalInput');input.value=goalSuggestions[button.dataset.goal]+goalScope;
     input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();input.setSelectionRange(input.value.length,input.value.length);
@@ -415,11 +433,13 @@ function initMain(){
   for(const id of ['scenarioSelect','chainSelect'])$(id).addEventListener('change',updateStartControls);
   $('providerSelect').addEventListener('change',()=>{
     $('modelSearch').value=''; selectedModelName=''; availableModels=[]; modelReady=false; renderModelPicker();
+    saveDash({provider:$('providerSelect').value, model:''});
     configureModelControls();
     loadReadiness();
   });
   $('modelSelect').addEventListener('change',()=>{
     selectedModelName=$('modelSelect').value;
+    saveDash({model:selectedModelName});
     configureModelControls(); renderModelPicker(); updateStartControls();
   });
   for(const id of ['thinkSelect','temperatureInput','contextInput','predictInput'])$(id).addEventListener('input',rememberModelSettings);
