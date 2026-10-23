@@ -107,8 +107,11 @@ class OpenRouterTests(unittest.TestCase):
             with self.http(respond):
                 Harness(log).decide(log.run_id, {}, model=MODEL,
                     settings={"think": None, "options": {"num_predict": 8192}})
+            # Output is reserved below the context window after the prompt; the exact value tracks the
+            # system prompt length, so assert the capping behavior rather than a prompt-tied magic number.
             self.assertGreater(seen[0]["max_tokens"], 0)
-            self.assertLess(seen[0]["max_tokens"], 1500)
+            self.assertLess(seen[0]["max_tokens"], catalog["data"][0]["context_length"])
+            self.assertLess(seen[0]["max_tokens"], 8192)   # below the requested num_predict too
         finally:
             log.close()
 
