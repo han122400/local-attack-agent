@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from harness import Harness, ModelFailure
+from model_providers import OpenRouterError
 from planning import Command, validate_command
 from session_log import SessionLog
 
@@ -254,6 +255,44 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(sent[0]["options"]["num_predict"], 4096)   # initial cap
             self.assertEqual(sent[1]["options"]["num_predict"], 8192)   # doubled on the retry
             self.assertEqual(sent[2]["options"]["num_predict"], 8192)   # floor carried into the next step
+            log.close()
+
+    def test_transient_transport_error_retries_then_succeeds(self):
+        # A provider that drops the stream once should be retried, not fail the whole run.
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            attempts = []
+            good = json.dumps({"action": "finish", "plan": "done", "reason": "enough",
+                               "path": "", "content": "", "command": "", "code": ""})
+            def transport(_payload):
+                attempts.append(1)
+                if len(attempts) == 1:
+                    raise OpenRouterError("OpenRouter 응답이 정상 종료되지 않았습니다")
+                yield {"message": {"content": good}, "done": True, "done_reason": "stop"}
+            command = Harness(log, transport=transport, transport_retry_backoff=0).decide(
+                RUN_ID, {}, model="openrouter:z-ai/glm-5.3-flash", settings={})
+            self.assertEqual(command.action, "finish")
+            self.assertEqual(len(attempts), 2)
+            events = log.read_events()
+            self.assertEqual([e["error_kind"] for e in events if e["kind"] == "model_error"], ["transport"])
+            self.assertTrue(any(e["kind"] == "transport_retry" for e in events))
+            log.close()
+
+    def test_non_retryable_transport_error_aborts_without_retry(self):
+        # Auth/billing/permission failures (retryable=False) must fail fast, not burn retries.
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            attempts = []
+            def transport(_payload):
+                attempts.append(1)
+                raise OpenRouterError("OpenRouter HTTP 402: 크레딧 잔액을 확인하세요.", retryable=False)
+                yield  # unreachable; makes this a generator
+            with self.assertRaises(ModelFailure) as raised:
+                Harness(log, transport=transport, transport_retry_backoff=0, max_calls=5).decide(
+                    RUN_ID, {}, model="openrouter:z-ai/glm-5.3-flash", settings={})
+            self.assertEqual(raised.exception.kind, "transport")
+            self.assertEqual(len(attempts), 1)
+            self.assertFalse(any(e["kind"] == "transport_retry" for e in log.read_events()))
             log.close()
 
 

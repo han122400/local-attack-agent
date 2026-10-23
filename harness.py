@@ -51,12 +51,15 @@ def _ollama_stream(payload: dict):
 
 class Harness:
     def __init__(self, log: SessionLog, *, transport=None, max_calls: int = 40,
-                 stop_requested=None, max_decode_attempts: int = 6):
+                 stop_requested=None, max_decode_attempts: int = 6,
+                 max_transport_retries: int = 3, transport_retry_backoff: float = 0.5):
         self.log = log
         self.run_id = log.run_id
         self.transport = transport or _model_stream
         self.max_calls = max_calls
         self.max_decode_attempts = max_decode_attempts
+        self.max_transport_retries = max_transport_retries
+        self.transport_retry_backoff = transport_retry_backoff
         self.stop_requested = stop_requested or (lambda: False)
         self.calls = 0
         self.last_prompt_tokens = None   # prompt_eval_count of the most recent model call (real num_ctx usage)
@@ -81,6 +84,7 @@ class Harness:
         if "keep_alive" in selected:
             payload["keep_alive"] = selected["keep_alive"]
         last_error: ModelFailure | None = None
+        transport_retries = 0
         # Retry recoverable format/output errors with feedback instead of failing the whole run
         # after a single retry. The global model-call budget below is the real ceiling.
         for _ in range(self.max_decode_attempts):
@@ -193,7 +197,19 @@ class Harness:
                 failure = ModelFailure("transport", str(exc)[:300], call_id)
                 self.log.append("model_error", {"call_id": call_id, "error_kind": failure.kind,
                                                 "message": str(failure), "elapsed": round(time.monotonic() - started, 3)})
-                raise failure from exc
+                last_error = failure
+                transport_retries += 1
+                # Transient provider/network errors (incomplete stream, 429, timeouts, dropped
+                # connections) usually clear on a retry; auth/billing/permission failures do not, so
+                # OpenRouterError marks those non-retryable. Back off briefly, bounded by attempts,
+                # the call budget, the deadline and a stop request.
+                retryable = getattr(exc, "retryable", True)
+                if (not retryable or transport_retries > self.max_transport_retries
+                        or self.calls >= self.max_calls or self.stop_requested()
+                        or (deadline is not None and time.monotonic() >= deadline)):
+                    raise failure from exc
+                self.log.append("transport_retry", {"call_id": call_id, "attempt": transport_retries})
+                time.sleep(min(self.transport_retry_backoff * 2 ** (transport_retries - 1), 4.0))
         assert last_error is not None
         raise last_error
 

@@ -20,7 +20,11 @@ _catalog_cache: dict = {}
 
 
 class OpenRouterError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, retryable: bool = True):
+        super().__init__(message)
+        # Transient failures (incomplete stream, 429, 5xx, dropped connection) may clear on a retry;
+        # auth/billing/permission failures will not, so they set retryable=False.
+        self.retryable = retryable
 
 
 def is_openrouter(model: str) -> bool:
@@ -47,7 +51,7 @@ def _http_failure(status: int) -> OpenRouterError:
             403: "키의 권한과 모델 접근 설정을 확인하세요.",
             429: "호출 한도에 도달했습니다. 잠시 후 다시 시도하세요."}.get(status, "잠시 후 다시 시도하세요.")
     # Never include upstream bodies/headers: they may echo credentials or request data.
-    return OpenRouterError(f"OpenRouter HTTP {status}: {hint}")
+    return OpenRouterError(f"OpenRouter HTTP {status}: {hint}", retryable=status not in {401, 402, 403})
 
 
 def get_openrouter_models(*, refresh: bool = False) -> list[dict]:
