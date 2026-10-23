@@ -290,10 +290,7 @@ function currentModelSettingsValues() {
 }
 
 function rememberModelSettings() {
-  if(configuredSettingsKey){
-    modelSettingsDrafts.set(configuredSettingsKey,currentModelSettingsValues());
-    saveDash({settings:Object.fromEntries(modelSettingsDrafts)});
-  }
+  if(configuredSettingsKey)modelSettingsDrafts.set(configuredSettingsKey,currentModelSettingsValues());
 }
 
 function configureModelControls() {
@@ -418,14 +415,21 @@ function initMain(){
   $('setupSection').hidden=historyMode; $('historySection').hidden=!historyMode;
   if(historyMode){setText('mainHeading','실험 기록');setText('mainLead','저장된 세션의 결과와 실행 로그를 확인합니다.');}
   $('startForm').addEventListener('submit',startRun);
-  // Restore the last-used inputs before loadReadiness runs, so the saved model is picked up as the
+  // Restore the last SAVED inputs before loadReadiness runs, so the saved model is picked up as the
   // "previous" selection and the saved per-model settings are applied by configureModelControls.
   const saved=loadDash();
   for(const [key,value] of Object.entries(saved.settings||{}))modelSettingsDrafts.set(key,value);
   if(saved.provider)$('providerSelect').value=saved.provider;
   if(saved.model)selectedModelName=saved.model;
   if(typeof saved.goal==='string')$('goalInput').value=saved.goal;
-  $('goalInput').addEventListener('input',()=>saveDash({goal:$('goalInput').value}));
+  if(Object.keys(saved).length)setText('saveStatus','저장된 설정을 불러왔습니다.');
+  // Explicit save: persist the current goal, provider/model and per-model settings on button press.
+  $('saveInputsButton').addEventListener('click',()=>{
+    rememberModelSettings();
+    saveDash({goal:$('goalInput').value, provider:$('providerSelect').value,
+      model:selectedModelName, settings:Object.fromEntries(modelSettingsDrafts)});
+    setText('saveStatus',`저장됨 ✓ · ${new Date().toLocaleTimeString('ko-KR')}`);
+  });
   for(const button of $('goalSuggestions').querySelectorAll('button[data-goal]'))button.addEventListener('click',()=>{
     const input=$('goalInput');input.value=goalSuggestions[button.dataset.goal]+goalScope;
     input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();input.setSelectionRange(input.value.length,input.value.length);
@@ -433,13 +437,11 @@ function initMain(){
   for(const id of ['scenarioSelect','chainSelect'])$(id).addEventListener('change',updateStartControls);
   $('providerSelect').addEventListener('change',()=>{
     $('modelSearch').value=''; selectedModelName=''; availableModels=[]; modelReady=false; renderModelPicker();
-    saveDash({provider:$('providerSelect').value, model:''});
     configureModelControls();
     loadReadiness();
   });
   $('modelSelect').addEventListener('change',()=>{
     selectedModelName=$('modelSelect').value;
-    saveDash({model:selectedModelName});
     configureModelControls(); renderModelPicker(); updateStartControls();
   });
   for(const id of ['thinkSelect','temperatureInput','contextInput','predictInput'])$(id).addEventListener('input',rememberModelSettings);

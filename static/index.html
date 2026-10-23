@@ -92,7 +92,7 @@
               <label>명령 1회 · 초<input id="commandSecondsInput" type="number" min="1" max="3600" step="1" value="30"></label>
             </div>
           </details>
-          <div class="form-actions"><button id="startButton" class="button primary" type="submit" disabled>실험 시작</button><span id="startError" class="error-text" role="alert"></span></div>
+          <div class="form-actions"><button id="startButton" class="button primary" type="submit" disabled>실험 시작</button><button id="saveInputsButton" class="button secondary" type="button">설정 저장</button><span id="saveStatus" class="field-note" role="status" aria-live="polite"></span><span id="startError" class="error-text" role="alert"></span></div>
         </form>
         <section class="panel"><div class="section-head"><h2>준비 상태</h2><div class="inline-controls"><button id="labStartButton" class="button secondary" type="button" hidden>실습환경 켜기</button><button id="refreshReadinessButton" class="button secondary" type="button">상태 새로고침</button></div></div>
           <div class="readiness-grid"><div><strong id="readinessProviderLabel">Ollama</strong><p id="ollamaReadiness">확인 중</p></div><div><strong>Juice Shop</strong><p id="labReadiness">확인 중</p></div></div>
