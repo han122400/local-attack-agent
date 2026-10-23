@@ -4,8 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Juice Explorer · 로컬 실험</title>
-  <link rel="stylesheet" href="/style.css?v=3-event-types">
-  <script src="/app.js?v=3-event-types" defer></script>
+  <link rel="stylesheet" href="/style.css?v=3-model-prices">
+  <script src="/model-settings-config.js?v=1-provider-settings" defer></script>
+  <script src="/app.js?v=3-provider-settings" defer></script>
 </head>
 <body>
   <button id="menuToggle" class="menu-toggle" type="button" aria-controls="sidebar" aria-expanded="false">☰ 메뉴</button>
@@ -18,7 +19,8 @@
         <a id="currentRunLink" href="/" hidden>현재 실험</a>
       </nav>
       <div class="side-status">
-        <p><span>Ollama</span><strong id="sideOllama">확인 중</strong></p>
+        <p><span id="sideOllamaLabel">Ollama</span><strong id="sideOllama">확인 중</strong></p>
+        <p id="sideProviderRow" hidden><span id="sideProviderLabel">OpenRouter</span><strong id="sideProviderStatus">확인 중</strong></p>
         <p><span>Juice Shop</span><strong id="sideLab">확인 중</strong></p>
         <small id="sideChecked">상태 확인 전</small>
       </div>
@@ -31,8 +33,30 @@
         <a id="activeRunBanner" class="active-banner" href="/" hidden>진행 중인 실험으로 이동</a>
         <form id="startForm" class="panel form-panel">
           <h2>모델 선택</h2>
-          <label for="modelSelect">로컬 Ollama 모델</label>
-          <div class="inline-controls"><select id="modelSelect" required disabled><option>모델 확인 중</option></select><button id="refreshModelsButton" type="button" class="button secondary">새로고침</button></div>
+          <label for="providerSelect">모델 제공자</label>
+          <select id="providerSelect"><option value="ollama">로컬 Ollama</option><option value="openrouter">OpenRouter API</option></select>
+          <p id="remoteModelNotice" class="field-note" hidden>OpenRouter 선택 시 목표와 관찰 내용이 외부 API로 전송되며, 선택한 모델의 요금이 적용됩니다. 키는 서버의 .env에서 읽습니다.</p>
+          <div class="model-picker">
+            <label for="modelSearch">모델 검색</label>
+            <div class="model-searchbar">
+              <input id="modelSearch" type="search" placeholder="모델명 또는 제공사 검색 · 예: gemini, openai" autocomplete="off" aria-controls="modelSelect" aria-describedby="modelSearchHelp">
+              <button id="clearModelSearchButton" type="button" class="button secondary" disabled>지우기</button>
+              <button id="refreshModelsButton" type="button" class="button secondary">새로고침</button>
+            </div>
+            <div class="model-results-head"><label for="modelSelect">검색 결과</label><span id="modelSearchCount" role="status" aria-live="polite">모델 확인 중</span></div>
+            <p id="modelPriceUnit" class="field-note" hidden>가격: USD / 100만 토큰 · 입력 / 출력 기본 단가</p>
+            <select id="modelSelect" size="5" disabled aria-describedby="modelSearchHelp selectedModelId"><option>모델 확인 중</option></select>
+            <p id="modelSearchEmpty" class="model-empty" hidden>일치하는 모델이 없습니다. 다른 이름이나 제공사로 검색해 보세요.</p>
+            <p id="modelSearchHelp" class="field-note">여러 검색어는 공백으로 구분하세요. 검색창에서 Enter로 첫 결과를 선택하고, Esc로 검색을 지웁니다.</p>
+            <div class="selected-model" aria-live="polite">
+              <span class="selected-model-label">실행할 모델</span><strong id="selectedModelName">모델을 불러오는 중입니다.</strong><code id="selectedModelId"></code><small id="selectedModelMeta"></small>
+              <div id="selectedModelPricing" hidden>
+                <dl class="model-pricing"><div><dt>입력 · 100만 토큰</dt><dd id="selectedInputPrice">미제공</dd></div><div><dt>출력 · 100만 토큰</dt><dd id="selectedOutputPrice">미제공</dd></div></dl>
+                <p class="field-note">USD 기준 · OpenRouter 목록의 기본 단가입니다. 제공자·긴 문맥·캐시 등 적용 조건에 따라 실제 요금은 달라질 수 있습니다.</p>
+              </div>
+              <small id="localModelPriceNote" hidden>로컬 실행 · API 토큰 과금 없음</small>
+            </div>
+          </div>
           <p id="modelStatus" class="field-note">설치된 모델을 읽고 있습니다.</p>
           <h2>실험 설정</h2>
           <div class="form-grid">
@@ -50,12 +74,18 @@
           </div>
           <p id="goalSuggestionHint" class="field-note goal-hint">선택하면 목표가 채워집니다. 내용을 자유롭게 수정할 수 있습니다.</p>
           <textarea id="goalInput" rows="4" maxlength="2000" required aria-describedby="goalSuggestionHint" placeholder="직접 목표를 입력하거나 위 선택지를 눌러 시작하세요."></textarea>
-          <details class="advanced"><summary>고급 설정 · 모델과 실행 예산</summary>
+          <details class="advanced"><summary id="advancedSettingsSummary">고급 설정 · Ollama / 실행 예산</summary>
+            <h3 id="modelSettingsTitle">Ollama 모델 설정</h3>
+            <p id="modelSettingsHelp" class="field-note">로컬 Ollama의 추론·샘플링·메모리 설정입니다.</p>
             <div class="form-grid">
-              <label>Thinking<select id="thinkSelect"><option value="false">끄기</option><option value="null">모델 기본값</option><option value="true">켜기</option></select></label>
-              <label>Temperature<input id="temperatureInput" type="number" min="0" max="2" step="0.05" value="0"></label>
-              <label>컨텍스트 토큰<input id="contextInput" type="number" min="512" max="262144" step="1" value="8192"></label>
-              <label>출력 토큰<input id="predictInput" type="number" min="1" max="65536" step="1" value="4096"></label>
+              <label id="thinkingField"><span id="thinkingLabel">Thinking</span><select id="thinkSelect" aria-describedby="thinkingHelp"><option value="false">끄기</option><option value="null">모델 기본값</option><option value="true">켜기</option></select><small id="thinkingHelp" class="field-note">모델이 지원하는 경우 Thinking을 켜거나 끕니다.</small></label>
+              <label id="temperatureField">Temperature<input id="temperatureInput" type="number" min="0" max="2" step="0.05" value="0" placeholder="모델 기본값" aria-describedby="temperatureHelp"><small id="temperatureHelp" class="field-note">출력의 다양성을 조절합니다.</small></label>
+              <label><span id="contextLabel">컨텍스트 토큰 · num_ctx</span><input id="contextInput" type="number" min="512" max="262144" step="1" value="8192" aria-describedby="contextHelp"><small id="contextHelp" class="field-note">Ollama가 사용할 문맥 크기입니다.</small></label>
+              <label><span id="outputLabel">출력 토큰 · num_predict</span><input id="predictInput" type="number" min="1" max="65536" step="1" value="4096" aria-describedby="outputHelp"><small id="outputHelp" class="field-note">Thinking과 최종 응답을 합친 생성 토큰 한도입니다.</small></label>
+            </div>
+            <h3>실행 예산 · 공통</h3>
+            <p class="field-note">로컬·외부 모델 모두에 적용되는 에이전트의 실행 한도입니다.</p>
+            <div class="form-grid">
               <label>탐색 시간 · 초<input id="secondsInput" type="number" min="1" max="3600" step="1" value="1200"></label>
               <label>모델 호출<input id="modelCallsInput" type="number" min="1" max="500" step="1" value="40"></label>
               <label>도구 호출<input id="toolCallsInput" type="number" min="1" max="500" step="1" value="80"></label>
@@ -65,8 +95,8 @@
           <div class="form-actions"><button id="startButton" class="button primary" type="submit" disabled>실험 시작</button><span id="startError" class="error-text" role="alert"></span></div>
         </form>
         <section class="panel"><div class="section-head"><h2>준비 상태</h2><div class="inline-controls"><button id="labStartButton" class="button secondary" type="button" hidden>실습환경 켜기</button><button id="refreshReadinessButton" class="button secondary" type="button">상태 새로고침</button></div></div>
-          <div class="readiness-grid"><div><strong>Ollama</strong><p id="ollamaReadiness">확인 중</p></div><div><strong>Juice Shop</strong><p id="labReadiness">확인 중</p></div></div>
-          <details><summary>모델 CPU / GPU 배치</summary><p class="field-note">메모리 배치 비율입니다. GPU 연산 사용률과는 다릅니다.</p><div id="processorList">확인 중</div></details>
+          <div class="readiness-grid"><div><strong id="readinessProviderLabel">Ollama</strong><p id="ollamaReadiness">확인 중</p></div><div><strong>Juice Shop</strong><p id="labReadiness">확인 중</p></div></div>
+          <details id="processorDetails"><summary>모델 CPU / GPU 배치</summary><p class="field-note">메모리 배치 비율입니다. GPU 연산 사용률과는 다릅니다.</p><div id="processorList">확인 중</div></details>
         </section>
         <section class="panel"><div class="section-head"><h2>최근 실험</h2><a href="/?view=history">전체 기록 보기</a></div><div id="recentRuns" class="run-list"></div></section>
       </section>

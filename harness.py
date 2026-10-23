@@ -9,6 +9,7 @@ from dataclasses import replace
 import httpx2 as httpx
 
 from model_settings import validate_model_settings
+from model_providers import OpenRouterError, is_openrouter, openrouter_stream, strip_tool_call_framing
 from planning import COMMAND_SCHEMA, SYSTEM_PROMPT, Command, normalize_command_inputs, validate_command
 from session_log import SessionLog
 
@@ -21,6 +22,20 @@ class ModelFailure(RuntimeError):
         super().__init__(message)
         self.kind = kind
         self.call_id = call_id
+
+
+def decode_first_command(raw: str) -> tuple[object, str]:
+    """Decode the first complete JSON value from the model output; return (value, trailing).
+
+    Ollama honours the response grammar, but some OpenRouter tool-call formats append framing after
+    the JSON object — a stray '}, a </tool_call> tag, or a second malformed call — which a strict
+    json.loads rejects as "Extra data" and which, if tolerated loosely, would corrupt the code field.
+    raw_decode parses the first balanced value and reports where it ended, so trailing noise is
+    discarded cleanly. The trailing text is returned (not dropped silently) so the caller can log that
+    salvage happened. A leading non-JSON prefix still raises, and is handled as a format error upstream.
+    """
+    value, end = json.JSONDecoder().raw_decode(raw.strip())
+    return value, raw.strip()[end:].strip()
 
 
 def _ollama_stream(payload: dict):
@@ -38,7 +53,7 @@ class Harness:
                  stop_requested=None, max_decode_attempts: int = 6):
         self.log = log
         self.run_id = log.run_id
-        self.transport = transport or _ollama_stream
+        self.transport = transport or _model_stream
         self.max_calls = max_calls
         self.max_decode_attempts = max_decode_attempts
         self.stop_requested = stop_requested or (lambda: False)
@@ -110,9 +125,18 @@ class Harness:
                     reason = completion.get("done_reason", "unknown")
                     raise ModelFailure("format", f"Empty model content (done_reason={reason}); check num_predict/thinking", call_id)
                 try:
-                    answer = json.loads(raw)
-                except json.JSONDecodeError as exc:
+                    answer, trailing = decode_first_command(raw)
+                except (json.JSONDecodeError, ValueError) as exc:
                     raise ModelFailure("format", f"Invalid JSON Command: {exc}", call_id) from exc
+                if trailing:
+                    self.log.append("command_salvaged", {"call_id": call_id, "trailing_chars": len(trailing),
+                                                          "trailing_snippet": trailing[:80]})
+                # Some OpenRouter models leak tool-call framing into field values; strip it before
+                # validating/executing. Provider-specific knowledge stays in the provider module.
+                if is_openrouter(model) and isinstance(answer, dict):
+                    answer, sanitized_fields = strip_tool_call_framing(answer)
+                    if sanitized_fields:
+                        self.log.append("command_sanitized", {"call_id": call_id, "fields": sanitized_fields})
                 try:
                     answer, normalized_fields = normalize_command_inputs(answer)
                     if normalized_fields:
@@ -141,10 +165,15 @@ class Harness:
                        "read_file uses path. Every action including finish requires nonempty plan and reason. "
                        "Unused path/content/command/code fields must be empty strings. "
                        "Produce one small step with concise code, without explanatory comments, within the same output limit."}]}
-            except (httpx.HTTPError, OSError, TimeoutError, json.JSONDecodeError) as exc:
+            except (OpenRouterError, httpx.HTTPError, OSError, TimeoutError, json.JSONDecodeError) as exc:
                 failure = ModelFailure("transport", str(exc)[:300], call_id)
                 self.log.append("model_error", {"call_id": call_id, "error_kind": failure.kind,
                                                 "message": str(failure), "elapsed": round(time.monotonic() - started, 3)})
                 raise failure from exc
         assert last_error is not None
         raise last_error
+
+
+def _model_stream(payload: dict):
+    transport = openrouter_stream if is_openrouter(payload["model"]) else _ollama_stream
+    yield from transport(payload)

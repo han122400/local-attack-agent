@@ -76,7 +76,7 @@ class BrowserUiScenarios(unittest.TestCase):
         cls.models_patch = patch.object(app, "get_ollama_models", return_value=[{"name": "mock:model", "size": 1024}])
         cls.lab_patch = patch.object(app, "get_lab_status", return_value={
             "status": "ready", "message": "Mock Juice Shop ready", "ready": True, "can_start": False})
-        cls.ollama_patch = patch.object(app, "urlopen", return_value=io.BytesIO(b'{"models":[]}'))
+        cls.ollama_patch = patch.object(app, "urlopen", side_effect=lambda *_args, **_kwargs: io.BytesIO(b'{"models":[]}'))
         cls.models_patch.start(); cls.lab_patch.start(); cls.ollama_patch.start()
         cls.sock = socket.socket()
         cls.sock.bind(("127.0.0.1", 0))
@@ -128,6 +128,136 @@ class BrowserUiScenarios(unittest.TestCase):
         self.assertFalse(self.explorer.worker.is_alive())
         metadata = self.explorer.get_run(run_id)
         self.assertEqual(metadata["phase"], "finished", f"{metadata!r}; snapshot={self.explorer.snapshot()!r}")
+
+    def test_openrouter_selection_and_start_work_without_ollama(self):
+        models = [{"name": "openrouter:vendor/test-model", "id": "vendor/test-model", "label": "Remote test",
+                   "provider": "openrouter", "context_length": 4096, "max_completion_tokens": 2048,
+                   "supported_parameters": ["structured_outputs", "max_tokens"], "pricing": {}}]
+        with patch.object(app, "get_ollama_models", side_effect=RuntimeError("Ollama offline")), \
+                patch.object(app, "get_openrouter_models", return_value=models):
+            page = self.page
+            page.goto(self.base)
+            page.locator("#providerSelect").select_option("openrouter")
+            page.locator("#startButton:not([disabled])").wait_for(timeout=10000)
+            self.assertEqual(page.locator("#modelSelect").input_value(), "openrouter:vendor/test-model")
+            self.assertIn("외부", page.locator("#remoteModelNotice").inner_text())
+            self.assertTrue(page.locator("#remoteModelNotice").is_visible())
+            self.assertEqual(page.locator("#thinkSelect").input_value(), "null")
+            self.assertTrue(page.locator("#thinkSelect").is_disabled())
+            self.assertEqual(page.locator("#contextInput").input_value(), "4096")
+            self.assertEqual(page.locator("#predictInput").input_value(), "2048")
+            page.locator("#goalInput").fill("UI remote")
+            page.locator("#startButton").click()
+            page.wait_for_url("**/runs/*")
+            run_id = page.url.rsplit("/", 1)[1]
+            self.wait_run(run_id)
+            self.assertEqual(self.explorer.get_run(run_id)["model"], "openrouter:vendor/test-model")
+            page.wait_for_function("document.getElementById('runModel').textContent === 'openrouter:vendor/test-model'")
+            self.assertEqual(page.locator("#sideProviderLabel").inner_text(), "OpenRouter")
+            self.assertEqual(self.page_errors, [])
+
+    def test_missing_openrouter_key_does_not_block_switching_back_to_ollama(self):
+        with patch.object(app, "get_openrouter_models", side_effect=RuntimeError("OPENROUTER_API_KEY 설정 필요")):
+            page = self.page
+            page.goto(self.base)
+            page.locator("#startButton:not([disabled])").wait_for(timeout=10000)
+            page.locator("#providerSelect").select_option("openrouter")
+            page.wait_for_function("document.getElementById('modelStatus').textContent.includes('OPENROUTER_API_KEY')")
+            self.assertTrue(page.locator("#startButton").is_disabled())
+            page.locator("#providerSelect").select_option("ollama")
+            page.locator("#startButton:not([disabled])").wait_for(timeout=10000)
+            self.assertEqual(page.locator("#modelSelect").input_value(), "mock:model")
+            self.assertTrue(page.locator("#remoteModelNotice").is_hidden())
+
+    def test_model_search_preserves_selection_and_starts_the_explicitly_chosen_model(self):
+        # This scenario verifies selection and request routing, without unrelated command execution.
+        self.explorer.transport = lambda _payload: iter([answer("finish")])
+        models = [{"name": f"openrouter:{model_id}", "id": model_id, "label": label,
+                   "context_length": 32768, "max_completion_tokens": 8192,
+                   "supported_parameters": ["temperature"]}
+                  for model_id, label in [("anthropic/sonnet", "Sonnet"), ("openai/pro", "Pro"),
+                                          ("openai/mini", "Mini"), ("google/flash", "Flash")]]
+        with patch.object(app, "get_openrouter_models", return_value=models):
+            page = self.page
+            page.goto(self.base)
+            page.locator("#providerSelect").select_option("openrouter")
+            page.locator("#startButton:not([disabled])").wait_for(timeout=10000)
+            search = page.locator("#modelSearch")
+            search.fill("OpEnAi pro")
+            self.assertEqual(page.locator("#modelSelect option").count(), 1)
+            self.assertIn("1 / 4", page.locator("#modelSearchCount").inner_text())
+            # Filtering must not silently replace the model already selected for the run.
+            self.assertIn("anthropic/sonnet", page.locator("#selectedModelId").inner_text())
+            search.press("Enter")
+            self.assertIn("openai/pro", page.locator("#selectedModelId").inner_text())
+            self.assertTrue(page.url.endswith("/"))
+            page.locator("#refreshModelsButton").click()
+            page.locator("#modelSelect:not([disabled])").wait_for()
+            self.assertEqual(search.input_value(), "OpEnAi pro")
+            self.assertEqual(page.locator("#modelSelect").input_value(), "openrouter:openai/pro")
+            search.fill("does-not-exist")
+            self.assertTrue(page.locator("#modelSearchEmpty").is_visible())
+            self.assertIn("openai/pro", page.locator("#selectedModelId").inner_text())
+            self.assertTrue(page.locator("#startButton").is_enabled())
+            search.press("Escape")
+            self.assertEqual(page.locator("#modelSelect option").count(), 4)
+            page.set_viewport_size({"width": 390, "height": 780})
+            self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), 390)
+            page.locator("#goalInput").fill("UI remote search")
+            page.locator("#startButton").click()
+            page.wait_for_url("**/runs/*")
+            run_id = page.url.rsplit("/", 1)[1]
+            self.wait_run(run_id)
+            self.assertEqual(self.explorer.get_run(run_id)["model"], "openrouter:openai/pro")
+            self.assertEqual(self.page_errors, [])
+
+    def test_model_prices_and_independent_ollama_sidebar_status(self):
+        models = [{"name": "openrouter:vendor/paid", "id": "vendor/paid", "label": "Paid model",
+                   "pricing": {"prompt": "0.0000025", "completion": "0.00001"}},
+                  {"name": "openrouter:vendor/free", "id": "vendor/free", "label": "Free model",
+                   "pricing": {"prompt": "0", "completion": "0"}},
+                  {"name": "openrouter:vendor/unknown", "id": "vendor/unknown", "label": "Unknown model",
+                   "pricing": {"prompt": None, "completion": "-1"}}]
+        with patch.object(app, "get_openrouter_models", return_value=models):
+            page = self.page
+            page.goto(self.base)
+            page.locator("#providerSelect").select_option("openrouter")
+            page.locator("#modelSelect:not([disabled])").wait_for()
+            self.assertEqual(page.locator("#selectedInputPrice").inner_text(), "$2.50")
+            self.assertEqual(page.locator("#selectedOutputPrice").inner_text(), "$10.00")
+            self.assertIn("100만 토큰", page.locator("#modelPriceUnit").inner_text())
+            paid = page.locator('#modelSelect option[value="openrouter:vendor/paid"]').inner_text()
+            self.assertIn("입력 $2.50", paid)
+            self.assertIn("출력 $10.00", paid)
+            self.assertEqual(page.locator("#sideProviderStatus").inner_text(), "연결됨")
+            self.assertEqual(page.locator("#sideOllamaLabel").inner_text(), "Ollama")
+            page.wait_for_function("document.getElementById('sideOllama').textContent === '연결됨'")
+            self.assertEqual(page.locator("#sideOllama").inner_text(), "연결됨")
+            page.locator("#modelSelect").select_option("openrouter:vendor/free")
+            self.assertEqual(page.locator("#selectedInputPrice").inner_text(), "$0.00")
+            self.assertEqual(page.locator("#selectedOutputPrice").inner_text(), "$0.00")
+            page.locator("#modelSelect").select_option("openrouter:vendor/unknown")
+            self.assertEqual(page.locator("#selectedInputPrice").inner_text(), "미제공")
+            self.assertEqual(page.locator("#selectedOutputPrice").inner_text(), "변동 요금")
+            # Route interception isolates the connection states without an actual Ollama instance.
+            pending = []
+            page.route("**/api/ollama/ps", lambda route: pending.append(route))
+            page.locator("#refreshModelsButton").click()
+            page.locator("#modelSelect:not([disabled])").wait_for()
+            self.assertTrue(page.locator("#startButton").is_enabled())
+            self.assertTrue(pending)
+            for route in pending:
+                route.fulfill(status=503, content_type="application/json", body='{"detail":"Ollama offline"}')
+            page.wait_for_function("document.getElementById('sideOllama').textContent === '연결 실패'")
+            page.locator("#modelSelect:not([disabled])").wait_for()
+            self.assertEqual(page.locator("#sideProviderStatus").inner_text(), "연결됨")
+            self.assertTrue(page.locator("#startButton").is_enabled())
+            page.unroute("**/api/ollama/ps")
+            page.locator("#providerSelect").select_option("ollama")
+            page.locator("#modelSelect:not([disabled])").wait_for()
+            self.assertTrue(page.locator("#selectedModelPricing").is_hidden())
+            self.assertIn("API 토큰 과금 없음", page.locator("#localModelPriceNote").inner_text())
+            self.assertEqual(self.page_errors, [])
 
     def test_01_start_navigation_reload_and_tab_close_do_not_stop_run(self):
         page = self.page

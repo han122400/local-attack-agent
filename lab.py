@@ -1,6 +1,7 @@
 """Status and explicit startup for the existing local Juice Shop container."""
 
 import json
+import os
 import subprocess
 import threading
 import time
@@ -12,10 +13,12 @@ _start_lock = threading.Lock()
 
 
 def _docker(*args: str, timeout: int = 5) -> subprocess.CompletedProcess:
+    env = {key: value for key, value in os.environ.items() if key.upper() != "OPENROUTER_API_KEY"}
     return subprocess.run(
         ["docker", *args], capture_output=True, text=True, encoding="utf-8",
         errors="replace", timeout=timeout, check=False,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        env=env,
     )
 
 

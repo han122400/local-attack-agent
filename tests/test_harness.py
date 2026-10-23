@@ -115,6 +115,92 @@ class HarnessTests(unittest.TestCase):
                 self.assertFalse(any(event["kind"] == "command_decoded" for event in log.read_events()))
                 log.close()
 
+    def test_trailing_data_after_json_object_is_discarded(self):
+        # Robustness: when a provider appends framing AFTER a complete JSON object, raw_decode keeps the
+        # first object and drops the trailing noise. (This is not the GLM bug where framing is embedded
+        # INSIDE the code string — that is handled provider-side in the OpenRouter adapter.)
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            command_json = json.dumps({"action": "run_python", "plan": "Inspect title", "reason": "Observe page",
+                                       "path": "", "content": "", "command": "", "code": "print(await page.title())"})
+            raw = command_json + "'}</arg_value></tool_call><tool_call>:{\t\t,\t\"action\"\t:\t\"run_python\"\t}"
+            def transport(_payload):
+                yield {"message": {"content": raw}, "done": True, "done_reason": "stop"}
+            command = Harness(log, transport=transport, max_calls=1).decide(
+                RUN_ID, {}, model="openrouter:~z-ai/glm-flash-latest", settings={})
+            self.assertEqual(command.action, "run_python")
+            self.assertEqual(command.code, "print(await page.title())")
+            self.assertNotIn("</tool_call>", command.code)
+            salvaged = next(event for event in log.read_events() if event["kind"] == "command_salvaged")
+            self.assertGreater(salvaged["trailing_chars"], 0)
+            self.assertEqual(salvaged["call_id"], command.call_id)
+            log.close()
+
+    def test_leading_non_json_prefix_still_fails_as_format(self):
+        # Salvage only trims trailing noise after a leading JSON value; junk BEFORE the object is a
+        # genuine format error and must not be silently searched past.
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            raw = "```json\n" + json.dumps({"action": "finish", "plan": "d", "reason": "e",
+                                            "path": "", "content": "", "command": "", "code": ""})
+            def transport(_payload):
+                yield {"message": {"content": raw}, "done": True, "done_reason": "stop"}
+            with self.assertRaises(ModelFailure) as raised:
+                Harness(log, transport=transport, max_calls=1).decide(
+                    RUN_ID, {}, model="test:model", settings={})
+            self.assertEqual(raised.exception.kind, "format")
+            self.assertFalse(any(event["kind"] == "command_decoded" for event in log.read_events()))
+            log.close()
+
+    def test_openrouter_tool_call_framing_is_stripped_from_code(self):
+        # The real GLM failure: a single valid JSON object whose code string has tool-call framing
+        # embedded in it. It must be cut back to clean, compilable Python before execution.
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            dirty = {"action": "run_python", "plan": "Inspect", "reason": "Observe",
+                     "path": "", "content": "", "command": "",
+                     "code": "print(await page.title())'}</arg_value></tool_call><tool_call>:{"}
+            def transport(_payload):
+                yield {"message": {"content": json.dumps(dirty)}, "done": True, "done_reason": "stop"}
+            command = Harness(log, transport=transport, max_calls=1).decide(
+                RUN_ID, {}, model="openrouter:~z-ai/glm-flash-latest", settings={})
+            self.assertEqual(command.code, "print(await page.title())")
+            self.assertNotIn("</tool_call>", command.code)
+            compile(command.code, "<c>", "exec", flags=__import__("ast").PyCF_ALLOW_TOP_LEVEL_AWAIT)
+            sanitized = next(e for e in log.read_events() if e["kind"] == "command_sanitized")
+            self.assertIn("code", sanitized["fields"])
+            log.close()
+
+    def test_openrouter_injection_payload_angle_brackets_are_preserved(self):
+        # An XSS payload carries <svg>/<script>, never a tool-call delimiter, so it must survive intact.
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            payload_code = "await submit_input(0, \"<svg onload=alert(1)>\", \".mat-card\")"
+            answer = {"action": "run_python", "plan": "XSS probe", "reason": "Test reflection",
+                      "path": "", "content": "", "command": "", "code": payload_code}
+            def transport(_payload):
+                yield {"message": {"content": json.dumps(answer)}, "done": True, "done_reason": "stop"}
+            command = Harness(log, transport=transport, max_calls=1).decide(
+                RUN_ID, {}, model="openrouter:~z-ai/glm-flash-latest", settings={})
+            self.assertEqual(command.code, payload_code)
+            self.assertFalse(any(e["kind"] == "command_sanitized" for e in log.read_events()))
+            log.close()
+
+    def test_non_openrouter_content_is_not_sanitized(self):
+        # Framing removal is provider-scoped: an Ollama command is left exactly as decoded.
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            code = "x = 1  # </tool_call> literal kept"
+            answer = {"action": "run_python", "plan": "p", "reason": "r",
+                      "path": "", "content": "", "command": "", "code": code}
+            def transport(_payload):
+                yield {"message": {"content": json.dumps(answer)}, "done": True, "done_reason": "stop"}
+            command = Harness(log, transport=transport, max_calls=1).decide(
+                RUN_ID, {}, model="qwen3.5:9b", settings={})
+            self.assertEqual(command.code, code)
+            self.assertFalse(any(e["kind"] == "command_sanitized" for e in log.read_events()))
+            log.close()
+
     def test_output_limit_retries_with_previous_response_and_same_settings(self):
         with tempfile.TemporaryDirectory() as temp:
             log = SessionLog(Path(temp), RUN_ID, {})

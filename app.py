@@ -455,6 +455,7 @@ class Explorer:
 from explorer import ExplorerV3  # noqa: E402 - v1 helpers above remain for unrelated regression tests.
 from lab import get_status as get_lab_status, start_lab
 from model_settings import settings_schema, validate_model_settings, model_presets
+from model_providers import get_openrouter_models, is_openrouter, openrouter_model
 from session_log import LogFailure, safe_relative_path, validate_run_id
 
 
@@ -488,8 +489,14 @@ def get_ollama_models() -> list[dict]:
 
 
 @app.get("/api/models")
-def ollama_models() -> JSONResponse:
+def ollama_models(provider: str = "ollama") -> JSONResponse:
     try:
+        if provider == "openrouter":
+            models = get_openrouter_models(refresh=True)
+            return JSONResponse({"models": models, "default_model": models[0]["name"] if models else None,
+                                 "provider": provider, "settings_schema": settings_schema()}, headers={"Cache-Control": "no-store"})
+        if provider != "ollama":
+            raise HTTPException(status_code=400, detail="지원하지 않는 모델 제공자입니다.")
         return JSONResponse({"models": get_ollama_models(), "default_model": MODEL, "settings_schema": settings_schema()}, headers={"Cache-Control": "no-store"})
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -498,6 +505,9 @@ def ollama_models() -> JSONResponse:
 @app.get("/api/models/details")
 def ollama_model_details(model: str) -> JSONResponse:
     try:
+        if is_openrouter(model):
+            info = openrouter_model(model)
+            return JSONResponse({**info, "model": model, "presets": []}, headers={"Cache-Control": "no-store"})
         if model not in {item["name"] for item in get_ollama_models()}:
             raise HTTPException(status_code=400, detail="설치된 모델을 선택하세요.")
         request = UrlRequest("http://127.0.0.1:11434/api/show", data=json.dumps({"model": model}).encode(), headers={"Content-Type": "application/json"})
@@ -610,11 +620,23 @@ async def start(request: Request) -> dict:
         scenario_source = body.get("scenario_source", "manual")
         chain_mode = body.get("chain_mode", "none")
         if not isinstance(model, str) or not model.strip() or len(model) > 256:
-            raise ValueError("설치된 Ollama 모델을 선택하세요.")
-        models = await run_in_threadpool(get_ollama_models)
+            raise ValueError("사용할 모델을 선택하세요.")
+        remote = is_openrouter(model)
+        models = await run_in_threadpool(get_openrouter_models if remote else get_ollama_models)
         if model not in {item["name"] for item in models}:
-            raise ValueError(f"설치된 Ollama 모델을 찾지 못했습니다: {model}. 모델 목록을 새로고침하세요.")
+            raise ValueError(f"선택한 모델을 찾지 못했습니다: {model}. 모델 목록을 새로고침하세요.")
         settings = validate_model_settings(body["model_settings"]) if "model_settings" in body else None
+        if remote:
+            info = next(item for item in models if item["name"] == model)
+            if settings is None:
+                settings = {"think": None, "options": {"num_ctx": min(8192, info.get("context_length") or 8192),
+                            "num_predict": min(4096, info.get("max_completion_tokens") or 4096,
+                                               int((info.get("context_length") or 16384) * 0.35))}}
+            options = settings["options"]
+            if info.get("context_length") and options.get("num_ctx", 8192) > info["context_length"]:
+                raise ValueError(f"선택한 모델의 컨텍스트 한도는 {info['context_length']} 토큰입니다.")
+            if info.get("max_completion_tokens") and options.get("num_predict", -1) > info["max_completion_tokens"]:
+                raise ValueError(f"선택한 모델의 출력 한도는 {info['max_completion_tokens']} 토큰입니다.")
         started = EXPLORER.start(target, model, goal=goal, model_settings=settings,
                                  scenario_source=scenario_source, chain_mode=chain_mode,
                                  budgets=body.get("budgets"))

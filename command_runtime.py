@@ -357,6 +357,7 @@ class CommandRuntime:
 
     def _environment(self) -> dict:
         env = dict(os.environ)
+        env.pop("OPENROUTER_API_KEY", None)
         temporary = self.runtime_dir / "tmp"
         env.update({"TEMP": str(temporary), "TMP": str(temporary), "TMPDIR": str(temporary),
                     "PIP_CACHE_DIR": str(temporary / "pip-cache"),

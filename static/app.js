@@ -16,6 +16,9 @@ async function jsonRequest(url, options) {
 }
 
 let activeRunId=null, canStart=false, modelReady=false, labReady=false, startPending=false;
+let readinessSerial=0, availableModels=[], selectedModelName='';
+let configuredSettingsKey='';
+const modelSettingsDrafts=new Map();
 let currentRun=null, stream=null, lastSeq=0, readingEvents=false, pendingEvents=new Map();
 let timelineEvents=[], consoleRaw='', consoleChannel='', selectedCode=null;
 const modelCalls=new Map(), consoleEntries=[];
@@ -234,26 +237,126 @@ async function loadRunList() {
   }
 }
 
+function modelTokenPrice(value) {
+  if(!['number','string'].includes(typeof value)||String(value).trim()==='')return '미제공';
+  const amount=Number(value)*1000000;
+  if(!Number.isFinite(amount))return '미제공';
+  if(amount<0)return '변동 요금';
+  if(amount>0&&amount<0.000001)return '< $0.000001';
+  return '$'+amount.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:6});
+}
+
+function renderModelPicker() {
+  const terms=$('modelSearch').value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const remote=$('providerSelect').value==='openrouter';
+  const matches=availableModels.filter(model=>{
+    const text=[model.label,model.name,model.id].filter(Boolean).join(' ').toLowerCase();
+    return terms.every(term=>text.includes(term));
+  });
+  const select=$('modelSelect');
+  select.replaceChildren(...matches.map(model=>{
+    const title=remote?`${model.label||model.id} · 입력 ${modelTokenPrice(model.pricing?.prompt)} / 출력 ${modelTokenPrice(model.pricing?.completion)} · ${model.id}`:`${model.name} · ${(Number(model.size||0)/1024**3).toFixed(1)} GiB`;
+    const option=textNode('option',title); option.value=model.name; option.title=title; return option;
+  }));
+  // A filter is only a view of the catalog; it must never change the run's model.
+  select.value=selectedModelName;
+  select.disabled=!modelReady||!matches.length;
+  select.hidden=!!terms.length&&!matches.length;
+  $('modelSearchEmpty').hidden=!terms.length||!!matches.length;
+  $('clearModelSearchButton').disabled=!$('modelSearch').value;
+  setText('modelSearchCount',`${matches.length} / ${availableModels.length}개 모델`);
+  const selected=availableModels.find(model=>model.name===selectedModelName);
+  setText('selectedModelName',selected?.label||selected?.name||'선택된 모델이 없습니다.');
+  setText('selectedModelId',selected?.id||selected?.name||'');
+  setText('selectedModelMeta',selected?.context_length?`컨텍스트 ${Number(selected.context_length).toLocaleString('ko-KR')} 토큰`:
+    selected?`로컬 모델 · ${(Number(selected.size||0)/1024**3).toFixed(1)} GiB`:'모델 목록을 확인한 뒤 선택하세요.');
+  $('modelPriceUnit').hidden=!remote;
+  $('selectedModelPricing').hidden=!remote||!selected;
+  $('localModelPriceNote').hidden=remote||!selected;
+  setText('selectedInputPrice',modelTokenPrice(selected?.pricing?.prompt));
+  setText('selectedOutputPrice',modelTokenPrice(selected?.pricing?.completion));
+}
+
+function currentModelSettingsValues() {
+  return {think:$('thinkSelect').value,temperature:$('temperatureInput').value,
+    context:$('contextInput').value,output:$('predictInput').value};
+}
+
+function rememberModelSettings() {
+  if(configuredSettingsKey)modelSettingsDrafts.set(configuredSettingsKey,currentModelSettingsValues());
+}
+
+function configureModelControls() {
+  const provider=$('providerSelect').value;
+  const info=availableModels.find(item=>item.name===selectedModelName);
+  const config=ModelSettingsConfig.describe(provider,info);
+  const key=selectedModelName||`provider:${provider}`;
+  if(key!==configuredSettingsKey){
+    rememberModelSettings();
+    const values=modelSettingsDrafts.get(key)||config.defaults;
+    $('thinkSelect').value=values.think;
+    $('temperatureInput').value=values.temperature;
+    $('contextInput').value=values.context;
+    $('predictInput').value=values.output;
+    configuredSettingsKey=key;
+  }
+  setText('advancedSettingsSummary',`고급 설정 · ${provider==='openrouter'?'OpenRouter':'Ollama'} / 실행 예산`);
+  setText('modelSettingsTitle',config.title);setText('modelSettingsHelp',config.help);
+  setText('thinkingLabel',config.thinkLabel);setText('thinkingHelp',config.thinkHelp);
+  setText('contextLabel',config.contextLabel);setText('contextHelp',config.contextHelp);
+  setText('outputLabel',config.outputLabel);setText('outputHelp',config.outputHelp);
+  setText('temperatureHelp',provider==='openrouter'?'비워 두면 API 제공자의 기본값을 사용합니다.':'출력의 다양성을 조절합니다.');
+  $('thinkingField').hidden=!config.thinkVisible;
+  $('temperatureField').hidden=!config.temperatureVisible;
+  $('thinkSelect').disabled=!config.thinkVisible||!info;
+  $('temperatureInput').disabled=!config.temperatureVisible||!info;
+  for(const [id,limit] of [['contextInput',config.contextMax],['predictInput',config.outputMax]]){
+    $(id).disabled=!info;
+    $(id).max=String(limit);
+    if(Number($(id).value)>limit)$(id).value=String(limit);
+  }
+}
+
 async function loadReadiness() {
-  const [models,lab,processor]=await Promise.allSettled([
-    jsonRequest('/api/models'),jsonRequest('/api/lab'),jsonRequest('/api/ollama/ps')]);
+  const serial=++readinessSerial, provider=$('providerSelect').value, remote=provider==='openrouter';
+  const label=remote?'OpenRouter':'Ollama';
+  const previous=selectedModelName;
+  modelReady=false; $('modelSelect').disabled=true;
+  setText('sideProviderLabel',label); setText('readinessProviderLabel',label);
+  $('sideProviderRow').hidden=!remote;
+  $('remoteModelNotice').hidden=!remote; $('processorDetails').hidden=remote;
+  if(!runId)updateStartControls();
+  // Poll Ollama independently so its timeout cannot hold up remote model selection.
+  jsonRequest('/api/ollama/ps').then(processor=>{
+    if(serial!==readinessSerial)return;
+    setText('sideOllama','연결됨'); $('sideOllama').className='ok';
+    const processorList=$('processorList'); processorList.replaceChildren();
+    const items=processor.models||[];
+    if(!items.length)processorList.append(textNode('p','현재 메모리에 로드된 모델이 없습니다.'));
+    for(const item of items)processorList.append(textNode('p',`${item.name} · ${item.processor} · GPU 메모리 ${item.size_vram == null?'알 수 없음':(item.size_vram/1024**3).toFixed(2)+' GiB'}`));
+  },error=>{
+    if(serial!==readinessSerial)return;
+    setText('sideOllama','연결 실패'); $('sideOllama').className='bad';
+    $('processorList').replaceChildren(textNode('p',`조회 실패: ${error.message}`));
+  });
+  const [models,lab]=await Promise.allSettled([
+    jsonRequest(remote?'/api/models?provider=openrouter':'/api/models'),jsonRequest('/api/lab')]);
+  if(serial!==readinessSerial)return;
   const now=new Date().toLocaleTimeString('ko-KR'); setText('sideChecked',`마지막 확인 ${now}`);
   if(models.status==='fulfilled'){
     modelReady=(models.value.models||[]).length>0;
-    const select=$('modelSelect'), previous=select.value;
-    select.replaceChildren(...(models.value.models||[]).map(model=>{
-      const option=textNode('option',`${model.name} · ${(Number(model.size||0)/1024**3).toFixed(1)} GiB`);
-      option.value=model.name; return option;
-    }));
+    availableModels=models.value.models||[];
     const names=(models.value.models||[]).map(item=>item.name);
-    select.value=[previous,models.value.default_model,names[0]].find(name=>names.includes(name)) || '';
-    select.disabled=!modelReady; setText('modelStatus',modelReady?`설치된 모델 ${names.length}개`:'설치된 모델이 없습니다.');
-    setText('ollamaReadiness',modelReady?`연결됨 · 설치된 모델 ${names.length}개`:'연결됨 · 모델 없음');
-    setText('sideOllama',modelReady?'연결됨':'모델 없음'); $('sideOllama').className=modelReady?'ok':'bad';
+    selectedModelName=[previous,models.value.default_model,names[0]].find(name=>names.includes(name)) || '';
+    renderModelPicker();
+    setText('modelStatus',modelReady?`${remote?'사용 가능한':'설치된'} 모델 ${names.length}개`:'사용 가능한 모델이 없습니다.');
+    setText('ollamaReadiness',modelReady?`연결됨 · 모델 ${names.length}개`:'연결됨 · 모델 없음');
+    setText('sideProviderStatus',modelReady?'연결됨':'모델 없음'); $('sideProviderStatus').className=modelReady?'ok':'bad';
+    configureModelControls();
   } else {
-    modelReady=false; $('modelSelect').disabled=true;
+    modelReady=false; availableModels=[]; selectedModelName=''; renderModelPicker();
     setText('modelStatus',models.reason.message); setText('ollamaReadiness',models.reason.message);
-    setText('sideOllama','연결 실패'); $('sideOllama').className='bad';
+    setText('sideProviderStatus','연결 실패'); $('sideProviderStatus').className='bad';
   }
   if(lab.status==='fulfilled'){
     labReady=!!lab.value.ready; setText('labReadiness',lab.value.message);
@@ -262,28 +365,24 @@ async function loadReadiness() {
   } else {
     labReady=false; setText('labReadiness',lab.reason.message); setText('sideLab','확인 실패'); $('sideLab').className='bad';
   }
-  const processorList=$('processorList'); processorList.replaceChildren();
-  if(processor.status==='fulfilled'){
-    const items=processor.value.models||[];
-    if(!items.length) processorList.append(textNode('p','현재 메모리에 로드된 모델이 없습니다.'));
-    for(const item of items) processorList.append(textNode('p',`${item.name} · ${item.processor} · GPU 메모리 ${item.size_vram == null?'알 수 없음':(item.size_vram/1024**3).toFixed(2)+' GiB'}`));
-  } else processorList.append(textNode('p',`조회 실패: ${processor.reason.message}`));
   if(!runId)updateStartControls();
 }
 
 async function startRun(event) {
   event.preventDefault();
   if(startPending)return;
+  if(!modelReady||!availableModels.some(model=>model.name===selectedModelName)){
+    setText('startError','실행할 모델을 선택하세요.'); return;
+  }
   if($('scenarioSelect').value!=='manual'||$('chainSelect').value!=='none'){
     setText('startError','이 모드는 준비 중입니다.'); return;
   }
   const goal=$('goalInput').value.trim();
   if(!goal){setText('startError','탐색 목표를 입력하세요.'); $('goalInput').focus(); return;}
-  const thinkValue=$('thinkSelect').value;
-  const body={target:$('targetInput').value,model:$('modelSelect').value,goal,
+  const info=availableModels.find(model=>model.name===selectedModelName);
+  const body={target:$('targetInput').value,model:selectedModelName,goal,
     scenario_source:'manual',chain_mode:'none',
-    model_settings:{think:thinkValue==='null'?null:thinkValue==='true',options:{
-      temperature:Number($('temperatureInput').value),num_ctx:Number($('contextInput').value),num_predict:Number($('predictInput').value)}},
+    model_settings:ModelSettingsConfig.encode($('providerSelect').value,info,currentModelSettingsValues()),
     budgets:{seconds:Number($('secondsInput').value),model_calls:Number($('modelCallsInput').value),
       tool_calls:Number($('toolCallsInput').value),command_seconds:Number($('commandSecondsInput').value),finalize_seconds:120}};
   startPending=true; updateStartControls(); setText('startButton','시작 요청 중');
@@ -311,6 +410,30 @@ function initMain(){
     input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();input.setSelectionRange(input.value.length,input.value.length);
   });
   for(const id of ['scenarioSelect','chainSelect'])$(id).addEventListener('change',updateStartControls);
+  $('providerSelect').addEventListener('change',()=>{
+    $('modelSearch').value=''; selectedModelName=''; availableModels=[]; modelReady=false; renderModelPicker();
+    configureModelControls();
+    loadReadiness();
+  });
+  $('modelSelect').addEventListener('change',()=>{
+    selectedModelName=$('modelSelect').value;
+    configureModelControls(); renderModelPicker(); updateStartControls();
+  });
+  for(const id of ['thinkSelect','temperatureInput','contextInput','predictInput'])$(id).addEventListener('input',rememberModelSettings);
+  $('modelSearch').addEventListener('input',renderModelPicker);
+  const clearSearch=()=>{$('modelSearch').value='';renderModelPicker();$('modelSearch').focus();};
+  $('clearModelSearchButton').addEventListener('click',clearSearch);
+  $('modelSearch').addEventListener('keydown',event=>{
+    if(event.key==='Escape'){event.preventDefault();clearSearch();}
+    if(event.key==='Enter'){
+      event.preventDefault();
+      const select=$('modelSelect');
+      if(!select.disabled&&select.options.length){select.selectedIndex=0;select.dispatchEvent(new Event('change'));select.focus();}
+    }
+  });
+  $('modelSelect').addEventListener('keydown',event=>{
+    if(event.key==='Enter'){event.preventDefault();$('goalInput').focus();}
+  });
   $('refreshModelsButton').addEventListener('click',loadReadiness);
   $('refreshReadinessButton').addEventListener('click',loadReadiness);
   $('labStartButton').addEventListener('click',async()=>{
@@ -330,6 +453,8 @@ function showTab(name){
 
 function renderRunHeader(state){
   currentRun=state; setText('runGoal',state.goal||'목표 기록 없음'); setText('runModel',state.model||'—'); setText('runId',runId);
+  const provider=state.model?.startsWith('openrouter:')?'openrouter':'ollama';
+  if($('providerSelect').value!==provider){$('providerSelect').value=provider;loadReadiness();}
   const seconds=Math.max(0,Math.floor((state.finished_at||Date.now()/1000)-(state.started_at||Date.now()/1000)));
   setText('runElapsed',`${Math.floor(seconds/60)}분 ${seconds%60}초`);
   const phase=statusText(state.phase), result=state.run_result?statusText(state.run_result):'탐색 중';
