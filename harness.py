@@ -15,6 +15,7 @@ from session_log import SessionLog
 
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
+_NUM_PREDICT_MAX = 65536   # mirrors the num_predict field ceiling in model_settings
 
 
 class ModelFailure(RuntimeError):
@@ -59,14 +60,20 @@ class Harness:
         self.stop_requested = stop_requested or (lambda: False)
         self.calls = 0
         self.last_prompt_tokens = None   # prompt_eval_count of the most recent model call (real num_ctx usage)
+        self.output_num_predict_floor = None   # raised, persisted output budget after a length-truncation
 
     def decide(self, run_id: str, context: dict, *, model: str, settings: dict,
                deadline: float | None = None) -> Command:
         if run_id != self.run_id:
             raise ValueError("Harness belongs to another run")
         selected = validate_model_settings(settings)
+        options = dict(selected["options"])
+        # Persist a raised output budget across steps: once a length-truncation forced num_predict up,
+        # keep at least that floor so later steps do not truncate at the original cap again.
+        if self.output_num_predict_floor is not None and options.get("num_predict", -1) != -1:
+            options["num_predict"] = max(int(options.get("num_predict", 0)), self.output_num_predict_floor)
         payload = {"model": model, "stream": True, "format": COMMAND_SCHEMA,
-                   "options": selected["options"],
+                   "options": options,
                    "messages": [{"role": "system", "content": SYSTEM_PROMPT},
                                 {"role": "user", "content": json.dumps(context, ensure_ascii=False)}]}
         if selected["think"] is not None:
@@ -117,7 +124,7 @@ class Harness:
                 if completion.get("prompt_eval_count") is not None:
                     self.last_prompt_tokens = completion["prompt_eval_count"]
                 if completion.get("done_reason") == "length":
-                    limit = selected["options"].get("num_predict", "model default")
+                    limit = payload["options"].get("num_predict", "model default")
                     raise ModelFailure("output_limit", f"Model reached the output limit (num_predict={limit}, "
                                        f"eval_count={completion.get('eval_count', 'unknown')}, done_reason=length); "
                                        "the response was not executed", call_id)
@@ -157,14 +164,31 @@ class Harness:
                 # Keep the failed answer available for correction without allowing a large
                 # response to consume the entire context. The full raw response is logged.
                 previous = raw if len(raw) <= 6000 else raw[:4000] + "\n[response middle omitted]\n" + raw[-2000:]
-                payload = {**payload, "messages": [*payload["messages"],
+                retry_options = dict(payload["options"])
+                if exc.kind == "output_limit":
+                    # Reasoning models can spend the whole output budget thinking and never emit the
+                    # command; re-sending the same cap just truncates again. Raise num_predict and keep
+                    # the higher floor for the rest of the run so later steps have room too.
+                    current = int(retry_options.get("num_predict", 0))
+                    if current != -1 and current < _NUM_PREDICT_MAX:
+                        raised = min(max(current, 1) * 2, _NUM_PREDICT_MAX)
+                        retry_options["num_predict"] = raised
+                        self.output_num_predict_floor = raised
+                        self.log.append("output_budget_raised", {"call_id": call_id,
+                                        "from_num_predict": current, "to_num_predict": raised})
+                    feedback = ("The previous response hit the output limit while thinking and never produced "
+                                "the command. You now have a larger output budget (num_predict="
+                                f"{retry_options.get('num_predict')}). Think briefly, then output one complete JSON Command.")
+                else:
+                    feedback = ("The previous response was invalid: " + str(exc)[:220]
+                                + ". Return one short, complete JSON Command. Use only the payload for its action: "
+                                  "run_python uses code; run_command uses command; write_file uses path/content; "
+                                  "read_file uses path. Every action including finish requires nonempty plan and reason. "
+                                  "Unused path/content/command/code fields must be empty strings. "
+                                  "Produce one small step with concise code, without explanatory comments.")
+                payload = {**payload, "options": retry_options, "messages": [*payload["messages"],
                     {"role": "assistant", "content": previous},
-                    {"role": "user", "content": "The previous response was invalid: " + str(exc)[:220]
-                     + ". Return one short, complete JSON Command. Use only the payload for its action: "
-                       "run_python uses code; run_command uses command; write_file uses path/content; "
-                       "read_file uses path. Every action including finish requires nonempty plan and reason. "
-                       "Unused path/content/command/code fields must be empty strings. "
-                       "Produce one small step with concise code, without explanatory comments, within the same output limit."}]}
+                    {"role": "user", "content": feedback}]}
             except (OpenRouterError, httpx.HTTPError, OSError, TimeoutError, json.JSONDecodeError) as exc:
                 failure = ModelFailure("transport", str(exc)[:300], call_id)
                 self.log.append("model_error", {"call_id": call_id, "error_kind": failure.kind,

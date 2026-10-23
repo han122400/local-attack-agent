@@ -309,6 +309,9 @@ function configureModelControls() {
   $('thinkingField').hidden=!config.thinkVisible;
   $('temperatureField').hidden=!config.temperatureVisible;
   $('thinkSelect').disabled=!config.thinkVisible||!info;
+  // Reasoning-effort levels (low/medium/high) only apply to models that support them; hide them otherwise.
+  for(const option of $('thinkSelect').querySelectorAll('option[data-effort]'))option.hidden=!config.thinkEffort;
+  if($('thinkSelect').selectedOptions[0]&&$('thinkSelect').selectedOptions[0].hidden)$('thinkSelect').value='null';
   $('temperatureInput').disabled=!config.temperatureVisible||!info;
   for(const [id,limit] of [['contextInput',config.contextMax],['predictInput',config.outputMax]]){
     $(id).disabled=!info;
