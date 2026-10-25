@@ -4,7 +4,7 @@ const runId = runMatch ? runMatch[1] : null;
 const historyMode = !runId && new URLSearchParams(location.search).get('view') === 'history';
 const validRunId = value => /^[0-9a-f]{32}$/.test(String(value || ''));
 const dateText = value => value ? new Date(value * 1000).toLocaleString('ko-KR') : '—';
-const statusText = value => ({preparing:'준비 중',running:'탐색 중',stopping:'중단 중',finalizing:'정리 중',resetting:'환경 초기화 중',finished:'종료',recovery_required:'복구 필요',completed:'완료',stopped:'중단됨',timed_out:'시간 초과',error:'오류',succeeded:'완료',pending:'대기',failed:'실패',preserved:'보존됨',finalized:'확정됨',collecting:'수집 중'})[value] || value || '확인 중';
+const statusText = value => ({preparing:'준비 중',running:'탐색 중',stopping:'중단 중',finalizing:'정리 중',resetting:'환경 초기화 중',finished:'종료',recovery_required:'복구 필요',completed:'관찰 수집 완료',inconclusive:'증거 부족 · 판단 보류',stopped:'중단됨',timed_out:'시간 초과',error:'오류',succeeded:'완료',pending:'대기',failed:'실패',preserved:'보존됨',finalized:'확정됨',collecting:'수집 중'})[value] || value || '확인 중';
 const textNode = (tag, value, className='') => { const item=document.createElement(tag); item.textContent=String(value ?? ''); if(className)item.className=className; return item; };
 const setText = (id, value) => { $(id).textContent=String(value ?? ''); };
 async function jsonRequest(url, options) {

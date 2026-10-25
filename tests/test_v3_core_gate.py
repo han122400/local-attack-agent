@@ -57,7 +57,7 @@ class CoreGateTests(unittest.TestCase):
             explorer.worker.join(20)
             self.assertFalse(explorer.worker.is_alive())
             state = explorer.get_run(run_id)
-            self.assertEqual(state["run_result"], "completed")
+            self.assertEqual(state["run_result"], "inconclusive")
             self.assertEqual(state["phase"], "finished")
             self.assertIn("NameError", json.dumps(observations[1]))
             self.assertIn("repair worked", json.dumps(observations[2]))

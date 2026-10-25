@@ -456,7 +456,7 @@ from explorer import ExplorerV3  # noqa: E402 - v1 helpers above remain for unre
 from lab import get_status as get_lab_status, start_lab
 from model_settings import settings_schema, validate_model_settings, model_presets
 from model_providers import get_openrouter_models, is_openrouter, openrouter_model
-from session_log import LogFailure, safe_relative_path, validate_run_id
+from session_log import LogFailure, safe_relative_path, validate_run_id, open_beneath
 
 
 EXPLORER = ExplorerV3()
@@ -772,25 +772,27 @@ def run_files(run_id: str, source: str = "runtime") -> JSONResponse:
                              "reason": "runtime_deleted" if source == "runtime" else "artifacts_unavailable",
                              "files": []}, headers={"Cache-Control": "no-store"})
     entries = []
-    stack = [root]
+    stack = [None]
     while stack and len(entries) < 2000:
         folder = stack.pop()
-        with os.scandir(folder) as children:
-            for child in sorted(children, key=lambda item: item.name.lower()):
-                if len(entries) >= 2000:
-                    break
-                path = Path(child.path)
-                relative = path.relative_to(root).as_posix()
-                if child.is_symlink():
-                    entries.append({"path": relative, "kind": "link", "size": 0, "modified_at": None})
-                    continue
-                stat = child.stat(follow_symlinks=False)
-                directory = child.is_dir(follow_symlinks=False)
-                entries.append({"path": relative, "kind": "directory" if directory else "file",
-                                "size": stat.st_size if not directory else 0,
-                                "modified_at": stat.st_mtime})
-                if directory:
-                    stack.append(path)
+        try:
+            with open_beneath(root, folder, os.O_RDONLY | os.O_DIRECTORY) as descriptor, os.scandir(descriptor) as children:
+                for child in sorted(children, key=lambda item: item.name.lower()):
+                    if len(entries) >= 2000:
+                        break
+                    relative = ((Path(folder) if folder else Path()) / child.name).as_posix()
+                    if child.is_symlink():
+                        entries.append({"path": relative, "kind": "link", "size": 0, "modified_at": None})
+                        continue
+                    stat = child.stat(follow_symlinks=False)
+                    directory = child.is_dir(follow_symlinks=False)
+                    entries.append({"path": relative, "kind": "directory" if directory else "file",
+                                    "size": stat.st_size if not directory else 0,
+                                    "modified_at": stat.st_mtime})
+                    if directory:
+                        stack.append(relative)
+        except OSError:
+            continue
     return JSONResponse({"run_id": run_id, "source": source, "available": True,
                          "files": entries, "truncated": bool(stack)}, headers={"Cache-Control": "no-store"})
 
@@ -810,9 +812,12 @@ def run_file(run_id: str, source: str, path: str) -> JSONResponse:
         raise HTTPException(status_code=403, detail="파일 경계를 벗어났습니다.")
     if not candidate.is_file():
         raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
-    stat = candidate.stat()
-    with candidate.open("rb") as stream:
-        body = stream.read(131073)
+    try:
+        with open_beneath(root, relative.as_posix()) as descriptor, os.fdopen(descriptor, 'rb', closefd=False) as stream:
+            stat = os.fstat(descriptor)
+            body = stream.read(131073)
+    except OSError as exc:
+        raise HTTPException(status_code=403, detail="파일 경계가 변경되었습니다.") from exc
     binary = b"\x00" in body
     try:
         content = None if binary else codecs.getincrementaldecoder("utf-8")("strict").decode(body[:131072], final=False)

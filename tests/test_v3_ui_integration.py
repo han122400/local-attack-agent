@@ -54,7 +54,7 @@ class BrowserUiScenarios(unittest.TestCase):
                     response = answer("write_file", path="work/live.txt", content="second version is longer")
                 elif count == 2:
                     cls.release_file_delete.wait(15)
-                    response = answer("run_command", command="del /Q work\\live.txt")
+                    response = answer("run_command", command="rm -f work/live.txt")
                 else:
                     cls.release_file_finish.wait(15)
                     response = answer("finish", reason="file lifecycle observed")
@@ -63,7 +63,7 @@ class BrowserUiScenarios(unittest.TestCase):
             elif count == 1:
                 if goal == "UI start": cls.release_start.wait(15)
                 if goal == "UI B": cls.release_b.wait(15)
-                command = "for /L %i in (1,1,300) do @echo LINE-%i" if goal == "UI D" else "type work\\note.txt"
+                command = "seq 1 300" if goal == "UI D" else "cat work/note.txt"
                 response = answer("run_command", command=command)
             elif count == 2 and goal == "UI D":
                 cls.release_more.wait(15)
@@ -389,7 +389,7 @@ class BrowserUiScenarios(unittest.TestCase):
         self.assertIn("EXEC-0002", page.locator("#executionText").inner_text())
         self.assertIn("CALL-0002", page.locator("#executionText").inner_text())
         page.locator("#openCodeButton").click()
-        page.locator("#filePreview", has_text="type work").wait_for()
+        page.locator("#filePreview", has_text="cat work").wait_for()
         page.locator("#evidenceTab").click()
         page.locator("#evidenceFiles .file-item", has_text="note-").click()
         page.locator("#evidencePreview", has_text="<img").wait_for()

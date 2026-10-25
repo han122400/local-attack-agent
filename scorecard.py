@@ -5,8 +5,8 @@ compaction counts). It never touches the lab, browser, Ollama, or the controller
 safe to run while an experiment is in progress — an in-flight run with a partial/locked session.json
 is simply skipped.
 
-The composite score is a convenience for A/B comparison; the raw columns are the real signal. Weights
-live in SCORE_WEIGHTS and are meant to be tuned.
+The composite score measures HTTP observation collection, not vulnerability detection accuracy.
+Legacy stdout-only flags never count as verified HTTP evidence. Weights live in SCORE_WEIGHTS.
 
 Usage (from the project folder):
     python scorecard.py                     # table of every finished run, newest last
@@ -22,6 +22,7 @@ import json
 import statistics
 import sys
 from pathlib import Path
+from http_evidence import http_observations
 
 RUNS_ROOT = Path(__file__).resolve().parent / "runs"
 
@@ -64,23 +65,24 @@ def score_run(session: dict, run_dir: Path) -> dict:
     """Metrics for one run from its session dict. Pure; tolerant of missing/older fields."""
     findings = session.get("findings") or []
     steps = len(findings)
-    # Runs from before the evidence flag landed have no "evidence" key at all; their evidence/
-    # inconclusive split is not trustworthy, so mark them and keep them out of quality headlines.
-    instrumented = any("evidence" in f for f in findings)
-    evidence = sum(1 for f in findings if f.get("evidence"))
-    inconclusive = sum(1 for f in findings if f.get("status") == "ok" and not f.get("evidence"))
+    # Only controller-captured request/response records participate in HTTP observation scoring.
+    instrumented = any("http_evidence" in f for f in findings)
+    evidence = sum(1 for f in findings if http_observations(f))
+    inconclusive = sum(1 for f in findings if f.get("status") == "ok" and not http_observations(f))
     failed = sum(1 for f in findings if f.get("status") in ("error", "timeout"))
     repeats = sum(1 for f in findings if f.get("repeat_of"))
     # Coverage proxy: distinct evidence-bearing observations (dwelling on one page does not add here).
-    unique_obs = len({f.get("observed") for f in findings if f.get("evidence")})
+    unique_obs = len({(r['url'], r['status'], r.get('body_sha256')) for f in findings for r in http_observations(f)})
     result = session.get("run_result")
-    clean_finish = result == "completed"
+    clean_finish = result == "completed" and evidence > 0
 
     evidence_rate = evidence / steps if steps else 0.0
     non_waste_rate = 1.0 - ((repeats + inconclusive + failed) / steps) if steps else 0.0
     score = (SCORE_WEIGHTS["evidence_rate"] * evidence_rate
              + SCORE_WEIGHTS["non_waste_rate"] * max(0.0, non_waste_rate)
              + SCORE_WEIGHTS["clean_finish"] * (1.0 if clean_finish else 0.0))
+    if not evidence:
+        score = 0.0
 
     started, finished = session.get("started_at"), session.get("finished_at")
     duration = round(finished - started) if isinstance(started, (int, float)) and isinstance(finished, (int, float)) else None

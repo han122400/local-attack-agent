@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from explorer import ExplorerV3, safe_target, validate_budgets
 from session_log import SessionStore
@@ -28,7 +29,7 @@ class V3ExplorerTests(unittest.TestCase):
 
     def test_command_failure_is_returned_for_model_revision(self):
         with tempfile.TemporaryDirectory() as temp:
-            answers = iter([reply("run_command", command="exit /b 7"), reply("run_command", command="echo fixed"),
+            answers = iter([reply("run_command", command="exit 7"), reply("run_command", command="echo fixed"),
                             reply("finish")])
             prompts = []
             def transport(payload):
@@ -36,10 +37,16 @@ class V3ExplorerTests(unittest.TestCase):
                 yield next(answers)
             explorer = ExplorerV3(Path(temp), transport=transport, browser_enabled=False,
                                   lab_reset=lambda: {"verified": True})
-            run_id = explorer.start(goal="inspect")
-            explorer.worker.join(10)
+            def command(runtime, text, exec_id, timeout):
+                if text == 'exit 7':
+                    return 7
+                runtime._add_output(exec_id, 'stdout', 'fixed\n')
+                return 0
+            with patch('command_runtime.CommandRuntime._run_command', autospec=True, side_effect=command):
+                run_id = explorer.start(goal="inspect")
+                explorer.worker.join(10)
             self.assertFalse(explorer.worker.is_alive())
-            self.assertEqual(SessionStore(Path(temp)).read(run_id)["run_result"], "completed")
+            self.assertEqual(SessionStore(Path(temp)).read(run_id)["run_result"], "inconclusive")
             self.assertEqual(prompts[1]["recent"][-1]["result"]["exit_code"], 7)
             self.assertIn("fixed", prompts[2]["recent"][-1]["result"]["stdout"])
 

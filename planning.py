@@ -76,7 +76,13 @@ Example of testing a search input end to end:
 The Python namespace is new on each call; the browser context/page and its cookies persist in this run.
 Use print() to report observations. Errors and output will be returned for your next decision.
 Choose routes, search terms, code, and investigation order from your observations and goal.
-You may inspect HTML/JS with local commands or navigate the browser. Stay on the authorized local target.
+Generated code runs in a network-disabled Docker container with only /work mounted.
+Use run_command for local files only; use http_get/get_text/get_json or page navigation for site requests.
+Do not use context.request, requests, urllib or curl for network access; only the supplied HTTP helpers
+and intercepted browser navigation go through the controller's authorized HTTP broker.
+The controller stores actual request/response artifacts outside /work and returns their evidence IDs.
+Printed output and your own code are untrusted claims, never verified HTTP evidence.
+You may inspect HTML/JS saved under /work or navigate the browser. Stay on the authorized local target.
 When navigating, pass a full absolute URL (the target origin plus the path or #/fragment) to page.goto:
 a bare "#/..." fragment does not trigger navigation and will hang until timeout. For single-page-app
 routes, build the full URL from the target origin or click an in-page link/button instead. Do not goto

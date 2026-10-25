@@ -9,6 +9,7 @@ from dataclasses import replace
 import httpx2 as httpx
 
 from model_settings import validate_model_settings
+from context_limits import compact_context, context_char_budget
 from model_providers import OpenRouterError, is_openrouter, openrouter_stream, strip_tool_call_framing
 from planning import COMMAND_SCHEMA, SYSTEM_PROMPT, Command, normalize_command_inputs, validate_command
 from session_log import SessionLog
@@ -65,6 +66,11 @@ class Harness:
         if run_id != self.run_id:
             raise ValueError("Harness belongs to another run")
         selected = validate_model_settings(settings)
+        try:
+            input_budget = context_char_budget(selected["options"].get("num_ctx", 8192))
+            context = compact_context(context, input_budget)
+        except ValueError as exc:
+            raise ModelFailure("context", str(exc)) from exc
         payload = {"model": model, "stream": True, "format": COMMAND_SCHEMA,
                    "options": selected["options"],
                    "messages": [{"role": "system", "content": SYSTEM_PROMPT},
@@ -156,15 +162,21 @@ class Harness:
                     raise
                 # Keep the failed answer available for correction without allowing a large
                 # response to consume the entire context. The full raw response is logged.
-                previous = raw if len(raw) <= 6000 else raw[:4000] + "\n[response middle omitted]\n" + raw[-2000:]
-                payload = {**payload, "messages": [*payload["messages"],
+                previous = raw[:400] + ("\n[truncated invalid output]" if len(raw) > 400 else "")
+                feedback = [
                     {"role": "assistant", "content": previous},
                     {"role": "user", "content": "The previous response was invalid: " + str(exc)[:220]
                      + ". Return one short, complete JSON Command. Use only the payload for its action: "
                        "run_python uses code; run_command uses command; write_file uses path/content; "
                        "read_file uses path. Every action including finish requires nonempty plan and reason. "
                        "Unused path/content/command/code fields must be empty strings. "
-                       "Produce one small step with concise code, without explanatory comments, within the same output limit."}]}
+                       "Produce one small step with concise code, without explanatory comments, within the same output limit."}]
+                try:
+                    retry_context = compact_context(context, input_budget - sum(len(m["content"]) for m in feedback))
+                except ValueError as error:
+                    raise ModelFailure("context", str(error), call_id) from error
+                payload = {**payload, "messages": [payload["messages"][0],
+                    {"role": "user", "content": json.dumps(retry_context, ensure_ascii=False)}, *feedback]}
             except (OpenRouterError, httpx.HTTPError, OSError, TimeoutError, json.JSONDecodeError) as exc:
                 failure = ModelFailure("transport", str(exc)[:300], call_id)
                 self.log.append("model_error", {"call_id": call_id, "error_kind": failure.kind,

@@ -13,6 +13,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from command_runtime import CommandRuntime
+from context_limits import compact_context, context_char_budget
+from http_evidence import http_observations
 from harness import Harness, ModelFailure
 from lab import reset_lab
 from model_settings import default_model_settings, validate_model_settings
@@ -25,19 +27,6 @@ MODEL = "qwen3.5:2b"
 RUNS_ROOT = Path(__file__).resolve().parent / "runs"
 DEFAULT_BUDGETS = {"seconds": 1200, "model_calls": 40, "tool_calls": 80,
                    "command_seconds": 30, "finalize_seconds": 120}
-
-# The full prompt (system + context) must fit num_ctx with room left for the model's output. We budget the
-# CONTEXT (the user message) in chars — a token proxy, since tokens are only known after a call — after
-# subtracting the system prompt and reserving ~35% of num_ctx for output. When the context exceeds this
-# budget the oldest structured history is dropped and a context_compacted event is emitted.
-_CHARS_PER_TOKEN = 3.3        # rough for mixed Korean/English/code
-_PROMPT_FRACTION = 0.65       # share of num_ctx used for the prompt (rest reserved for output)
-
-
-def context_char_budget(num_ctx: int) -> int:
-    total_prompt_chars = int(max(1024, num_ctx) * _CHARS_PER_TOKEN * _PROMPT_FRACTION)
-    return max(2000, total_prompt_chars - len(SYSTEM_PROMPT))
-
 
 def _digest(text: str, limit: int = 240) -> str:
     """Head+tail digest so a long output keeps its start AND end, not only the trailing noise."""
@@ -52,17 +41,19 @@ def compose_report(findings: list[dict], run_result: str, model_reason: str) -> 
     """Deterministic report built from the preserved findings, so every run ends with an actual result
     (confirmed observations / inconclusive / failures) even when the model never produced a finish summary."""
     findings = findings or []
-    evidence = [f for f in findings if f.get("evidence")]
-    inconclusive = [f for f in findings if f.get("status") == "ok" and not f.get("evidence")]
+    evidence = [f for f in findings if http_observations(f)]
+    inconclusive = [f for f in findings if f.get("status") == "ok" and not http_observations(f)]
     failed = [f for f in findings if f.get("status") in ("error", "timeout")]
     lines = [f"결과: {run_result} · 스텝 {len(findings)}개 "
              f"(증거 {len(evidence)} · 미확정 {len(inconclusive)} · 실패 {len(failed)})"]
     if model_reason:
-        lines.append(f"모델 종료 요약: {model_reason}")
+        lines.append(f"모델 종료 요약(미검증 주장): {model_reason}")
     if evidence:
         lines.append("확인된 관찰:")
         for f in evidence[:12]:
-            lines.append(f"  - [{f['step']}] {f.get('plan', '')} → {str(f.get('observed', ''))[:140]}")
+            for response in http_observations(f)[:3]:
+                lines.append(f"  - [{response['id']}] {response['method']} {response['url']} → HTTP {response['status']} "
+                             f"({response['bytes']} bytes, artifact={response['response_artifact']['path']})")
     else:
         lines.append("확인된(증거 있는) 관찰 없음.")
     if inconclusive:
@@ -71,6 +62,7 @@ def compose_report(findings: list[dict], run_result: str, model_reason: str) -> 
     if failed:
         steps = ", ".join(str(f["step"]) for f in failed[:8])
         lines.append(f"실패/타임아웃: {len(failed)}건 (스텝 {steps}).")
+    lines.append("HTTP 응답 수집은 취약점 확정을 의미하지 않습니다. 취약점 판정은 별도 검증이 필요합니다.")
     return "\n".join(lines)
 
 
@@ -259,7 +251,7 @@ class ExplorerV3:
 
             def build_context(window: int) -> dict:
                 ctx = {"goal": metadata["goal"], "target": metadata["target"],
-                       "runtime_path": str(runtime.runtime_dir), "python": runtime.python,
+                       "runtime_path": "/work", "python": "python",
                        "browser_api": "run_python has page/context/browser and helpers get_text/get_json/"
                                       "http_get/goto_and_render/list_inputs/submit_input; top-level await.",
                        # history = structured memory of all prior steps (avoid forgetting/repeating);
@@ -271,23 +263,7 @@ class ExplorerV3:
                                      "avg_call_seconds": round(avg_call, 1), "finish_soon": finish_soon}}
                 return ctx
 
-            # Compaction: keep the assembled context under a char budget (token proxy) by dropping the
-            # oldest structured history first; emit an event and expose usage so the UI can show it.
-            window = min(len(history), 30)
-            context = build_context(window)
-            context_chars = len(json.dumps(context, ensure_ascii=False))
-            while context_chars > budget and window > 1:
-                window -= 1
-                context = build_context(window)
-                context_chars = len(json.dumps(context, ensure_ascii=False))
-            dropped = min(len(history), 30) - window
-            if dropped > 0:
-                log.append("context_compacted", {"dropped": dropped, "kept_steps": window, "chars": context_chars})
-            # Expose both the char budget (pre-call proxy) and the real token usage of the last call.
-            usage = {"context_chars": context_chars, "context_budget": budget,
-                     "prompt_tokens": harness.last_prompt_tokens, "num_ctx": num_ctx}
-            self._recent_state.update(**usage)
-            log.update(**usage)
+            context = build_context(min(len(history), 30))
             if history and history[-1].get("repeat_of"):
                 context["note"] = ("Your last step repeated an earlier observation with no new evidence. "
                                    "Try a different route, feature, or approach — do not repeat it.")
@@ -295,6 +271,16 @@ class ExplorerV3:
                 context["instruction"] = ("Time is almost up. Call finish now with the actual result: the "
                                           "confirmed facts (each with its evidence), the failures, and what "
                                           "remains unverified, from history and recent. No new exploration.")
+            before = len(json.dumps(context, ensure_ascii=False))
+            context = compact_context(context, budget)
+            context_chars = len(json.dumps(context, ensure_ascii=False))
+            if context_chars < before:
+                log.append("context_compacted", {"before_chars": before, "chars": context_chars,
+                                                 "kept_steps": len(context.get("history", []))})
+            usage = {"context_chars": context_chars, "context_budget": budget,
+                     "prompt_tokens": harness.last_prompt_tokens, "num_ctx": num_ctx}
+            self._recent_state.update(**usage)
+            log.update(**usage)
             started = time.monotonic()
             command = harness.decide(run_id, context, model=metadata["model"],
                                      settings=metadata["model_settings"], deadline=deadline)
@@ -304,7 +290,7 @@ class ExplorerV3:
                 log.append("run_finished_by_model", {"call_id": command.call_id, "reason": command.reason,
                                                      "plan": command.plan})
                 log.update(findings=history)
-                return "completed", command.reason
+                return ("completed" if any(http_observations(f) for f in history) else "inconclusive"), command.reason
             execution = runtime.run(run_id, command.runtime_payload(), call_id=command.call_id,
                                     timeout=budgets["command_seconds"])
             record = asdict(execution)
@@ -313,7 +299,7 @@ class ExplorerV3:
             record["exception"] = record["exception"][-800:]
             recent.append({"call_id": command.call_id, "plan": command.plan, "reason": command.reason,
                            "command": {"action": command.action, "path": command.path,
-                                       "command": command.command, "code": command.code[-800:]},
+                                       "command": _digest(command.command, 800), "code": _digest(command.code, 800)},
                            "result": record})
             # Structured memory: keep the model's claim (plan/reason) separate from the actual observation,
             # and code-success (status) separate from investigation-success (evidence present).
@@ -326,10 +312,13 @@ class ExplorerV3:
             repeat_of = seen.get(observed) if observed else None
             if observed and repeat_of is None:
                 seen[observed] = tool_index + 1
-            entry = {"step": tool_index + 1, "action": command.action, "plan": command.plan[:140],
+            entry = {"step": tool_index + 1, "exec_id": execution.exec_id,
+                     "action": command.action, "plan": command.plan[:140],
                      "claim": command.reason[:200], "status": status,
                      "observed": observed or "(no evidence)", "error": error,
-                     "evidence": bool(observed) and status == "ok"}
+                     "http_evidence": execution.http_evidence}
+            entry["evidence"] = bool(http_observations(entry))
+            entry["evidence_ids"] = [item["id"] for item in http_observations(entry)]
             if repeat_of is not None:
                 entry["repeat_of"] = repeat_of
             history.append(entry)
@@ -360,10 +349,11 @@ class ExplorerV3:
         try:
             log.update(run_result=run_result, finish_reason=reason, phase="finalizing")
             log.append("finalize_started", {"run_result": run_result, "reason": reason})
-            if log.metadata.get("cleanup_status") != "succeeded" or runtime.inspect(run_id)["runtime_exists"] or runtime.inspect(run_id)["managed_processes"]:
+            if (log.metadata.get("cleanup_status") != "succeeded" or runtime.inspect(run_id)["runtime_exists"]
+                    or runtime.inspect(run_id)["managed_processes"] or runtime.inspect(run_id)["sandbox_containers"]):
                 log.update(cleanup_status="running")
                 runtime.stop(run_id, remaining(20))
-                if runtime.inspect(run_id)["managed_processes"]:
+                if runtime.inspect(run_id)["managed_processes"] or runtime.inspect(run_id)["sandbox_containers"]:
                     raise RuntimeError("Managed processes remain after stop")
                 log.append("cleanup_step", {"step": "stop", "status": "succeeded"})
                 if log.metadata.get("log_status") not in {"preserved", "finalized"}:
@@ -407,7 +397,8 @@ class ExplorerV3:
             try:
                 failed = {"phase": "recovery_required", "finish_reason": reason,
                           "cleanup_error": str(exc)[:500]}
-                if runtime.inspect(run_id)["runtime_exists"] or runtime.inspect(run_id)["managed_processes"]:
+                if (runtime.inspect(run_id)["runtime_exists"] or runtime.inspect(run_id)["managed_processes"]
+                        or runtime.inspect(run_id)["sandbox_containers"]):
                     failed["cleanup_status"] = "failed"
                 elif log.metadata.get("cleanup_status") != "succeeded":
                     failed["cleanup_status"] = "failed"

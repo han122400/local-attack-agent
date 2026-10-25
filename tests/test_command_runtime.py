@@ -3,6 +3,7 @@ import unittest
 import sys
 import time
 import os
+import json
 from unittest.mock import patch
 from pathlib import Path
 
@@ -32,9 +33,9 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(written.exit_code, 0)
         read = self.runtime.run(RUN_ID, {"action": "read_file", "path": "work/note.txt"}, call_id="CALL-2")
         self.assertEqual(read.stdout, "hello")
-        command = self.runtime.run(RUN_ID, {"action": "run_command", "command": "cd"}, call_id="CALL-3")
+        command = self.runtime.run(RUN_ID, {"action": "run_command", "command": "pwd"}, call_id="CALL-3")
         self.assertEqual(command.exit_code, 0)
-        self.assertIn(str(self.runtime.runtime_dir), command.stdout.strip())
+        self.assertEqual(command.stdout.strip(), '/work')
         events = self.log.read_events()
         self.assertTrue(any(event.get("exec_id") == command.exec_id and event.get("call_id") == "CALL-3" for event in events))
         self.assertTrue(command.artifact_path.startswith("artifacts/"))
@@ -55,8 +56,29 @@ class RuntimeTests(unittest.TestCase):
         result = self.runtime.run(RUN_ID, {"action": "read_file", "path": "work/link.txt"})
         self.assertNotEqual(result.exit_code, 0)
 
+    def test_real_container_cannot_access_host_files_credentials_or_network(self):
+        canary = self.root / 'host-only.txt'
+        canary.write_text('test-only canary')
+        code = ("import os,pathlib,socket,json\n"
+                "result={}\n"
+                f"try: pathlib.Path({str(canary)!r}).read_text(); result['host_read']=True\n"
+                "except OSError: result['host_read']=False\n"
+                "try: pathlib.Path('/outside.txt').write_text('x'); result['root_write']=True\n"
+                "except OSError: result['root_write']=False\n"
+                "try: socket.create_connection(('198.51.100.1',80),timeout=0.2); result['network']=True\n"
+                "except OSError: result['network']=False\n"
+                "result['credential']='OPENROUTER_API_KEY' in os.environ\n"
+                "print(json.dumps(result))\n")
+        self.runtime.run(RUN_ID, {'action': 'write_file', 'path': 'tools/isolation.py', 'content': code})
+        with patch.dict(os.environ, {'OPENROUTER_API_KEY': 'test-only-not-forwarded'}):
+            result = self.runtime.run(RUN_ID, {'action': 'run_command', 'command': 'python tools/isolation.py'}, timeout=10)
+        self.assertEqual(result.exit_code, 0, result.exception or result.stderr)
+        self.assertEqual(json.loads(result.stdout), dict(host_read=False, root_write=False, network=False, credential=False))
+        self.assertEqual(result.http_evidence, [])
+        self.assertEqual(self.runtime.inspect(RUN_ID)['sandbox_containers'], [])
+
     def test_timeout_stops_command_and_children(self):
-        result = self.runtime.run(RUN_ID, {"action": "run_command", "command": "ping -n 10 127.0.0.1 > NUL"}, timeout=0.2)
+        result = self.runtime.run(RUN_ID, {"action": "run_command", "command": "sleep 10"}, timeout=0.2)
         self.assertTrue(result.timed_out)
         self.assertEqual(result.cause_code, "execution_timeout")
         self.assertFalse(self.runtime.inspect(RUN_ID)["managed_processes"])
@@ -74,23 +96,18 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(events[stopped.exec_id]["outcome"], "cancelled")
         self.assertFalse(events[stopped.exec_id]["retryable"])
 
-    def test_stop_terminates_child_after_cmd_parent_exits(self):
+    def test_container_exit_cleans_up_its_background_child(self):
         source = ("import pathlib,subprocess,sys\n"
                   "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'], "
                   "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
                   "pathlib.Path('work/child.pid').write_text(str(p.pid))\n")
         self.runtime.run(RUN_ID, {"action": "write_file", "path": "work/spawn.py", "content": source})
         result = self.runtime.run(RUN_ID, {"action": "run_command",
-                                           "command": f'{sys.executable} work\\spawn.py'})
+                                           "command": 'python work/spawn.py'})
         self.assertEqual(result.exit_code, 0, result.stderr)
-        child_pid = int((self.runtime.runtime_dir / "work" / "child.pid").read_text())
-        self.assertTrue(psutil.pid_exists(child_pid))
+        self.assertTrue((self.runtime.runtime_dir / 'work/child.pid').is_file())
         self.runtime.stop(RUN_ID, 5)
-        for _ in range(20):
-            if not psutil.pid_exists(child_pid):
-                break
-            time.sleep(0.1)
-        self.assertFalse(psutil.pid_exists(child_pid))
+        self.assertEqual(self.runtime.inspect(RUN_ID)['sandbox_containers'], [])
         self.assertFalse(self.runtime.inspect(RUN_ID)["managed_processes"])
 
     def test_reused_pid_identity_is_not_terminated(self):
@@ -141,32 +158,16 @@ class BrowserWorkerTests(unittest.TestCase):
                 runtime.destroy(RUN_ID, 10)
                 log.close()
 
-    def test_stop_terminates_browser_processes_that_escaped_the_job(self):
-        # Chromium children break away from the worker's Windows Job Object, so
-        # TerminateJobObject does not reach them. stop() must still terminate them,
-        # otherwise an orphaned chrome-headless-shell keeps chrome_debug.log open and
-        # destroy() cannot delete the runtime directory.
+    def test_stop_removes_the_browser_container_and_its_processes(self):
         with tempfile.TemporaryDirectory() as temp:
             log = SessionLog(Path(temp), RUN_ID, {})
             runtime = CommandRuntime(Path(temp), log)
             runtime.start_session(RUN_ID)
             try:
                 runtime.run(RUN_ID, {"action": "run_python", "code": "print(await page.title())"})
-                worker_pid = runtime._worker.pid
-                before = {}
-                for child in psutil.Process(worker_pid).children(recursive=True):
-                    if "chrome" in (child.name() or "").lower():
-                        before[child.pid] = child.create_time()
-                self.assertTrue(before, "expected chromium child processes to exist")
+                self.assertTrue(runtime.inspect(RUN_ID)['sandbox_containers'])
                 runtime.stop(RUN_ID, 10)
-                survivors = []
-                for pid, created in before.items():
-                    try:
-                        if abs(psutil.Process(pid).create_time() - created) < 0.5:
-                            survivors.append(pid)
-                    except psutil.NoSuchProcess:
-                        pass
-                self.assertEqual(survivors, [], f"chromium processes survived stop(): {survivors}")
+                self.assertEqual(runtime.inspect(RUN_ID)['sandbox_containers'], [])
                 runtime.destroy(RUN_ID, 10)
             finally:
                 try:

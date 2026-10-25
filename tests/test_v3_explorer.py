@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from explorer import ExplorerV3
 from session_log import SessionStore
@@ -15,10 +16,20 @@ def model_reply(action, **fields):
 
 
 class ExplorerLoopTests(unittest.TestCase):
+    def setUp(self):
+        def command(runtime, text, exec_id, timeout):
+            output = ((runtime.runtime_dir / 'work/note.txt').read_text() if text == 'cat work/note.txt'
+                      else text.removeprefix('echo ') + '\n')
+            runtime._add_output(exec_id, 'stdout', output)
+            return 0
+        runner = patch('command_runtime.CommandRuntime._run_command', autospec=True, side_effect=command)
+        runner.start()
+        self.addCleanup(runner.stop)
+
     def test_model_writes_executes_observes_and_finishes_then_cleans(self):
         with tempfile.TemporaryDirectory() as temp:
             answers = iter([model_reply("write_file", path="work/note.txt", content="hello"),
-                            model_reply("run_command", command="type work\\note.txt"),
+                            model_reply("run_command", command="cat work/note.txt"),
                             model_reply("finish")])
             prompts = []
             def transport(payload):
@@ -32,7 +43,7 @@ class ExplorerLoopTests(unittest.TestCase):
             explorer.worker.join(10)
             self.assertFalse(explorer.worker.is_alive())
             meta = SessionStore(Path(temp)).read(run_id)
-            self.assertEqual(meta["run_result"], "completed")
+            self.assertEqual(meta["run_result"], "inconclusive")
             self.assertEqual(meta["cleanup_status"], "succeeded")
             self.assertEqual(meta["lab_reset_status"], "succeeded")
             self.assertEqual(meta["scenario_source"], "manual")
@@ -63,7 +74,7 @@ class ExplorerLoopTests(unittest.TestCase):
             self.assertIn("finish_soon", finish_ctx["remaining"])
             # Findings (the step memory) are preserved in session.json.
             meta = SessionStore(Path(temp)).read(run_id)
-            self.assertEqual(meta["run_result"], "completed")
+            self.assertEqual(meta["run_result"], "inconclusive")
             self.assertEqual([f["action"] for f in meta["findings"]], ["write_file", "run_command"])
 
     def test_unsupported_modes_rejected_without_creating_run(self):
@@ -111,11 +122,11 @@ class ExplorerLoopTests(unittest.TestCase):
             run_id = explorer.start(goal="inspect")
             explorer.worker.join(10)
             self.assertFalse(explorer.can_start()[0])
-            self.assertEqual(SessionStore(Path(temp)).read(run_id)["run_result"], "completed")
+            self.assertEqual(SessionStore(Path(temp)).read(run_id)["run_result"], "inconclusive")
             self.assertTrue(explorer.recover(run_id))
             explorer.worker.join(10)
             self.assertTrue(explorer.can_start()[0])
-            self.assertEqual(SessionStore(Path(temp)).read(run_id)["run_result"], "completed")
+            self.assertEqual(SessionStore(Path(temp)).read(run_id)["run_result"], "inconclusive")
 
     def test_recovery_rebuilds_interrupted_creation_without_runtime(self):
         with tempfile.TemporaryDirectory() as temp:
