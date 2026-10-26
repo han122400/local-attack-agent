@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -13,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from command_runtime import CommandRuntime
-from context_limits import compact_context, context_char_budget
+from context_limits import context_char_budget
 from http_evidence import http_observations
 from harness import Harness, ModelFailure
 from lab import reset_lab
@@ -35,6 +36,36 @@ def _digest(text: str, limit: int = 240) -> str:
         return text
     head = limit * 2 // 3
     return (text[:head] + " … " + text[-(limit - head - 3):]).strip()
+
+
+def _pack_model_context(context: dict, budget: int) -> dict:
+    """Preview execution detail without changing executable commands, goals or stored findings."""
+    fields = {"plan", "reason", "claim", "observed", "error", "stdout", "stderr", "exception", "command", "code", "content"}
+    def preview(value, limit, field=""):
+        if isinstance(value, str) and field in fields and len(value) > limit:
+            marker = "\n[preview; full value in run log]\n"
+            head = (limit - len(marker)) * 2 // 3
+            return value[:head] + marker + value[-(limit - len(marker) - head):]
+        if isinstance(value, dict):
+            return {key: preview(child, limit, key) for key, child in value.items()}
+        if isinstance(value, list):
+            return [preview(child, limit, field) for child in value]
+        return value
+    def size():
+        return len(json.dumps(result, ensure_ascii=False))
+    for limit in (1200, 600, 240, 80):
+        result = {**context, **{key: preview(context[key], limit) for key in ("history", "recent", "feedback") if key in context}}
+        while size() > budget and len(result.get("history", [])) > 1:
+            result["history"].pop(0)
+        if size() <= budget:
+            return result
+    while size() > budget and len(result.get("recent", [])) > 1:
+        result["recent"].pop(0)
+    if size() > budget:
+        result["history"] = []
+    if size() > budget:
+        raise ModelFailure("context", "Required model context exceeds the input budget; shorten the goal or increase num_ctx")
+    return result
 
 
 def compose_report(findings: list[dict], run_result: str, model_reason: str) -> str:
@@ -236,7 +267,8 @@ class ExplorerV3:
         budget = context_char_budget(num_ctx)
         recent: list[dict] = []
         history: list[dict] = []       # structured memory of every step; survives recent trimming
-        seen: dict[str, int] = {}      # observation digest -> step that first produced it (repetition)
+        last_signature = None
+        repeat_start_step = None
         durations: list[float] = []    # recent decide() wall times, to reserve time for a final summary
         for tool_index in range(budgets["tool_calls"]):
             if self.stop_event.is_set():
@@ -253,7 +285,7 @@ class ExplorerV3:
                 ctx = {"goal": metadata["goal"], "target": metadata["target"],
                        "runtime_path": "/work", "python": "python",
                        "browser_api": "run_python has page/context/browser and helpers get_text/get_json/"
-                                      "http_get/goto_and_render/list_inputs/submit_input; top-level await.",
+                                      "http_get/goto_and_render/list_inputs/submit_input/compare_inputs; top-level await.",
                        # history = structured memory of all prior steps (avoid forgetting/repeating);
                        # recent = fuller detail for the latest steps.
                        "history": history[-window:], "recent": recent[-2:],
@@ -264,19 +296,25 @@ class ExplorerV3:
                 return ctx
 
             context = build_context(min(len(history), 30))
+            if history and history[-1]["status"] in {"error", "timeout"}:
+                last = history[-1]
+                context["feedback"] = {"step": last["step"], "action": last["action"], "error": last["error"],
+                    "repeat_of": last.get("repeat_of"),
+                    "instruction": "Use the recent command and error to fix the cause. Preserve useful prior observations; failed execution is not a finding."}
             if history and history[-1].get("repeat_of"):
-                context["note"] = ("Your last step repeated an earlier observation with no new evidence. "
-                                   "Try a different route, feature, or approach — do not repeat it.")
+                context["note"] = ("The last command and outcome match the preceding attempt. "
+                                   "If this is an intentional control, state its purpose; otherwise revise the command or approach.")
             if finish_soon:
                 context["instruction"] = ("Time is almost up. Call finish now with the actual result: the "
                                           "confirmed facts (each with its evidence), the failures, and what "
                                           "remains unverified, from history and recent. No new exploration.")
-            before = len(json.dumps(context, ensure_ascii=False))
-            context = compact_context(context, budget)
+            before_chars = len(json.dumps(context, ensure_ascii=False))
+            context = _pack_model_context(context, budget)
             context_chars = len(json.dumps(context, ensure_ascii=False))
-            if context_chars < before:
-                log.append("context_compacted", {"before_chars": before, "chars": context_chars,
-                                                 "kept_steps": len(context.get("history", []))})
+            if context_chars < before_chars:
+                kept = len(context["history"])
+                log.append("context_compacted", {"dropped": min(len(history), 30) - kept,
+                    "kept_steps": kept, "chars": context_chars, "before_chars": before_chars})
             usage = {"context_chars": context_chars, "context_budget": budget,
                      "prompt_tokens": harness.last_prompt_tokens, "num_ctx": num_ctx}
             self._recent_state.update(**usage)
@@ -294,13 +332,11 @@ class ExplorerV3:
             execution = runtime.run(run_id, command.runtime_payload(), call_id=command.call_id,
                                     timeout=budgets["command_seconds"])
             record = asdict(execution)
-            record["stdout"] = record["stdout"][-1500:]
-            record["stderr"] = record["stderr"][-800:]
-            record["exception"] = record["exception"][-800:]
             recent.append({"call_id": command.call_id, "plan": command.plan, "reason": command.reason,
                            "command": {"action": command.action, "path": command.path,
-                                       "command": _digest(command.command, 800), "code": _digest(command.code, 800)},
+                                       "command": command.command, "code": command.code},
                            "result": record})
+            recent = recent[-2:]  # Full originals remain in model/runtime events, not in the model's window.
             # Structured memory: keep the model's claim (plan/reason) separate from the actual observation,
             # and code-success (status) separate from investigation-success (evidence present).
             if execution.timed_out:
@@ -309,9 +345,14 @@ class ExplorerV3:
                 status, observed, error = "ok", _digest(execution.stdout), ""
             else:
                 status, observed, error = "error", "", _digest(execution.exception or execution.stderr, 200)
-            repeat_of = seen.get(observed) if observed else None
-            if observed and repeat_of is None:
-                seen[observed] = tool_index + 1
+            error_lines = (execution.exception or execution.stderr).strip().splitlines()
+            outcome = {"stdout": execution.stdout, "exit_code": execution.exit_code, "timed_out": execution.timed_out,
+                       "error": error_lines[-1] if error_lines else ""}
+            signature = hashlib.sha256(json.dumps([command.runtime_payload(), outcome], sort_keys=True).encode()).hexdigest()
+            repeat_of = repeat_start_step if signature == last_signature and (observed or error) else None
+            if repeat_of is None:
+                repeat_start_step = tool_index + 1
+            last_signature = signature
             entry = {"step": tool_index + 1, "exec_id": execution.exec_id,
                      "action": command.action, "plan": command.plan[:140],
                      "claim": command.reason[:200], "status": status,

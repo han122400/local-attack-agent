@@ -22,7 +22,7 @@ _PAGE_ASYNC = {
 }
 _PAGE_OBJECTS = {"page", "context", "browser"}
 # injected async helpers, called as bare names: await get_json(...), await submit_input(...)
-_HELPER_FUNCS = {"get_text", "get_json", "http_get", "goto_and_render", "list_inputs", "submit_input"}
+_HELPER_FUNCS = {"get_text", "get_json", "http_get", "goto_and_render", "list_inputs", "submit_input", "compare_inputs"}
 
 
 def check_generated_code(code: str) -> list[str]:
