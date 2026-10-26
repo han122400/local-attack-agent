@@ -2,7 +2,7 @@
 
 import unittest
 
-from planning import COMMAND_SCHEMA, SYSTEM_PROMPT, validate_command
+from planning import COMMAND_SCHEMA, SYSTEM_PROMPT, available_prompt_versions, load_prompt, validate_command
 
 
 def answer(action="finish", **fields):
@@ -19,6 +19,17 @@ class PlanningRegressionTests(unittest.TestCase):
         for old in ("element_id", "request_id", "allowed_actions", "search", "click", "experiment"):
             self.assertNotIn(old, COMMAND_SCHEMA["properties"])
         self.assertIn("browser", SYSTEM_PROMPT)
+
+    def test_prompt_versions_list_and_load_with_traversal_guard(self):
+        versions = available_prompt_versions()
+        self.assertIn("v1", versions)
+        self.assertEqual(versions, sorted(versions, key=lambda v: (len(v), v)))
+        text, digest = load_prompt(versions[0])
+        self.assertTrue(text.strip())
+        self.assertEqual(len(digest), 64)
+        for bad in ("../secret", "v999", "", "system/v1"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                load_prompt(bad)
 
     def test_python_code_can_choose_search_and_navigation_itself(self):
         code = "await page.goto(target)\nawait page.locator('input').fill('a phrase longer than thirty characters chosen by the model')"

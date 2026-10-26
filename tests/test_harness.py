@@ -295,6 +295,26 @@ class HarnessTests(unittest.TestCase):
             self.assertFalse(any(e["kind"] == "transport_retry" for e in log.read_events()))
             log.close()
 
+    def test_custom_system_prompt_is_used_and_logged(self):
+        # A per-run prompt version is injected into the harness, not taken from the module default.
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            sent = []
+            finish = json.dumps({"action": "finish", "plan": "d", "reason": "e",
+                                 "path": "", "content": "", "command": "", "code": ""})
+            def transport(payload):
+                sent.append(payload)
+                yield {"message": {"content": finish}, "done": True, "done_reason": "stop"}
+            command = Harness(log, transport=transport, system_prompt="CUSTOM PROMPT X",
+                              system_prompt_version="vtest", system_prompt_sha256="deadbeef").decide(
+                RUN_ID, {}, model="test:model", settings={})
+            self.assertEqual(command.action, "finish")
+            self.assertEqual(sent[0]["messages"][0], {"role": "system", "content": "CUSTOM PROMPT X"})
+            request = next(e for e in log.read_events() if e["kind"] == "model_request")
+            self.assertEqual(request["system_prompt_version"], "vtest")
+            self.assertEqual(request["system_prompt_sha256"], "deadbeef")
+            log.close()
+
 
 if __name__ == "__main__":
     unittest.main()

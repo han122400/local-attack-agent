@@ -459,6 +459,7 @@ from lab import get_status as get_lab_status, start_lab
 from model_settings import settings_schema, validate_model_settings, model_presets
 from model_providers import get_openrouter_models, is_openrouter, openrouter_model
 from session_log import LogFailure, safe_relative_path, validate_run_id
+from planning import SYSTEM_PROMPT_VERSION, available_prompt_versions  # noqa: E402
 
 
 EXPLORER = ExplorerV3()
@@ -607,6 +608,12 @@ def check_origin(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Cross-site request blocked")
 
 
+@app.get("/api/prompts")
+def list_prompts() -> JSONResponse:
+    return JSONResponse({"versions": available_prompt_versions(), "default": SYSTEM_PROMPT_VERSION},
+                        headers={"Cache-Control": "no-store"})
+
+
 @app.post("/api/start")
 async def start(request: Request) -> dict:
     check_origin(request)
@@ -641,7 +648,7 @@ async def start(request: Request) -> dict:
                 raise ValueError(f"선택한 모델의 출력 한도는 {info['max_completion_tokens']} 토큰입니다.")
         started = EXPLORER.start(target, model, goal=goal, model_settings=settings,
                                  scenario_source=scenario_source, chain_mode=chain_mode,
-                                 budgets=body.get("budgets"))
+                                 budgets=body.get("budgets"), prompt_version=body.get("prompt_version"))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:

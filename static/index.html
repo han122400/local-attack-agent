@@ -63,6 +63,7 @@
             <label>대상 URL<input id="targetInput" type="url" value="http://127.0.0.1:3000/" maxlength="2048" required aria-describedby="targetHelp"></label>
             <label>시나리오 소스<select id="scenarioSelect"><option value="manual">수동 목표</option><option value="auto" disabled>자동 생성 · 준비 중</option></select></label>
             <label>세션 체인<select id="chainSelect"><option value="none">단일 세션</option><option value="campaign" disabled>캠페인 · 준비 중</option></select></label>
+            <label>시스템 프롬프트<select id="promptVersionSelect" aria-describedby="promptVersionHint"><option value="">기본값</option></select><small id="promptVersionHint" class="field-note">탐색 지침 프롬프트 버전</small></label>
           </div>
           <p id="targetHelp" class="field-note">본인이 소유하거나 탐색 권한이 있는 사이트의 HTTP(S) 주소를 입력하세요. Juice Shop 외 사이트는 자동 초기화하지 않습니다.</p>
           <p class="field-note">자동 시나리오와 캠페인 체인은 준비 중입니다. 현재 수동 목표·단일 세션만 실행합니다.</p>

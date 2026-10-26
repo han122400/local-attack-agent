@@ -16,7 +16,7 @@ from command_runtime import CommandRuntime
 from harness import Harness, ModelFailure
 from lab import reset_lab
 from model_settings import default_model_settings, validate_model_settings
-from planning import SYSTEM_PROMPT
+from planning import SYSTEM_PROMPT, SYSTEM_PROMPT_VERSION, available_prompt_versions, load_prompt
 from session_log import ControllerLease, LogFailure, SessionLog, SessionStore, validate_run_id
 
 
@@ -34,9 +34,9 @@ _CHARS_PER_TOKEN = 3.3        # rough for mixed Korean/English/code
 _PROMPT_FRACTION = 0.65       # share of num_ctx used for the prompt (rest reserved for output)
 
 
-def context_char_budget(num_ctx: int) -> int:
+def context_char_budget(num_ctx: int, system_prompt: str = SYSTEM_PROMPT) -> int:
     total_prompt_chars = int(max(1024, num_ctx) * _CHARS_PER_TOKEN * _PROMPT_FRACTION)
-    return max(2000, total_prompt_chars - len(SYSTEM_PROMPT))
+    return max(2000, total_prompt_chars - len(system_prompt))
 
 
 def _digest(text: str, limit: int = 240) -> str:
@@ -142,7 +142,7 @@ class ExplorerV3:
 
     def start(self, target: str = TARGET, model: str = MODEL, *, goal: str = "Explore the local lab",
               model_settings: dict | None = None, scenario_source: str = "manual", chain_mode: str = "none",
-              budgets: dict | None = None) -> str | bool:
+              budgets: dict | None = None, prompt_version: str | None = None) -> str | bool:
         if scenario_source != "manual" or chain_mode != "none":
             raise ValueError("Only manual scenario with none chain is implemented")
         if not isinstance(goal, str) or not goal.strip() or len(goal) > 2000:
@@ -150,6 +150,9 @@ class ExplorerV3:
         target = safe_target(target, self.allowed_target)
         if not isinstance(model, str) or not model.strip() or len(model) > 256:
             raise ValueError("Installed model name is required")
+        prompt_version = prompt_version or SYSTEM_PROMPT_VERSION
+        if prompt_version not in available_prompt_versions():
+            raise ValueError("Unknown system prompt version")
         selected = default_model_settings() if model_settings is None else validate_model_settings(model_settings)
         selected_budgets = validate_budgets(budgets)
         with self.lock:
@@ -170,6 +173,7 @@ class ExplorerV3:
                         "initial_lab_status": "pending" if uses_juice_lab(target) else "not_applicable",
                         "model": model, "model_settings": selected, "budgets": selected_budgets,
                         "scenario_source": scenario_source, "chain_mode": chain_mode,
+                        "prompt_version": prompt_version,
                         "started_at": time.time(), "finished_at": None, "finish_reason": "",
                         "managed_processes": []}
             try:
@@ -255,10 +259,13 @@ class ExplorerV3:
         metadata = log.metadata
         budgets = metadata["budgets"]
         deadline = time.monotonic() + budgets["seconds"]
+        prompt_version = metadata.get("prompt_version", SYSTEM_PROMPT_VERSION)
+        system_prompt, system_prompt_sha256 = load_prompt(prompt_version)
         harness = Harness(log, transport=self.transport, max_calls=budgets["model_calls"],
-                          stop_requested=self.stop_event.is_set)
+                          stop_requested=self.stop_event.is_set, system_prompt=system_prompt,
+                          system_prompt_version=prompt_version, system_prompt_sha256=system_prompt_sha256)
         num_ctx = (metadata.get("model_settings", {}).get("options", {}) or {}).get("num_ctx", 8192)
-        budget = context_char_budget(num_ctx)
+        budget = context_char_budget(num_ctx, system_prompt)
         recent: list[dict] = []
         history: list[dict] = []       # structured memory of every step; survives recent trimming
         seen: dict[str, int] = {}      # observation digest -> step that first produced it (repetition)

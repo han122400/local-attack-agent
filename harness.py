@@ -53,10 +53,15 @@ def _ollama_stream(payload: dict):
 class Harness:
     def __init__(self, log: SessionLog, *, transport=None, max_calls: int = 40,
                  stop_requested=None, max_decode_attempts: int = 6,
-                 max_transport_retries: int = 3, transport_retry_backoff: float = 0.5):
+                 max_transport_retries: int = 3, transport_retry_backoff: float = 0.5,
+                 system_prompt: str = SYSTEM_PROMPT, system_prompt_version: str = SYSTEM_PROMPT_VERSION,
+                 system_prompt_sha256: str = SYSTEM_PROMPT_SHA256):
         self.log = log
         self.run_id = log.run_id
         self.transport = transport or _model_stream
+        self.system_prompt = system_prompt
+        self.system_prompt_version = system_prompt_version
+        self.system_prompt_sha256 = system_prompt_sha256
         self.max_calls = max_calls
         self.max_decode_attempts = max_decode_attempts
         self.max_transport_retries = max_transport_retries
@@ -79,7 +84,7 @@ class Harness:
             options["num_predict"] = max(int(options.get("num_predict", 0)), self.output_num_predict_floor)
         payload = {"model": model, "stream": True, "format": COMMAND_SCHEMA,
                    "options": options,
-                   "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                   "messages": [{"role": "system", "content": self.system_prompt},
                                 {"role": "user", "content": json.dumps(context, ensure_ascii=False)}]}
         if selected["think"] is not None:
             payload["think"] = selected["think"]
@@ -101,8 +106,8 @@ class Harness:
             started = time.monotonic()
             self.log.append("model_request", {"call_id": call_id, "input": payload,
                                               "settings": selected, "attempt": self.calls,
-                                              "system_prompt_version": SYSTEM_PROMPT_VERSION,
-                                              "system_prompt_sha256": SYSTEM_PROMPT_SHA256})
+                                              "system_prompt_version": self.system_prompt_version,
+                                              "system_prompt_sha256": self.system_prompt_sha256})
             content: list[str] = []
             thinking: list[str] = []
             completion: dict = {}

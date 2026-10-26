@@ -46,10 +46,24 @@ COMMAND_SCHEMA = {
     ],
 }
 
+_PROMPTS_DIR = Path(__file__).resolve().parent / "prompts" / "system"
+
+
+def available_prompt_versions() -> list[str]:
+    """Prompt version ids from prompts/system/*.txt, ordered v1, v2, ... (shortest id first)."""
+    return sorted((path.stem for path in _PROMPTS_DIR.glob("*.txt")), key=lambda v: (len(v), v))
+
+
+def load_prompt(version: str) -> tuple[str, str]:
+    """Return (text, sha256) for a prompt version; validate against the available files (no traversal)."""
+    if version not in available_prompt_versions():
+        raise ValueError(f"Unknown system prompt version: {version}")
+    text = (_PROMPTS_DIR / f"{version}.txt").read_text(encoding="utf-8")
+    return text, sha256(text.encode("utf-8")).hexdigest()
+
+
 SYSTEM_PROMPT_VERSION = "v2"
-SYSTEM_PROMPT = (Path(__file__).resolve().parent / "prompts" / "system"
-                 / f"{SYSTEM_PROMPT_VERSION}.txt").read_text(encoding="utf-8")
-SYSTEM_PROMPT_SHA256 = sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+SYSTEM_PROMPT, SYSTEM_PROMPT_SHA256 = load_prompt(SYSTEM_PROMPT_VERSION)
 
 
 @dataclass(frozen=True)

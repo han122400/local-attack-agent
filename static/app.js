@@ -433,7 +433,7 @@ async function startRun(event) {
   }
   const info=availableModels.find(model=>model.name===selectedModelName);
   const body={target:$('targetInput').value.trim(),model:selectedModelName,goal,
-    scenario_source:'manual',chain_mode:'none',
+    scenario_source:'manual',chain_mode:'none',prompt_version:$('promptVersionSelect').value,
     model_settings:ModelSettingsConfig.encode($('providerSelect').value,info,currentModelSettingsValues()),
     budgets:{seconds:Number($('secondsInput').value),model_calls:Number($('modelCallsInput').value),
       tool_calls:Number($('toolCallsInput').value),command_seconds:Number($('commandSecondsInput').value),finalize_seconds:120}};
@@ -452,6 +452,18 @@ async function startRun(event) {
   }
 }
 
+async function loadPrompts(savedVersion){
+  try{
+    const data=await jsonRequest('/api/prompts');
+    const select=$('promptVersionSelect');
+    select.replaceChildren(...data.versions.map(version=>{
+      const option=document.createElement('option');
+      option.value=version; option.textContent=version+(version===data.default?' (기본)':''); return option;
+    }));
+    select.value=(savedVersion&&data.versions.includes(savedVersion))?savedVersion:data.default;
+  }catch(_){ /* keep the static 기본값 option; the server will default an empty value */ }
+}
+
 function initMain(){
   $('mainView').hidden=false; $('runView').hidden=true;
   $('setupSection').hidden=historyMode; $('historySection').hidden=!historyMode;
@@ -465,6 +477,7 @@ function initMain(){
   if(saved.model)selectedModelName=saved.model;
   if(typeof saved.target==='string')$('targetInput').value=saved.target;
   if(typeof saved.goal==='string')$('goalInput').value=saved.goal;
+  loadPrompts(saved.prompt_version);
   $('targetInput').addEventListener('input',()=>{updateTargetReadiness();updateStartControls();});
   updateTargetReadiness();
   if(Object.keys(saved).length)setText('saveStatus','저장된 설정을 불러왔습니다.');
@@ -472,7 +485,7 @@ function initMain(){
   $('saveInputsButton').addEventListener('click',()=>{
     rememberModelSettings();
     saveDash({target:$('targetInput').value.trim(),goal:$('goalInput').value, provider:$('providerSelect').value,
-      model:selectedModelName, settings:Object.fromEntries(modelSettingsDrafts)});
+      model:selectedModelName, prompt_version:$('promptVersionSelect').value, settings:Object.fromEntries(modelSettingsDrafts)});
     setText('saveStatus',`저장됨 ✓ · ${new Date().toLocaleTimeString('ko-KR')}`);
   });
   for(const button of $('goalSuggestions').querySelectorAll('button[data-goal]'))button.addEventListener('click',()=>{
