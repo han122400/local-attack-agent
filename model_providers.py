@@ -20,7 +20,11 @@ _catalog_cache: dict = {}
 
 
 class OpenRouterError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, retryable: bool = True):
+        super().__init__(message)
+        # Transient failures (incomplete stream, 429, 5xx, dropped connection) may clear on a retry;
+        # auth/billing/permission failures will not, so they set retryable=False.
+        self.retryable = retryable
 
 
 def is_openrouter(model: str) -> bool:
@@ -47,7 +51,7 @@ def _http_failure(status: int) -> OpenRouterError:
             403: "키의 권한과 모델 접근 설정을 확인하세요.",
             429: "호출 한도에 도달했습니다. 잠시 후 다시 시도하세요."}.get(status, "잠시 후 다시 시도하세요.")
     # Never include upstream bodies/headers: they may echo credentials or request data.
-    return OpenRouterError(f"OpenRouter HTTP {status}: {hint}")
+    return OpenRouterError(f"OpenRouter HTTP {status}: {hint}", retryable=status not in {401, 402, 403})
 
 
 def get_openrouter_models(*, refresh: bool = False) -> list[dict]:
@@ -155,6 +159,9 @@ def _request_payload(payload: dict, info: dict) -> dict:
     think = payload.get("think")
     if think is not None and "reasoning" in supported:
         request["reasoning"] = {"enabled": think} if type(think) is bool else {"effort": think}
+    # Prefer the cheapest provider for this model. The same model is priced very differently per
+    # provider, and input tokens (re-sent context each step) dominate cost on multi-step runs.
+    request["provider"] = {"sort": "price"}
     if "structured_outputs" in supported:
         # Use the portable object schema; action-specific invariants remain enforced by validate_command.
         schema = {key: value for key, value in payload["format"].items() if key != "oneOf"}
@@ -163,9 +170,13 @@ def _request_payload(payload: dict, info: dict) -> dict:
                                           for name, prop in schema["properties"].items()}}
         request["response_format"] = {"type": "json_schema", "json_schema": {
             "name": "investigation_command", "strict": True, "schema": schema}}
-        request["provider"] = {"require_parameters": True}
+        # Only route to providers that honour every parameter we send (schema, reasoning, sampling).
+        request["provider"]["require_parameters"] = True
     elif "response_format" in supported:
         request["response_format"] = {"type": "json_object"}
+    # Ask OpenRouter to return the actual billed cost (per the chosen provider and any caching) in the
+    # final usage object, so per-run cost is exact rather than a token*price estimate for a guessed provider.
+    request["usage"] = {"include": True}
     return request
 
 
@@ -207,6 +218,8 @@ def openrouter_stream(payload: dict):
                     for source, destination in (("prompt_tokens", "prompt_eval_count"), ("completion_tokens", "eval_count")):
                         if usage.get(source) is not None:
                             completion[destination] = usage[source]
+                    if usage.get("cost") is not None:
+                        completion["cost"] = usage["cost"]
                     for choice in chunk.get("choices") or []:
                         if choice.get("index", 0) != 0:
                             continue

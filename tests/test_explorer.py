@@ -20,12 +20,36 @@ def reply(action, **values):
 class V3ExplorerTests(unittest.TestCase):
     def test_target_and_budgets_are_scoped(self):
         self.assertEqual(safe_target("http://127.0.0.1:3000/#/"), "http://127.0.0.1:3000/#/")
-        for target in ("http://example.com/", "http://127.0.0.1:3001/", "http://127.0.0.1:3000.evil.example/"):
+        self.assertEqual(safe_target("https://my-site.example:8443/app"), "https://my-site.example:8443/app")
+        self.assertEqual(safe_target("http://localhost:5173/"), "http://localhost:5173/")
+        for target in ("file:///etc/passwd", "javascript:alert(1)", "http://user:pass@example.com/",
+                       "http://example.com/\nmalicious", "http://example.com:99999/", "http://example.com\\@evil.test/"):
             with self.subTest(target=target), self.assertRaises(ValueError):
                 safe_target(target)
+        with self.assertRaises(ValueError):
+            safe_target("https://other.example/", allowed_origin="https://my-site.example/")
         self.assertEqual(validate_budgets(None)["tool_calls"], 80)
         with self.assertRaises(ValueError):
             validate_budgets({"tool_calls": 0})
+
+    def test_custom_site_skips_juice_reset_and_frees_next_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            reset_calls = []
+            def reset():
+                reset_calls.append(True)
+                return {"verified": True}
+            explorer = ExplorerV3(Path(temp), transport=lambda _payload: iter([reply("finish")]),
+                                  browser_enabled=False, lab_reset=reset)
+            run_id = explorer.start(target="https://my-site.example/app", goal="inspect")
+            explorer.worker.join(10)
+            self.assertFalse(explorer.worker.is_alive())
+            state = explorer.get_run(run_id)
+            self.assertEqual(state["target"], "https://my-site.example/app")
+            self.assertEqual(state["run_result"], "inconclusive")
+            self.assertEqual(state["lab_reset_status"], "not_applicable")
+            self.assertEqual(state["initial_lab_status"], "not_applicable")
+            self.assertEqual(reset_calls, [])
+            self.assertTrue(explorer.store.can_start()[0])
 
     def test_command_failure_is_returned_for_model_revision(self):
         with tempfile.TemporaryDirectory() as temp:

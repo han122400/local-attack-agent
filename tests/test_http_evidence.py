@@ -7,12 +7,65 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from http_evidence import EvidenceBroker
 from command_runtime import CommandRuntime
 from explorer import compose_report
 from scorecard import score_run
 from session_log import SessionLog
+
+
+class SelectedTargetTests(unittest.TestCase):
+    def test_http_and_https_targets_use_selected_origin_and_preserve_evidence(self):
+        for target, url, connection, hostname, port in (
+            ('https://my-site.example/app', 'https://my-site.example:443/api?q=one',
+             'HTTPSConnection', 'my-site.example', 443),
+            ('http://localhost:5173/', 'http://localhost:5173/api', 'HTTPConnection', 'localhost', 5173),
+            ('http://my-site.example:80/', 'http://my-site.example/api',
+             'HTTPConnection', 'my-site.example', 80),
+            ('https://b\u00fccher.example/', 'https://xn--bcher-kva.example/api',
+             'HTTPSConnection', 'xn--bcher-kva.example', 443),
+        ):
+            with self.subTest(target=target):
+                log = Mock()
+                log.preserve_bytes.return_value = {'path': 'artifacts/fixture', 'sha256': 'a' * 64}
+                broker = EvidenceBroker(target, log)
+                broker.begin('EXEC-0001', 'CALL-0001')
+                with patch('http_evidence.http.client.' + connection) as connect:
+                    response = connect.return_value.getresponse.return_value
+                    response.status = 200
+                    response.getheader.return_value = 'application/json'
+                    response.getheaders.return_value = [('Content-Type', 'application/json')]
+                    response.read1.side_effect = [b'{"items":[1]}', b'']
+                    result = broker.fetch('GET', url)
+                    connect.assert_called_once_with(hostname, port, timeout=8)
+                    path = '/api?q=one' if '?q=one' in url else '/api'
+                    connect.return_value.request.assert_called_once_with('GET', path, headers={})
+                    self.assertEqual((result['status'], result['body']), (200, b'{"items":[1]}'))
+                records = broker.end('EXEC-0001')
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]['source'], 'controller_http')
+                self.assertEqual(log.preserve_bytes.call_count, 3)
+
+    def test_custom_target_still_rejects_other_origins_and_writes(self):
+        broker = EvidenceBroker('https://my-site.example/', Mock())
+        broker.begin('EXEC-0001', 'CALL-0001')
+        with patch('http_evidence.http.client.HTTPConnection') as http, \
+                patch('http_evidence.http.client.HTTPSConnection') as https:
+            for method, url in (
+                ('GET', 'http://my-site.example/'),
+                ('GET', 'https://my-site.example:8443/'),
+                ('GET', 'https://other.example/'),
+                ('GET', 'https://user:password@my-site.example/'),
+                ('GET', 'https://my-site.example/#fragment'),
+                ('POST', 'https://my-site.example/'),
+            ):
+                with self.subTest(method=method, url=url), self.assertRaises(PermissionError):
+                    broker.fetch(method, url)
+            http.assert_not_called()
+            https.assert_not_called()
+        self.assertEqual(broker.end('EXEC-0001'), [])
 
 
 class ProxyTests(unittest.TestCase):

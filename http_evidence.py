@@ -20,11 +20,20 @@ def http_observations(finding: dict) -> list[dict]:
 class EvidenceBroker:
     def __init__(self, target: str, log):
         self.target = urlsplit(target)
-        if self.target.scheme != 'http' or self.target.hostname != '127.0.0.1' or not self.target.port:
-            raise ValueError('Evidence broker requires an explicit local HTTP target port')
+        if (self.target.scheme not in {'http', 'https'} or not self.target.hostname
+                or self.target.username is not None or self.target.password is not None
+                or self.target.port == 0):
+            raise ValueError('Evidence broker requires an HTTP(S) target without credentials')
+        self.origin = self._origin_key(self.target)
         self.log = log
         self.active = None
         self.records = []
+
+    @staticmethod
+    def _origin_key(parts):
+        hostname = (parts.hostname or '').encode('idna').decode('ascii')
+        port = parts.port if parts.port is not None else {'http': 80, 'https': 443}.get(parts.scheme)
+        return parts.scheme, hostname, port
 
     def begin(self, exec_id, call_id):
         self.active = (exec_id, call_id)
@@ -40,14 +49,15 @@ class EvidenceBroker:
         if method not in {'GET', 'HEAD'} or not isinstance(url, str) or len(url) > 8192:
             raise PermissionError('Only bounded GET/HEAD requests are allowed')
         parts = urlsplit(url)
-        if ((parts.scheme, parts.hostname, parts.port) != ('http', self.target.hostname, self.target.port)
+        if (self._origin_key(parts) != self.origin
                 or parts.username is not None or parts.password is not None or parts.fragment):
             raise PermissionError('HTTP request is outside the authorized target')
         active = self.active
         if active is None or len(self.records) >= 100:
             raise PermissionError('No active execution or HTTP budget exhausted')
         timeout = min(8, max(0.1, timeout))
-        conn = http.client.HTTPConnection(self.target.hostname, self.target.port, timeout=timeout)
+        connection = http.client.HTTPSConnection if self.target.scheme == 'https' else http.client.HTTPConnection
+        conn = connection(self.origin[1], self.origin[2], timeout=timeout)
         try:
             headers = {k: v for k, v in (headers or {}).items() if isinstance(k, str) and isinstance(v, str) and k.lower() in {
                 'accept', 'accept-encoding', 'content-type', 'cookie', 'authorization', 'user-agent', 'referer'}}

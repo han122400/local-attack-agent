@@ -9,6 +9,7 @@
       help:remote?'선택한 모델이 지원하는 옵션만 표시합니다. 비워 둔 Temperature는 API 제공자의 기본값을 사용합니다.':
         '로컬 Ollama의 추론·샘플링·메모리 설정입니다.',
       thinkVisible:!remote||supported.includes('reasoning'),
+      thinkEffort:remote&&supported.includes('reasoning_effort'),
       temperatureVisible:!remote||supported.includes('temperature'),
       thinkLabel:remote?'Reasoning · 추론':'Thinking',
       thinkHelp:remote?'기본값은 선택한 모델과 API 제공자의 설정을 따릅니다.':'모델이 지원하는 경우 Thinking을 켜거나 끕니다.',

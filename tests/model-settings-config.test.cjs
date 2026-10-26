@@ -31,6 +31,18 @@ test('blank remote temperature preserves provider defaults while explicit values
   assert.equal(explicit.think,true);
 });
 
+test('reasoning-effort models expose effort levels and encode the chosen level',()=>{
+  const info={supported_parameters:['reasoning','reasoning_effort','temperature'],context_length:200000};
+  const config=settings.describe('openrouter',info);
+  assert.equal(config.thinkEffort,true);
+  assert.equal(settings.encode('openrouter',info,{think:'"low"',temperature:'',context:'8192',output:'4096'}).think,'low');
+});
+
+test('effort levels are hidden for models without reasoning_effort and for Ollama',()=>{
+  assert.equal(settings.describe('openrouter',{supported_parameters:['reasoning']}).thinkEffort,false);
+  assert.equal(settings.describe('ollama',{}).thinkEffort,false);
+});
+
 test('Ollama keeps local defaults and its context and generation option semantics',()=>{
   const config=settings.describe('ollama',{});
   assert.equal(config.title,'Ollama 모델 설정');

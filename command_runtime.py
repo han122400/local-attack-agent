@@ -163,6 +163,12 @@ async def main():
                 raise RuntimeError(reply.get("error", "Invalid HTTP broker reply"))
             reply["body"] = base64.b64decode(reply["body"])
             return reply
+    def origin_key(url):
+        parts = urlsplit(url)
+        hostname = (parts.hostname or "").encode("idna").decode("ascii")
+        port = parts.port if parts.port is not None else {"http": 80, "https": 443}.get(parts.scheme)
+        return parts.scheme, hostname, port
+    selected_origin = origin_key(target)
     async with async_playwright() as playwright:
         options = {"headless": True}
         browser = await playwright.chromium.launch(**options)
@@ -170,8 +176,7 @@ async def main():
         async def guard(route):
             request = route.request
             parts = urlsplit(request.url)
-            allowed = (parts.scheme == target_parts.scheme and parts.hostname == target_parts.hostname
-                       and parts.port == target_parts.port and request.method in ("GET", "HEAD")
+            allowed = (origin_key(request.url) == selected_origin and request.method in ("GET", "HEAD")
                        and parts.username is None and parts.password is None)
             if allowed:
                 try:
@@ -188,8 +193,8 @@ async def main():
         target_origin = target_parts.scheme + "://" + target_parts.netloc
         def _same_origin(url):
             p = urlsplit(url)
-            return (p.scheme == target_parts.scheme and p.hostname == target_parts.hostname
-                    and p.port == target_parts.port)
+            return (origin_key(url) == selected_origin
+                    and p.username is None and p.password is None)
         async def get_text(url):
             """GET a URL within the target origin and return its response text."""
             if not _same_origin(url):

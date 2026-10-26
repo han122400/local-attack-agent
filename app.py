@@ -28,6 +28,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.concurrency import run_in_threadpool
 
+import scorecard
+
 
 TARGET = "http://127.0.0.1:3000/"
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
@@ -452,7 +454,7 @@ class Explorer:
         return ({"api": 0, "page": 1, "form": 1, "route": 2, "script": 3}.get(kind, 4), 0 if url.endswith("main.js") else 1)
 
 
-from explorer import ExplorerV3  # noqa: E402 - v1 helpers above remain for unrelated regression tests.
+from explorer import ExplorerV3, safe_target  # noqa: E402 - v1 helpers above remain for unrelated regression tests.
 from lab import get_status as get_lab_status, start_lab
 from model_settings import settings_schema, validate_model_settings, model_presets
 from model_providers import get_openrouter_models, is_openrouter, openrouter_model
@@ -612,7 +614,7 @@ async def start(request: Request) -> dict:
         body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
         if not isinstance(body, dict):
             raise ValueError("실험 설정은 JSON 객체여야 합니다.")
-        target = body.get("target", TARGET)
+        target = safe_target(body.get("target", TARGET))
         model = body.get("model", MODEL)
         goal = body.get("goal", "")
         if not isinstance(goal, str) or not goal.strip():
@@ -708,6 +710,13 @@ def run_state(run_id: str) -> JSONResponse:
     return JSONResponse({**state, "live_available": live_available(run_id),
                          "runtime_exists": (EXPLORER.store.root / run_id / "runtime").is_dir()},
                         headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/runs/{run_id}/score")
+def run_score(run_id: str) -> JSONResponse:
+    state = existing_run(run_id)
+    run_dir = EXPLORER.store.root / validate_run_id(run_id)
+    return JSONResponse(scorecard.score_run(state, run_dir), headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/runs/{run_id}/events")

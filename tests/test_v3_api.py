@@ -37,6 +37,7 @@ class RunApiTests(unittest.TestCase):
     def test_start_returns_run_id_and_run_scoped_state(self):
         with patch.object(app, "EXPLORER", self.explorer), patch("app.get_ollama_models", return_value=[{"name": "mock:model"}]):
             response = self.client.post("/api/start", json={"goal": "inspect catalog", "model": "mock:model",
+                                                            "target": "https://my-site.example/catalog",
                                                             "scenario_source": "manual", "chain_mode": "none"})
             self.assertEqual(response.status_code, 200, response.text)
             body = response.json()
@@ -46,6 +47,9 @@ class RunApiTests(unittest.TestCase):
             state = self.client.get("/api/runs/" + body["run_id"])
             self.assertEqual(state.status_code, 200)
             self.assertEqual(state.json()["goal"], "inspect catalog")
+            self.assertEqual(state.json()["target"], "https://my-site.example/catalog")
+            self.assertEqual(state.json()["lab_reset_status"], "not_applicable")
+            self.assertEqual(state.json()["run_result"], "inconclusive")
             self.assertEqual(state.json()["run_id"], body["run_id"])
             self.assertEqual(self.client.get("/api/runs/" + "f" * 32).status_code, 404)
 

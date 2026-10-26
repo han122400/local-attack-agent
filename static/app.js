@@ -4,7 +4,7 @@ const runId = runMatch ? runMatch[1] : null;
 const historyMode = !runId && new URLSearchParams(location.search).get('view') === 'history';
 const validRunId = value => /^[0-9a-f]{32}$/.test(String(value || ''));
 const dateText = value => value ? new Date(value * 1000).toLocaleString('ko-KR') : '—';
-const statusText = value => ({preparing:'준비 중',running:'탐색 중',stopping:'중단 중',finalizing:'정리 중',resetting:'환경 초기화 중',finished:'종료',recovery_required:'복구 필요',completed:'관찰 수집 완료',inconclusive:'증거 부족 · 판단 보류',stopped:'중단됨',timed_out:'시간 초과',error:'오류',succeeded:'완료',pending:'대기',failed:'실패',preserved:'보존됨',finalized:'확정됨',collecting:'수집 중'})[value] || value || '확인 중';
+const statusText = value => ({preparing:'준비 중',running:'탐색 중',stopping:'중단 중',finalizing:'정리 중',resetting:'환경 초기화 중',finished:'종료',recovery_required:'복구 필요',completed:'관찰 수집 완료',inconclusive:'증거 부족 · 판단 보류',stopped:'중단됨',timed_out:'시간 초과',error:'오류',succeeded:'완료',not_applicable:'해당 없음',pending:'대기',failed:'실패',preserved:'보존됨',finalized:'확정됨',collecting:'수집 중'})[value] || value || '확인 중';
 const textNode = (tag, value, className='') => { const item=document.createElement(tag); item.textContent=String(value ?? ''); if(className)item.className=className; return item; };
 const setText = (id, value) => { $(id).textContent=String(value ?? ''); };
 async function jsonRequest(url, options) {
@@ -16,6 +16,8 @@ async function jsonRequest(url, options) {
 }
 
 let activeRunId=null, canStart=false, modelReady=false, labReady=false, startPending=false;
+let labStatus=null;
+const DEFAULT_TARGET='http://127.0.0.1:3000/';
 let readinessSerial=0, availableModels=[], selectedModelName='';
 let configuredSettingsKey='';
 const modelSettingsDrafts=new Map();
@@ -26,6 +28,49 @@ const runStats={calls:0,executions:0,modelErrors:0,systemErrors:0,unknownFailure
 let displayQueued=false, latestExecution=null;
 let fileSource='runtime', fileItems=[], selectedFile=null, selectedEvidence=null, evidenceItems=[];
 const collapsedDirs=new Set(['deps','tmp','browser']);
+
+// Persist the operator's dashboard inputs (target, goal, provider/model, per-model settings) in the
+// browser so a reload or app restart does not wipe them. Per-viewer convenience only; wrapped so a
+// private window or blocked storage degrades to defaults instead of throwing.
+const DASH_KEY='juice-explorer:dashboard:v1';
+function loadDash(){ try{ return JSON.parse(localStorage.getItem(DASH_KEY))||{}; }catch{ return {}; } }
+function saveDash(patch){ try{ localStorage.setItem(DASH_KEY, JSON.stringify({...loadDash(),...patch})); }catch{ /* storage unavailable */ } }
+function targetInfo(){
+  const raw=$('targetInput').value.trim();
+  if(!raw||raw.length>2048||/[\s\\]/.test(raw))return null;
+  try{
+    const url=new URL(raw);
+    if(!['http:','https:'].includes(url.protocol)||!url.hostname
+       ||url.username||url.password||url.port==='0')return null;
+    return url;
+  }catch{return null;}
+}
+function usesJuiceLab(){
+  const url=targetInfo();
+  return !!url&&url.protocol==='http:'&&url.hostname==='127.0.0.1'&&url.port==='3000';
+}
+function updateTargetReadiness(){
+  const valid=!!targetInfo(), juice=usesJuiceLab();
+  setText('sideTargetLabel',juice?'Juice Shop':'대상 사이트');
+  setText('readinessTargetLabel',juice?'Juice Shop':'대상 사이트');
+  if(!valid){
+    labReady=false;setText('labReadiness','대상 사이트의 HTTP(S) 주소를 입력하세요.');
+    setText('sideLab','주소 확인');$('sideLab').className='bad';$('labStartButton').hidden=true;
+  }else if(!juice){
+    labReady=true;setText('labReadiness','탐색 중 연결을 확인합니다. 자동 초기화하지 않습니다.');
+    setText('sideLab','직접 지정');$('sideLab').className='warn';$('labStartButton').hidden=true;
+  }else if(labStatus?.status==='fulfilled'){
+    labReady=!!labStatus.value.ready;setText('labReadiness',labStatus.value.message);
+    setText('sideLab',labReady?'준비됨':statusText(labStatus.value.status));
+    $('sideLab').className=labReady?'ok':'bad';$('labStartButton').hidden=!labStatus.value.can_start;
+  }else if(labStatus?.status==='rejected'){
+    labReady=false;setText('labReadiness',labStatus.reason.message);
+    setText('sideLab','확인 실패');$('sideLab').className='bad';$('labStartButton').hidden=true;
+  }else{
+    labReady=false;setText('labReadiness','확인 중');setText('sideLab','확인 중');
+    $('sideLab').className='';$('labStartButton').hidden=true;
+  }
+}
 const goalSuggestions={
   structure:'설정된 대상 웹사이트에서 접근 가능한 페이지와 주요 기능의 구조를 파악해줘. 실제로 관찰한 링크, 화면과 이동 관계를 근거로 기능별 요약과 아직 확인하지 못한 영역을 정리해줘.',
   inputs:'설정된 대상 웹사이트에서 검색, 필터와 입력 요소의 동작을 관찰해줘. 관찰한 화면을 바탕으로 확인할 요소와 비파괴적인 입력값을 스스로 선택하고, 입력 전후의 변화와 근거를 정리해줘. 해당 요소가 없으면 관찰한 범위와 함께 기록해줘.',
@@ -211,7 +256,7 @@ function renderRunRows(containerId, runs) {
 
 function updateStartControls() {
   const modeOk=$('scenarioSelect').value==='manual' && $('chainSelect').value==='none';
-  const ready=canStart&&modelReady&&labReady&&!startPending&&modeOk;
+  const ready=canStart&&modelReady&&labReady&&!!targetInfo()&&!startPending&&modeOk;
   $('startButton').disabled=!ready;
   if(!modeOk) setText('startError','자동 시나리오와 캠페인 체인은 준비 중입니다.');
   else if(!startPending) setText('startError','');
@@ -309,6 +354,9 @@ function configureModelControls() {
   $('thinkingField').hidden=!config.thinkVisible;
   $('temperatureField').hidden=!config.temperatureVisible;
   $('thinkSelect').disabled=!config.thinkVisible||!info;
+  // Reasoning-effort levels (low/medium/high) only apply to models that support them; hide them otherwise.
+  for(const option of $('thinkSelect').querySelectorAll('option[data-effort]'))option.hidden=!config.thinkEffort;
+  if($('thinkSelect').selectedOptions[0]&&$('thinkSelect').selectedOptions[0].hidden)$('thinkSelect').value='null';
   $('temperatureInput').disabled=!config.temperatureVisible||!info;
   for(const [id,limit] of [['contextInput',config.contextMax],['predictInput',config.outputMax]]){
     $(id).disabled=!info;
@@ -322,6 +370,7 @@ async function loadReadiness() {
   const label=remote?'OpenRouter':'Ollama';
   const previous=selectedModelName;
   modelReady=false; $('modelSelect').disabled=true;
+  labStatus=null;updateTargetReadiness();
   setText('sideProviderLabel',label); setText('readinessProviderLabel',label);
   $('sideProviderRow').hidden=!remote;
   $('remoteModelNotice').hidden=!remote; $('processorDetails').hidden=remote;
@@ -339,8 +388,14 @@ async function loadReadiness() {
     setText('sideOllama','연결 실패'); $('sideOllama').className='bad';
     $('processorList').replaceChildren(textNode('p',`조회 실패: ${error.message}`));
   });
-  const [models,lab]=await Promise.allSettled([
-    jsonRequest(remote?'/api/models?provider=openrouter':'/api/models'),jsonRequest('/api/lab')]);
+  jsonRequest('/api/lab').then(value=>{
+    if(serial!==readinessSerial)return;
+    labStatus={status:'fulfilled',value};updateTargetReadiness();if(!runId)updateStartControls();
+  },reason=>{
+    if(serial!==readinessSerial)return;
+    labStatus={status:'rejected',reason};updateTargetReadiness();if(!runId)updateStartControls();
+  });
+  const [models]=await Promise.allSettled([jsonRequest(remote?'/api/models?provider=openrouter':'/api/models')]);
   if(serial!==readinessSerial)return;
   const now=new Date().toLocaleTimeString('ko-KR'); setText('sideChecked',`마지막 확인 ${now}`);
   if(models.status==='fulfilled'){
@@ -358,13 +413,6 @@ async function loadReadiness() {
     setText('modelStatus',models.reason.message); setText('ollamaReadiness',models.reason.message);
     setText('sideProviderStatus','연결 실패'); $('sideProviderStatus').className='bad';
   }
-  if(lab.status==='fulfilled'){
-    labReady=!!lab.value.ready; setText('labReadiness',lab.value.message);
-    setText('sideLab',labReady?'준비됨':statusText(lab.value.status)); $('sideLab').className=labReady?'ok':'bad';
-    $('labStartButton').hidden=!lab.value.can_start;
-  } else {
-    labReady=false; setText('labReadiness',lab.reason.message); setText('sideLab','확인 실패'); $('sideLab').className='bad';
-  }
   if(!runId)updateStartControls();
 }
 
@@ -379,8 +427,12 @@ async function startRun(event) {
   }
   const goal=$('goalInput').value.trim();
   if(!goal){setText('startError','탐색 목표를 입력하세요.'); $('goalInput').focus(); return;}
+  if(!targetInfo()){
+    setText('startError','대상 사이트의 HTTP(S) 주소를 입력하세요.');
+    $('targetInput').focus();return;
+  }
   const info=availableModels.find(model=>model.name===selectedModelName);
-  const body={target:$('targetInput').value,model:selectedModelName,goal,
+  const body={target:$('targetInput').value.trim(),model:selectedModelName,goal,
     scenario_source:'manual',chain_mode:'none',
     model_settings:ModelSettingsConfig.encode($('providerSelect').value,info,currentModelSettingsValues()),
     budgets:{seconds:Number($('secondsInput').value),model_calls:Number($('modelCallsInput').value),
@@ -405,6 +457,24 @@ function initMain(){
   $('setupSection').hidden=historyMode; $('historySection').hidden=!historyMode;
   if(historyMode){setText('mainHeading','실험 기록');setText('mainLead','저장된 세션의 결과와 실행 로그를 확인합니다.');}
   $('startForm').addEventListener('submit',startRun);
+  // Restore the last SAVED inputs before loadReadiness runs, so the saved model is picked up as the
+  // "previous" selection and the saved per-model settings are applied by configureModelControls.
+  const saved=loadDash();
+  for(const [key,value] of Object.entries(saved.settings||{}))modelSettingsDrafts.set(key,value);
+  if(saved.provider)$('providerSelect').value=saved.provider;
+  if(saved.model)selectedModelName=saved.model;
+  if(typeof saved.target==='string')$('targetInput').value=saved.target;
+  if(typeof saved.goal==='string')$('goalInput').value=saved.goal;
+  $('targetInput').addEventListener('input',()=>{updateTargetReadiness();updateStartControls();});
+  updateTargetReadiness();
+  if(Object.keys(saved).length)setText('saveStatus','저장된 설정을 불러왔습니다.');
+  // Explicit save: persist the current target, goal, provider/model and settings on button press.
+  $('saveInputsButton').addEventListener('click',()=>{
+    rememberModelSettings();
+    saveDash({target:$('targetInput').value.trim(),goal:$('goalInput').value, provider:$('providerSelect').value,
+      model:selectedModelName, settings:Object.fromEntries(modelSettingsDrafts)});
+    setText('saveStatus',`저장됨 ✓ · ${new Date().toLocaleTimeString('ko-KR')}`);
+  });
   for(const button of $('goalSuggestions').querySelectorAll('button[data-goal]'))button.addEventListener('click',()=>{
     const input=$('goalInput');input.value=goalSuggestions[button.dataset.goal]+goalScope;
     input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();input.setSelectionRange(input.value.length,input.value.length);
@@ -451,8 +521,32 @@ function showTab(name){
   if(name==='evidence')loadEvidenceFiles();
 }
 
+let scoreShownKey='';
+async function loadScore(state){
+  const panel=$('scorePanel'), id=state.run_id;
+  if(!id||!state.run_result){panel.hidden=true;return;}   // 스코어는 종료 후 집계
+  const key=`${id}:${state.run_result}:${(state.findings||[]).length}`;
+  if(key===scoreShownKey)return;                           // 같은 상태면 재요청하지 않음
+  try{
+    const s=await jsonRequest(`/api/runs/${id}/score`);
+    const cost=s.cost_usd==null?'—':`$${Number(s.cost_usd).toFixed(4)}`;
+    const cards=$('scoreCards'); cards.replaceChildren();
+    for(const [label,value] of [['점수',s.score],['증거',s.evidence],['실패',s.failed],
+        ['반복',s.repeats],['압축',s.compactions],['비용',cost]]){
+      const card=document.createElement('div');
+      card.append(textNode('strong',value),textNode('p',label,'field-note'));
+      cards.append(card);
+    }
+    panel.hidden=false; scoreShownKey=key;
+  }catch(_){panel.hidden=true;}
+}
+
 function renderRunHeader(state){
   currentRun=state; setText('runGoal',state.goal||'목표 기록 없음'); setText('runModel',state.model||'—'); setText('runId',runId);
+  setText('runTarget',state.target||'—');
+  if(state.target&&$('targetInput').value!==state.target){
+    $('targetInput').value=state.target;updateTargetReadiness();
+  }
   const provider=state.model?.startsWith('openrouter:')?'openrouter':'ollama';
   if($('providerSelect').value!==provider){$('providerSelect').value=provider;loadReadiness();}
   const seconds=Math.max(0,Math.floor((state.finished_at||Date.now()/1000)-(state.started_at||Date.now()/1000)));
@@ -470,13 +564,14 @@ function renderRunHeader(state){
   else $('contextBar').hidden=true;
   const summary=$('resultSummary'); summary.replaceChildren();
   for(const [key,value] of [['실험 결과',state.run_result||'진행 중'],['종료 이유',state.finish_reason||'—'],
-    ['로그',state.log_status],['런타임 정리',state.cleanup_status],['Juice Shop 초기화',state.lab_reset_status]]){
+    ['로그',state.log_status],['런타임 정리',state.cleanup_status],['대상 초기화',statusText(state.lab_reset_status)]]){
     summary.append(textNode('dt',key),textNode('dd',value||'—'));
   }
   setText('reportText',state.report||'보고서가 아직 생성되지 않았습니다.');
   setText('settingsValue',JSON.stringify({run_id:state.run_id,target:state.target,goal:state.goal,model:state.model,
     model_settings:state.model_settings,budgets:state.budgets,scenario_source:state.scenario_source,chain_mode:state.chain_mode},null,2));
   renderAgentStatus();
+  loadScore(state);
   $('exportLink').href=`/api/runs/${runId}/export`;
   if(!state.live_available&&stream){stream.close();stream=null;setText('connectionStatus','저장 기록');refreshEvents();}
   if(!state.live_available&&!stream)setText('connectionStatus','저장 기록');

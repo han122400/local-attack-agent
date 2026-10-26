@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from harness import Harness, ModelFailure
+from model_providers import OpenRouterError
 from planning import Command, validate_command
 from session_log import SessionLog
 
@@ -201,7 +202,7 @@ class HarnessTests(unittest.TestCase):
             self.assertFalse(any(e["kind"] == "command_sanitized" for e in log.read_events()))
             log.close()
 
-    def test_output_limit_retries_with_previous_response_and_same_settings(self):
+    def test_output_limit_raises_output_budget_and_retries(self):
         with tempfile.TemporaryDirectory() as temp:
             log = SessionLog(Path(temp), RUN_ID, {})
             sent = []
@@ -219,14 +220,79 @@ class HarnessTests(unittest.TestCase):
                 RUN_ID, {}, model="test:model", settings={"think": False, "options": {"num_predict": 700}})
             self.assertEqual(command.action, "finish")
             self.assertEqual(len(sent), 2)
-            self.assertEqual(sent[0]["options"], sent[1]["options"])
-            self.assertEqual(sent[1]["options"]["num_predict"], 700)
+            # A length truncation doubles num_predict for the retry instead of re-sending the same cap.
+            self.assertEqual(sent[0]["options"]["num_predict"], 700)
+            self.assertEqual(sent[1]["options"]["num_predict"], 1400)
+            self.assertEqual({k: v for k, v in sent[1]["options"].items() if k != "num_predict"},
+                             {k: v for k, v in sent[0]["options"].items() if k != "num_predict"})
             self.assertEqual(sent[1]["messages"][-2], {"role": "assistant", "content": cut})
             self.assertIn("output limit", sent[1]["messages"][-1]["content"].lower())
             events = log.read_events()
             self.assertEqual([e["error_kind"] for e in events if e["kind"] == "model_error"], ["output_limit"])
+            raised = next(e for e in events if e["kind"] == "output_budget_raised")
+            self.assertEqual((raised["from_num_predict"], raised["to_num_predict"]), (700, 1400))
             self.assertEqual([e["call_id"] for e in events if e["kind"] == "command_decoded"], ["CALL-0002"])
             self.assertEqual([e["output"] for e in events if e["kind"] == "model_response"], [cut, repaired])
+            log.close()
+
+    def test_raised_output_budget_persists_to_later_steps(self):
+        # Once a length-truncation forces the budget up, later decide() calls in the same run start
+        # at the raised floor so a reasoning model does not re-truncate at the original cap every step.
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            sent = []
+            good = json.dumps({"action": "finish", "plan": "Done", "reason": "Enough",
+                               "path": "", "content": "", "command": "", "code": ""})
+            def transport(payload):
+                sent.append(payload)
+                truncate = len(sent) == 1   # step 1 call 1 truncates; everything else completes
+                yield {"message": {"content": "" if truncate else good}, "done": True,
+                       "done_reason": "length" if truncate else "stop", "eval_count": 4096}
+            harness = Harness(log, transport=transport)
+            settings = {"think": None, "options": {"num_ctx": 262144, "num_predict": 4096}}
+            harness.decide(RUN_ID, {}, model="openrouter:z-ai/glm-5.3-flash", settings=settings)
+            harness.decide(RUN_ID, {}, model="openrouter:z-ai/glm-5.3-flash", settings=settings)
+            self.assertEqual(sent[0]["options"]["num_predict"], 4096)   # initial cap
+            self.assertEqual(sent[1]["options"]["num_predict"], 8192)   # doubled on the retry
+            self.assertEqual(sent[2]["options"]["num_predict"], 8192)   # floor carried into the next step
+            log.close()
+
+    def test_transient_transport_error_retries_then_succeeds(self):
+        # A provider that drops the stream once should be retried, not fail the whole run.
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            attempts = []
+            good = json.dumps({"action": "finish", "plan": "done", "reason": "enough",
+                               "path": "", "content": "", "command": "", "code": ""})
+            def transport(_payload):
+                attempts.append(1)
+                if len(attempts) == 1:
+                    raise OpenRouterError("OpenRouter 응답이 정상 종료되지 않았습니다")
+                yield {"message": {"content": good}, "done": True, "done_reason": "stop"}
+            command = Harness(log, transport=transport, transport_retry_backoff=0).decide(
+                RUN_ID, {}, model="openrouter:z-ai/glm-5.3-flash", settings={})
+            self.assertEqual(command.action, "finish")
+            self.assertEqual(len(attempts), 2)
+            events = log.read_events()
+            self.assertEqual([e["error_kind"] for e in events if e["kind"] == "model_error"], ["transport"])
+            self.assertTrue(any(e["kind"] == "transport_retry" for e in events))
+            log.close()
+
+    def test_non_retryable_transport_error_aborts_without_retry(self):
+        # Auth/billing/permission failures (retryable=False) must fail fast, not burn retries.
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            attempts = []
+            def transport(_payload):
+                attempts.append(1)
+                raise OpenRouterError("OpenRouter HTTP 402: 크레딧 잔액을 확인하세요.", retryable=False)
+                yield  # unreachable; makes this a generator
+            with self.assertRaises(ModelFailure) as raised:
+                Harness(log, transport=transport, transport_retry_backoff=0, max_calls=5).decide(
+                    RUN_ID, {}, model="openrouter:z-ai/glm-5.3-flash", settings={})
+            self.assertEqual(raised.exception.kind, "transport")
+            self.assertEqual(len(attempts), 1)
+            self.assertFalse(any(e["kind"] == "transport_retry" for e in log.read_events()))
             log.close()
 
 

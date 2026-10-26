@@ -97,16 +97,29 @@ def compose_report(findings: list[dict], run_result: str, model_reason: str) -> 
     return "\n".join(lines)
 
 
-def safe_target(target: str, allowed_origin: str = TARGET) -> str:
-    if not isinstance(target, str) or not target or any(char in target for char in "\x00\r\n\\"):
-        raise ValueError("Invalid target URL")
-    parsed = urlsplit(target)
-    allowed = urlsplit(allowed_origin)
-    if (parsed.scheme, parsed.hostname, parsed.port) != (allowed.scheme, allowed.hostname, allowed.port):
-        raise ValueError("Target must be the authorized local lab")
-    if parsed.username or parsed.password:
-        raise ValueError("Target credentials are not allowed")
+def safe_target(target: str, allowed_origin: str | None = None) -> str:
+    """Validate a user-entered web target, optionally restricted to one origin."""
+    if (not isinstance(target, str) or not target or len(target) > 2048
+            or any(ord(char) <= 32 or ord(char) == 127 or char == "\\" for char in target)):
+        raise ValueError("Enter an absolute HTTP or HTTPS URL")
+    try:
+        parsed = urlsplit(target)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or parsed.port == 0):
+            raise ValueError("Target must be an absolute HTTP(S) URL without credentials")
+        if allowed_origin is not None:
+            allowed = urlsplit(allowed_origin)
+            if (parsed.scheme, parsed.hostname, parsed.port) != (allowed.scheme, allowed.hostname, allowed.port):
+                raise ValueError("Target must remain within the allowed origin")
+    except ValueError as exc:
+        raise ValueError(f"Invalid target URL: {exc}") from exc
     return target
+
+
+def uses_juice_lab(target: str) -> bool:
+    parsed = urlsplit(target)
+    return (parsed.scheme, parsed.hostname, parsed.port) == ("http", "127.0.0.1", 3000)
 
 
 def validate_budgets(raw: dict | None) -> dict:
@@ -121,7 +134,7 @@ def validate_budgets(raw: dict | None) -> dict:
 
 class ExplorerV3:
     def __init__(self, runs_root: Path = RUNS_ROOT, *, transport=None, browser_enabled: bool = True,
-                 lab_reset=None, allowed_target: str = TARGET):
+                 lab_reset=None, allowed_target: str | None = None):
         self.store = SessionStore(runs_root)
         self.lease = ControllerLease(runs_root)
         self.instance_id = uuid.uuid4().hex
@@ -176,6 +189,8 @@ class ExplorerV3:
             metadata = {"owner_instance_id": self.instance_id, "controller_pid": os.getpid(),
                         "runtime_path": str(self.store.root / run_id / "runtime"),
                         "runtime_creation_intent": False, "goal": goal.strip(), "target": target,
+                        "lab_reset_status": "pending" if uses_juice_lab(target) else "not_applicable",
+                        "initial_lab_status": "pending" if uses_juice_lab(target) else "not_applicable",
                         "model": model, "model_settings": selected, "budgets": selected_budgets,
                         "scenario_source": scenario_source, "chain_mode": chain_mode,
                         "started_at": time.time(), "finished_at": None, "finish_reason": "",
@@ -223,7 +238,9 @@ class ExplorerV3:
         with self.lock:
             self._runtime = runtime
         try:
-            if not any(item.get("lab_reset_status") == "succeeded" and item.get("phase") == "finished"
+            if uses_juice_lab(log.metadata.get("target", TARGET)) and not any(
+                       uses_juice_lab(item.get("target", TARGET))
+                       and item.get("lab_reset_status") == "succeeded" and item.get("phase") == "finished"
                        for item in self.store.list_runs() if item.get("run_id") != run_id):
                 log.update(initial_lab_status="running")
                 initial_probe = self.lab_reset()
@@ -316,7 +333,8 @@ class ExplorerV3:
                 log.append("context_compacted", {"dropped": min(len(history), 30) - kept,
                     "kept_steps": kept, "chars": context_chars, "before_chars": before_chars})
             usage = {"context_chars": context_chars, "context_budget": budget,
-                     "prompt_tokens": harness.last_prompt_tokens, "num_ctx": num_ctx}
+                     "prompt_tokens": harness.last_prompt_tokens, "num_ctx": num_ctx,
+                     "cost_usd": round(harness.total_cost, 6)}
             self._recent_state.update(**usage)
             log.update(**usage)
             started = time.monotonic()
@@ -410,7 +428,8 @@ class ExplorerV3:
                     raise RuntimeError("Runtime folder remains after destroy")
                 log.update(cleanup_status="succeeded")
                 log.append("cleanup_step", {"step": "destroy", "status": "succeeded"})
-            if log.metadata.get("lab_reset_status") != "succeeded":
+            if (uses_juice_lab(log.metadata.get("target", TARGET))
+                    and log.metadata.get("lab_reset_status") != "succeeded"):
                 log.update(phase="resetting", lab_reset_status="running")
                 remaining(120)
                 probe = self.lab_reset()
@@ -419,6 +438,8 @@ class ExplorerV3:
                     raise RuntimeError("Lab reset probe failed")
                 log.append("lab_reset", {"probe": probe, "status": "succeeded"})
                 log.update(lab_reset_status="succeeded")
+            elif not uses_juice_lab(log.metadata.get("target", TARGET)):
+                log.update(lab_reset_status="not_applicable")
             log.append("run_finalized", {"run_result": run_result, "reason": reason})
             remaining(120)
             log.flush()
@@ -511,7 +532,8 @@ class ExplorerV3:
                 except (KeyError, ValueError, LogFailure):
                     metadata = self.store.repair_unowned_metadata(run_id)
                 if (metadata.get("phase") == "finished" and metadata.get("cleanup_status") == "succeeded"
-                        and metadata.get("log_status") == "finalized" and metadata.get("lab_reset_status") == "succeeded"):
+                        and metadata.get("log_status") == "finalized"
+                        and metadata.get("lab_reset_status") in {"succeeded", "not_applicable"}):
                     self.lease.release()
                     return False
                 log = SessionLog(self.store.root, run_id, recovery=True)

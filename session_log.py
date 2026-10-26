@@ -401,7 +401,7 @@ class SessionStore:
             if ((path / "runtime").exists() or meta.get("phase") != "finished"
                     or meta.get("log_status") != "finalized"
                     or meta.get("cleanup_status") != "succeeded"
-                    or meta.get("lab_reset_status") != "succeeded"):
+                    or meta.get("lab_reset_status") not in {"succeeded", "not_applicable"}):
                 return False, f"{meta['run_id']}: session cleanup is incomplete"
         return True, ""
 

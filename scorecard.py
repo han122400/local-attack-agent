@@ -104,6 +104,7 @@ def score_run(session: dict, run_dir: Path) -> dict:
         "compactions": _count_compactions(run_dir),
         "clean_finish": clean_finish,
         "duration_s": duration,
+        "cost_usd": session.get("cost_usd"),
         "score": round(score, 3),
     }
 
@@ -125,7 +126,7 @@ def load_runs(runs_root: Path = RUNS_ROOT) -> list[dict]:
 
 _COLS = [("run_id", 12), ("model", 12), ("num_ctx", 7), ("result", 10), ("instrumented", 5),
          ("steps", 5), ("evidence", 4), ("inconclusive", 5), ("failed", 6), ("repeats", 7),
-         ("unique_obs", 4), ("compactions", 6), ("duration_s", 8), ("score", 6)]
+         ("unique_obs", 4), ("compactions", 6), ("duration_s", 8), ("cost_usd", 9), ("score", 6)]
 
 
 def _fmt(value: object, width: int) -> str:

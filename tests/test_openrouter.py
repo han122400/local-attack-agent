@@ -107,8 +107,11 @@ class OpenRouterTests(unittest.TestCase):
             with self.http(respond):
                 Harness(log).decide(log.run_id, {}, model=MODEL,
                     settings={"think": None, "options": {"num_predict": 8192}})
+            # Output is reserved below the context window after the prompt; the exact value tracks the
+            # system prompt length, so assert the capping behavior rather than a prompt-tied magic number.
             self.assertGreater(seen[0]["max_tokens"], 0)
-            self.assertLess(seen[0]["max_tokens"], 1500)
+            self.assertLess(seen[0]["max_tokens"], catalog["data"][0]["context_length"])
+            self.assertLess(seen[0]["max_tokens"], 8192)   # below the requested num_predict too
         finally:
             log.close()
 
@@ -135,13 +138,14 @@ class OpenRouterTests(unittest.TestCase):
             seen.append(json.loads(request.content))
             chunks = [{"choices": [{"delta": {"reasoning": "checking"}, "finish_reason": None}]},
                       {"choices": [{"delta": {"content": json.dumps(COMMAND)}, "finish_reason": "stop"}]},
-                      {"choices": [], "usage": {"prompt_tokens": 90, "completion_tokens": 40}}]
+                      {"choices": [], "usage": {"prompt_tokens": 90, "completion_tokens": 40, "cost": 0.0012}}]
             data = ': heartbeat\n\n' + ''.join('data: ' + json.dumps(c) + '\n\n' for c in chunks) + 'data: [DONE]\n\n'
             return httpx.Response(200, text=data, headers={"content-type": "text/event-stream"})
         log = SessionLog(self.root, "d" * 32, {})
         self.addCleanup(log.close)
+        harness = Harness(log)
         with self.http(respond):
-            command = Harness(log).decide(log.run_id, {}, model=MODEL,
+            command = harness.decide(log.run_id, {}, model=MODEL,
                 settings={"think": True, "options": {"num_ctx": 8192, "num_predict": 2000, "temperature": 0.3}})
         self.assertEqual(command.action, "finish")
         self.assertEqual(seen[0]["model"], "vendor/test-model")
@@ -149,8 +153,13 @@ class OpenRouterTests(unittest.TestCase):
         self.assertEqual(seen[0]["temperature"], 0.3)
         self.assertEqual(seen[0]["response_format"]["type"], "json_schema")
         self.assertNotIn("oneOf", seen[0]["response_format"]["json_schema"]["schema"])
+        # Route to the cheapest provider that still honours the parameters we send.
+        self.assertEqual(seen[0]["provider"], {"sort": "price", "require_parameters": True})
         self.assertNotIn("options", seen[0])
         self.assertNotIn("num_ctx", seen[0])
+        # Ask for usage accounting and accumulate the billed cost OpenRouter returns.
+        self.assertEqual(seen[0]["usage"], {"include": True})
+        self.assertEqual(harness.total_cost, 0.0012)
         events = log.read_events()
         self.assertNotIn("test-secret", json.dumps(events))
         self.assertTrue(any(e["kind"] == "model_delta" and e.get("channel") == "thinking" for e in events))
