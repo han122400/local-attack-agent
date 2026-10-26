@@ -40,7 +40,7 @@ class RealOllamaGate(unittest.TestCase):
                 print(f"REAL_GATE result={state['run_result']} phase={state['phase']} "
                       f"cleanup={state['cleanup_status']} reset={state['lab_reset_status']} "
                       f"actions={actions} reason={state.get('finish_reason', '')[:160]}", flush=True)
-                self.assertIn(state["run_result"], {"completed", "inconclusive", "timed_out", "error"})
+                self.assertIn(state["run_result"], {"completed", "timed_out", "error"})
                 self.assertNotIn("Executor or lifecycle failure", state.get("finish_reason", ""))
                 self.assertEqual(state["phase"], "finished")
                 self.assertEqual(state["cleanup_status"], "succeeded")

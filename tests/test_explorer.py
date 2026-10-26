@@ -45,7 +45,7 @@ class V3ExplorerTests(unittest.TestCase):
             self.assertFalse(explorer.worker.is_alive())
             state = explorer.get_run(run_id)
             self.assertEqual(state["target"], "https://my-site.example/app")
-            self.assertEqual(state["run_result"], "inconclusive")
+            self.assertEqual(state["run_result"], "completed")
             self.assertEqual(state["lab_reset_status"], "not_applicable")
             self.assertEqual(state["initial_lab_status"], "not_applicable")
             self.assertEqual(reset_calls, [])
@@ -70,7 +70,7 @@ class V3ExplorerTests(unittest.TestCase):
                 run_id = explorer.start(goal="inspect")
                 explorer.worker.join(10)
             self.assertFalse(explorer.worker.is_alive())
-            self.assertEqual(SessionStore(Path(temp)).read(run_id)["run_result"], "inconclusive")
+            self.assertEqual(SessionStore(Path(temp)).read(run_id)["run_result"], "completed")
             self.assertEqual(prompts[1]["recent"][-1]["result"]["exit_code"], 7)
             self.assertIn("fixed", prompts[2]["recent"][-1]["result"]["stdout"])
 

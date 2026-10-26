@@ -49,7 +49,7 @@ class RunApiTests(unittest.TestCase):
             self.assertEqual(state.json()["goal"], "inspect catalog")
             self.assertEqual(state.json()["target"], "https://my-site.example/catalog")
             self.assertEqual(state.json()["lab_reset_status"], "not_applicable")
-            self.assertEqual(state.json()["run_result"], "inconclusive")
+            self.assertEqual(state.json()["run_result"], "completed")
             self.assertEqual(state.json()["run_id"], body["run_id"])
             self.assertEqual(self.client.get("/api/runs/" + "f" * 32).status_code, 404)
 

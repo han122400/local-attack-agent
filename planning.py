@@ -46,7 +46,7 @@ COMMAND_SCHEMA = {
     ],
 }
 
-SYSTEM_PROMPT_VERSION = "v3"
+SYSTEM_PROMPT_VERSION = "v4"
 SYSTEM_PROMPT = (Path(__file__).resolve().parent / "prompts" / "system"
                  / f"{SYSTEM_PROMPT_VERSION}.txt").read_text(encoding="utf-8")
 SYSTEM_PROMPT_SHA256 = sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()

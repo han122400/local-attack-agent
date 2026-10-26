@@ -15,7 +15,6 @@ from urllib.parse import urlsplit
 
 from command_runtime import CommandRuntime
 from context_limits import context_char_budget
-from http_evidence import http_observations
 from harness import Harness, ModelFailure
 from lab import reset_lab
 from model_settings import default_model_settings, validate_model_settings
@@ -72,19 +71,17 @@ def compose_report(findings: list[dict], run_result: str, model_reason: str) -> 
     """Deterministic report built from the preserved findings, so every run ends with an actual result
     (confirmed observations / inconclusive / failures) even when the model never produced a finish summary."""
     findings = findings or []
-    evidence = [f for f in findings if http_observations(f)]
-    inconclusive = [f for f in findings if f.get("status") == "ok" and not http_observations(f)]
+    evidence = [f for f in findings if f.get("evidence")]
+    inconclusive = [f for f in findings if f.get("status") == "ok" and not f.get("evidence")]
     failed = [f for f in findings if f.get("status") in ("error", "timeout")]
     lines = [f"결과: {run_result} · 스텝 {len(findings)}개 "
              f"(증거 {len(evidence)} · 미확정 {len(inconclusive)} · 실패 {len(failed)})"]
     if model_reason:
-        lines.append(f"모델 종료 요약(미검증 주장): {model_reason}")
+        lines.append(f"모델 종료 요약: {model_reason}")
     if evidence:
         lines.append("확인된 관찰:")
         for f in evidence[:12]:
-            for response in http_observations(f)[:3]:
-                lines.append(f"  - [{response['id']}] {response['method']} {response['url']} → HTTP {response['status']} "
-                             f"({response['bytes']} bytes, artifact={response['response_artifact']['path']})")
+            lines.append(f"  - [{f['step']}] {f.get('plan', '')} → {str(f.get('observed', ''))[:140]}")
     else:
         lines.append("확인된(증거 있는) 관찰 없음.")
     if inconclusive:
@@ -93,7 +90,6 @@ def compose_report(findings: list[dict], run_result: str, model_reason: str) -> 
     if failed:
         steps = ", ".join(str(f["step"]) for f in failed[:8])
         lines.append(f"실패/타임아웃: {len(failed)}건 (스텝 {steps}).")
-    lines.append("HTTP 응답 수집은 취약점 확정을 의미하지 않습니다. 취약점 판정은 별도 검증이 필요합니다.")
     return "\n".join(lines)
 
 
@@ -300,7 +296,7 @@ class ExplorerV3:
 
             def build_context(window: int) -> dict:
                 ctx = {"goal": metadata["goal"], "target": metadata["target"],
-                       "runtime_path": "/work", "python": "python",
+                       "runtime_path": str(runtime.runtime_dir), "python": runtime.python,
                        "browser_api": "run_python has page/context/browser and helpers get_text/get_json/"
                                       "http_get/goto_and_render/list_inputs/submit_input/compare_inputs; top-level await.",
                        # history = structured memory of all prior steps (avoid forgetting/repeating);
@@ -346,7 +342,7 @@ class ExplorerV3:
                 log.append("run_finished_by_model", {"call_id": command.call_id, "reason": command.reason,
                                                      "plan": command.plan})
                 log.update(findings=history)
-                return ("completed" if any(http_observations(f) for f in history) else "inconclusive"), command.reason
+                return "completed", command.reason
             execution = runtime.run(run_id, command.runtime_payload(), call_id=command.call_id,
                                     timeout=budgets["command_seconds"])
             record = asdict(execution)
@@ -375,9 +371,7 @@ class ExplorerV3:
                      "action": command.action, "plan": command.plan[:140],
                      "claim": command.reason[:200], "status": status,
                      "observed": observed or "(no evidence)", "error": error,
-                     "http_evidence": execution.http_evidence}
-            entry["evidence"] = bool(http_observations(entry))
-            entry["evidence_ids"] = [item["id"] for item in http_observations(entry)]
+                     "evidence": bool(observed) and status == "ok"}
             if repeat_of is not None:
                 entry["repeat_of"] = repeat_of
             history.append(entry)
@@ -409,10 +403,10 @@ class ExplorerV3:
             log.update(run_result=run_result, finish_reason=reason, phase="finalizing")
             log.append("finalize_started", {"run_result": run_result, "reason": reason})
             if (log.metadata.get("cleanup_status") != "succeeded" or runtime.inspect(run_id)["runtime_exists"]
-                    or runtime.inspect(run_id)["managed_processes"] or runtime.inspect(run_id)["sandbox_containers"]):
+                    or runtime.inspect(run_id)["managed_processes"]):
                 log.update(cleanup_status="running")
                 runtime.stop(run_id, remaining(20))
-                if runtime.inspect(run_id)["managed_processes"] or runtime.inspect(run_id)["sandbox_containers"]:
+                if runtime.inspect(run_id)["managed_processes"]:
                     raise RuntimeError("Managed processes remain after stop")
                 log.append("cleanup_step", {"step": "stop", "status": "succeeded"})
                 if log.metadata.get("log_status") not in {"preserved", "finalized"}:
@@ -459,8 +453,7 @@ class ExplorerV3:
             try:
                 failed = {"phase": "recovery_required", "finish_reason": reason,
                           "cleanup_error": str(exc)[:500]}
-                if (runtime.inspect(run_id)["runtime_exists"] or runtime.inspect(run_id)["managed_processes"]
-                        or runtime.inspect(run_id)["sandbox_containers"]):
+                if (runtime.inspect(run_id)["runtime_exists"] or runtime.inspect(run_id)["managed_processes"]):
                     failed["cleanup_status"] = "failed"
                 elif log.metadata.get("cleanup_status") != "succeeded":
                     failed["cleanup_status"] = "failed"

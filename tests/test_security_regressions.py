@@ -1,4 +1,4 @@
-"""Security boundaries; model/runtime doubles never launch a browser or call a model."""
+"""Model context limits; runtime doubles never launch a browser or call a model."""
 
 import json
 import tempfile
@@ -7,9 +7,8 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from command_runtime import ExecutionResult
-from explorer import ExplorerV3, context_char_budget, compose_report
+from explorer import ExplorerV3, context_char_budget
 from harness import Harness, ModelFailure
-from scorecard import score_run
 from session_log import SessionLog
 
 
@@ -21,7 +20,7 @@ def answer(action, **values):
     return {"message": {"content": json.dumps({**command, **values})}, "done": True, "done_reason": "stop"}
 
 
-class EvidenceAndContextTests(unittest.TestCase):
+class ContextLimitTests(unittest.TestCase):
     def run_loop(self, replies, result=None):
         with tempfile.TemporaryDirectory() as directory:
             log = SessionLog(Path(directory), RUN_ID, {
@@ -35,28 +34,10 @@ class EvidenceAndContextTests(unittest.TestCase):
                 sent.append(json.loads(json.dumps(payload)))
                 yield next(replies)
             runtime = Mock(runtime_dir=Path(directory), python="python")
-            runtime.run.return_value = result or ExecutionResult("EXEC-0001", "run_command", stdout="CONFIRMED SQLi", exit_code=0)
+            runtime.run.return_value = result or ExecutionResult("EXEC-0001", "run_command", stdout="sample observation", exit_code=0)
             explorer = ExplorerV3(Path(directory), transport=transport, browser_enabled=False)
             outcome, reason = explorer._loop(RUN_ID, log, runtime)
             return outcome, reason, dict(log.metadata), sent
-
-    def test_printed_claim_is_not_evidence_or_a_completed_investigation(self):
-        outcome, reason, state, _ = self.run_loop([answer("run_command", command="echo CONFIRMED SQLi"), answer("finish")])
-        self.assertFalse(state["findings"][0]["evidence"])
-        self.assertEqual(outcome, "inconclusive")
-        report = compose_report(state["findings"], outcome, reason)
-        self.assertNotIn("확인된 관찰:\n", report)
-
-    def test_immediate_finish_is_inconclusive(self):
-        outcome, _, _, _ = self.run_loop([answer("finish")])
-        self.assertEqual(outcome, "inconclusive")
-
-    def test_legacy_evidence_flag_and_empty_finish_cannot_earn_quality_points(self):
-        for findings in ([], [{"step": 1, "evidence": True, "status": "ok", "observed": "made up"}]):
-            with self.subTest(findings=findings):
-                row = score_run({"findings": findings, "run_result": "completed"}, Path("missing-run"))
-                self.assertEqual(row["evidence"], 0)
-                self.assertEqual(row["score"], 0)
 
     def test_long_recent_command_never_exceeds_context_budget(self):
         _, _, _, sent = self.run_loop([answer("run_command", command="x" * 30000), answer("finish")])

@@ -74,7 +74,7 @@ class ModelContextTests(unittest.TestCase):
         result, sent, executed, state, _ = self.run_loop(
             [command] * 4 + [answer("finish")], [failure(i) for i in range(4)])
         self.assertEqual(len(executed), 4)
-        self.assertEqual(result[0], "inconclusive")
+        self.assertEqual(result[0], "completed")
         self.assertIn("feedback", sent[2])
         self.assertEqual(sent[2]["feedback"]["repeat_of"], 1)
         self.assertIn("NameError", sent[2]["feedback"]["error"])

@@ -12,8 +12,6 @@ import re
 import threading
 import time
 import uuid
-import stat
-from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
 
 from event_classification import classify_event, event_view
@@ -42,36 +40,6 @@ def safe_relative_path(value: str) -> Path:
     if any(part in ("", ".", "..") or ":" in part for part in parts):
         raise ValueError("Path escapes session")
     return Path(*parts)
-
-
-@contextmanager
-def open_beneath(root: Path, relative: str | None, flags: int = os.O_RDONLY, *, parents=False):
-    """Anchor each lookup to a directory handle; generated symlink swaps must not redirect host I/O."""
-    if os.open not in os.supports_dir_fd or not hasattr(os, 'O_NOFOLLOW'):
-        raise RuntimeError('Secure runtime file access requires a POSIX controller (macOS/Linux)')
-    parts = safe_relative_path(relative).parts if relative is not None else ()
-    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    descriptor = None
-    try:
-        for name in parts[:-1]:
-            if parents:
-                try:
-                    os.mkdir(name, mode=0o700, dir_fd=directory)
-                except FileExistsError:
-                    pass
-            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
-            os.close(directory)
-            directory = child
-        if parts:
-            descriptor = os.open(parts[-1], flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
-            kind = os.fstat(descriptor).st_mode
-            if not (stat.S_ISREG(kind) or (flags & os.O_DIRECTORY and stat.S_ISDIR(kind))):
-                raise ValueError('Only regular files or directories are allowed')
-        yield descriptor if descriptor is not None else directory
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        os.close(directory)
 
 
 class SessionLog:
@@ -332,7 +300,6 @@ class SessionStore:
         except (KeyError, ValueError, LogFailure):
             pass
         outstanding = set()
-        containers = set()
         result = None
         events_path = directory / "events.jsonl"
         if events_path.exists():
@@ -347,15 +314,11 @@ class SessionStore:
                         outstanding.add(identity)
                     elif event.get("kind") == "process_stopped":
                         outstanding.discard(identity)
-                    elif event.get("kind") == "sandbox_created":
-                        containers.add(event.get("container"))
-                    elif event.get("kind") == "sandbox_removed":
-                        containers.discard(event.get("container"))
                     elif event.get("kind") in {"finalize_started", "run_finalized"}:
                         result = event.get("run_result") or result
             except (ValueError, UnicodeDecodeError, TypeError) as exc:
                 raise LogFailure("Cannot establish process ownership from events") from exc
-        if outstanding or containers:
+        if outstanding:
             raise LogFailure("Cannot repair metadata with unconfirmed managed processes")
         if session_path.exists():
             artifact = directory / "artifacts" / "recovery"

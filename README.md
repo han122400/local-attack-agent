@@ -9,57 +9,48 @@
 ## 실행 환경
 
 - Python 3.10 이상
-- Docker Desktop
+- Docker Desktop (로컬 Juice Shop 실습 타깃을 사용할 때만 필요)
 - Ollama 및 설치된 로컬 모델 또는 OpenRouter API 키
 - Playwright Chromium
 
-컨트롤러는 현재 macOS/Linux에서 실행합니다. 생성 코드가 바꾼 심볼릭 링크를 따라 호스트 파일에
-접근하지 않도록 POSIX 디렉터리 핸들 기반 파일 접근을 사용하며, 지원되지 않는 환경에서는 거부합니다.
-Windows에서는 WSL2의 Linux 환경에서 컨트롤러를 실행해야 합니다.
+AI가 작성한 코드와 Playwright 브라우저 워커는 main과 동일하게 로컬 Python·셸에서 실행합니다.
+별도의 에이전트 실행 이미지 빌드나 WSL은 필요하지 않습니다. Docker는 Juice Shop 타깃 실행에만 사용합니다.
 
 ## 시작하기
 
-Docker Desktop을 켜고 프로젝트 폴더에서 **격리 실행 이미지**를 한 번 빌드합니다.
-Dockerfile만 빌더에 전달하므로 프로젝트 파일, `.env`, 모델이나 실행 로그는 이미지에 들어가지 않습니다.
+프로젝트 폴더에서 Python 의존성과 브라우저를 설치합니다.
 
-```bash
-docker build -t local-attack-agent-runtime:v3 - < Dockerfile.runtime
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m playwright install chromium
 ```
 
-`run_command`와 `run_python`은 이 이미지의 컨테이너 안에서만 실행됩니다. 이미지 또는 Docker가
-없으면 실행을 거부하며 호스트 Python/셸로 대체 실행하지 않습니다. 컨테이너에는 세션 runtime만
-`/work`로 연결하고, 호스트 API 키·Docker 소켓·프로젝트 폴더는 연결하지 않습니다.
-네트워크는 `none`, 루트 파일시스템은 읽기 전용이며 CPU·메모리·프로세스 수를 제한합니다.
-각 실행에는 전용 컨테이너 소유권을 기록하고, 종료·취소·복구 때 해당 컨테이너도 정리합니다.
-
-모든 생성 명령은 호스트 OS와 관계없이 **Linux 셸** 명령입니다(`cat`, `rm`, `python` 등).
-셸은 runtime 파일 분석에 사용합니다. 사이트 조회에는 `http_get`/`get_text`/`get_json` 또는
-브라우저 탐색을 사용하세요. 이 경로만 컨트롤러가 허용된 타깃의 GET/HEAD 요청으로 중계합니다.
-컨테이너 내부 `curl`·`urllib`·`context.request` 등의 직접 네트워크 연결은 사용할 수 없습니다.
-
-프로젝트 폴더에서 컨트롤러의 Python 의존성을 설치합니다(macOS/Linux 또는 WSL2).
+macOS/Linux에서는 다음 명령을 사용합니다.
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m playwright install chromium
 ```
 
 Juice Shop 실습 컨테이너를 준비합니다.
 
-```bash
+```powershell
 docker pull bkimminich/juice-shop:v20.2.0
 docker run -d --name juice-lab -p 127.0.0.1:3000:3000 bkimminich/juice-shop:v20.2.0
 ```
 
 컨테이너가 이미 있다면 `docker start juice-lab`으로 시작합니다. Ollama를 실행하고 `ollama list`에 모델이 있는지 확인한 뒤 대시보드를 시작합니다.
 
-```bash
-.venv/bin/python app.py
+```powershell
+.\.venv\Scripts\python.exe app.py
 ```
 
-테스트는 필요한 모듈을 지정해 실행합니다(예: `.venv/bin/python -m unittest discover -s tests -p test_security_regressions.py -v`).
-실제 실행기 테스트에는 위에서 빌드한 Docker 이미지가 필요합니다. UI 테스트를 명시적으로 실행할 때만
-호스트에 `.venv/bin/python -m playwright install chromium`으로 Chromium을 추가로 설치하세요.
+macOS/Linux에서는 `.venv/bin/python app.py`로 시작합니다.
+
+관련 단위 테스트는 모듈을 지정해 실행합니다(예: `python -m unittest discover -s tests -p test_local_runtime.py -v`).
+전체 테스트나 브라우저 검증은 명시적으로 요청한 경우에만 실행합니다.
 
 브라우저에서 <http://127.0.0.1:8765/>에 접속해 설치된 모델을 선택합니다. Ollama 연결 주소는 `http://127.0.0.1:11434`입니다.
 
@@ -91,26 +82,12 @@ Thinking과 Temperature는 모델이 지원할 때만 적용합니다. 컨텍스
 - `explorer.py`: 브라우저 관찰, LLM 계획 실행, 가설 실험 및 응답 비교
 - `model_providers.py`: OpenRouter 모델 목록, 설정 변환 및 스트리밍 어댑터
 - `planning.py`: 계획 스키마, 모델 지시문, 결정 검증
-- `process_sandbox.py`, `Dockerfile.runtime`: 생성 코드의 Docker 격리와 소유 컨테이너 정리
-- `http_evidence.py`: 타깃 제한 HTTP 중계 및 컨트롤러가 보존한 요청·응답 증거
-- `context_limits.py`: 최근 실행 결과와 재시도 메시지를 포함한 입력 크기 제한
 - `lab.py`: 로컬 Juice Shop 컨테이너 상태 확인과 시작
 - `static/`: 대시보드
 - `tests/`: 테스트
 - `Version/`: v1·v2 설계 문서
 
 ## 개발 상태
-
-출력 문자열, 모델의 주장, 생성 파일은 그 자체로 검증된 HTTP 증거가 아닙니다. 컨트롤러가
-실제로 수집한 요청·응답 아티팩트의 ID와 해시를 각 단계에 연결하며 보고서는 이 응답만
-‘확인된 관찰’에 표시합니다. 모델 종료 요약은 미검증 주장으로 따로 표시합니다.
-HTTP 증거 없이 `finish`하면 결과는 `inconclusive`이고 점수는 0입니다. HTTP 관찰이 있는
-`completed`도 취약점 확정이나 목표 전체 달성을 보증하지 않습니다.
-`scorecard.py`의 점수는 HTTP 관찰 수집 지표이며 취약점 탐지 정확도가 아닙니다.
-
-컨텍스트는 시스템 프롬프트와 출력 여유를 제외한 문자 예산으로 제한합니다. 최근 명령·출력과
-재시도 피드백까지 포함해 다시 검사하며, 최소한의 필수 입력조차 맞지 않으면 모델을 호출하지
-않습니다. 문자 수는 토큰 수의 추정치이며 모델별 정확한 토큰 계산은 아닙니다.
 
 MVP 실험 단계입니다. 검색 입력은 연결된 레이블, 접근성 이름과 상위 검색 영역을 함께 읽어 인식하며, 숨겨지거나 접힌 입력은 선택지에서 제외합니다.
 입력칸과 결과 선택자가 확인되면 모델은 `await compare_inputs(index, normal_value, test_value,
@@ -134,6 +111,5 @@ result_selector)`로 정상 입력·테스트 입력·정상 입력 재확인을
 모델에 전달할 긴 명령·코드·출력·오류는 줄바꿈과 앞뒤 내용을 유지한 미리보기로 줄입니다.
 기존 기록 압축에 최근 실행 상세와 오류 피드백도 포함하며, 실제 전송할 최초 문맥 크기를 다시
 검사합니다. 목표·대상·파일 경로는 임의로 자르지 않고, 필수 내용이 문자 예산에 들어가지 않으면
-호출 전 오류를 표시합니다. 문자 예산은 토큰 수의 근사치이며, Harness 내부 재시도 메시지까지
-포함한 한도를 보장하지는 않습니다. 실행 명령과 저장된 findings는 미리보기로 바꾸지 않습니다.
+호출 전 오류를 표시합니다. 문자 예산은 토큰 수의 근사치이며, Harness 내부 재시도 메시지에도 별도의 입력 크기 제한을 적용합니다. 실행 명령과 저장된 findings는 미리보기로 바꾸지 않습니다.
 모델 연결·응답 생성 오류는 별도로 표시하며, 실행 데이터, 로그, 로컬 의존성은 Git 저장소에서 제외됩니다.

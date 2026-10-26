@@ -43,7 +43,7 @@ class ExplorerLoopTests(unittest.TestCase):
             explorer.worker.join(10)
             self.assertFalse(explorer.worker.is_alive())
             meta = SessionStore(Path(temp)).read(run_id)
-            self.assertEqual(meta["run_result"], "inconclusive")
+            self.assertEqual(meta["run_result"], "completed")
             self.assertEqual(meta["cleanup_status"], "succeeded")
             self.assertEqual(meta["lab_reset_status"], "succeeded")
             self.assertEqual(meta["scenario_source"], "manual")
@@ -74,7 +74,7 @@ class ExplorerLoopTests(unittest.TestCase):
             self.assertIn("finish_soon", finish_ctx["remaining"])
             # Findings (the step memory) are preserved in session.json.
             meta = SessionStore(Path(temp)).read(run_id)
-            self.assertEqual(meta["run_result"], "inconclusive")
+            self.assertEqual(meta["run_result"], "completed")
             self.assertEqual([f["action"] for f in meta["findings"]], ["write_file", "run_command"])
 
     def test_unsupported_modes_rejected_without_creating_run(self):
@@ -122,11 +122,11 @@ class ExplorerLoopTests(unittest.TestCase):
             run_id = explorer.start(goal="inspect")
             explorer.worker.join(10)
             self.assertFalse(explorer.can_start()[0])
-            self.assertEqual(SessionStore(Path(temp)).read(run_id)["run_result"], "inconclusive")
+            self.assertEqual(SessionStore(Path(temp)).read(run_id)["run_result"], "completed")
             self.assertTrue(explorer.recover(run_id))
             explorer.worker.join(10)
             self.assertTrue(explorer.can_start()[0])
-            self.assertEqual(SessionStore(Path(temp)).read(run_id)["run_result"], "inconclusive")
+            self.assertEqual(SessionStore(Path(temp)).read(run_id)["run_result"], "completed")
 
     def test_recovery_rebuilds_interrupted_creation_without_runtime(self):
         with tempfile.TemporaryDirectory() as temp:

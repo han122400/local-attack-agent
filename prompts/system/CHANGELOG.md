@@ -1,7 +1,15 @@
 # 시스템 프롬프트 변경 기록
 
-현재 적용 버전: **v3** (`planning.py`의 `SYSTEM_PROMPT_VERSION`에서 선택).
+현재 적용 버전: **v4** (`planning.py`의 `SYSTEM_PROMPT_VERSION`에서 선택).
 이 번호는 시스템 프롬프트에만 해당하며, 탐색 설계 문서의 v4와는 별개입니다.
+
+## v4 — 2026-10-26 로컬 실행 복원
+
+- 사용자 요청에 따라 Docker 코드 격리와 HTTP 중계를 제거하고, main의 로컬 Python·셸·Playwright 실행 방식으로 복원했습니다.
+- 실제 세션 작업 경로와 Python 실행 파일을 사용하며, Windows·macOS/Linux에서 WSL 없이 컨트롤러를 실행합니다.
+- v2의 범위·신뢰·증거·보고 규칙과 feat/jihun의 `compare_inputs` 안내를 함께 사용합니다.
+- 컨테이너 경로·직접 네트워크 차단·컨트롤러 HTTP 증거 ID에 의존한 안내를 현재 프롬프트에서 제거했습니다.
+- 이전 버전 파일은 과거 실행 기록 확인을 위해 보존합니다.
 
 ## v3 — 2026-10-26 main → feat/jihun 병합
 

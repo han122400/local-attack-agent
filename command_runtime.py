@@ -1,30 +1,32 @@
-"""Per-run Docker execution with controller-owned, scope-checked HTTP evidence."""
+"""Per-run local command and persistent Playwright execution.
+
+The runtime folder is a workspace boundary for file APIs, not an OS sandbox
+for arbitrary CMD or Python code.
+"""
 
 from __future__ import annotations
 
 import hashlib
-import base64
 import codecs
 import json
 import os
 import signal
+import select
 import shutil
-import queue
+import socket
 import subprocess
 import sys
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import psutil
 
 from code_checks import check_generated_code
-from http_evidence import EvidenceBroker
-from process_sandbox import sandbox_command, remove_container
-from session_log import LogFailure, SessionLog, safe_relative_path, validate_run_id, open_beneath
+from session_log import LogFailure, SessionLog, safe_relative_path, validate_run_id
 
 
 if os.name == "nt":
@@ -88,81 +90,38 @@ def installed_chromium() -> str | None:
 
 WORKER_SOURCE = r'''import ast
 import asyncio
-import base64
 import contextlib
 import inspect
 import json
 import os
+import socket
 import sys
-import threading
 import traceback
 from pathlib import Path
 from urllib.parse import urlsplit
 
+project = Path(sys.argv[5])
+sys.path.insert(0, str(project / ".deps"))
 from playwright.async_api import async_playwright
-
-class ControlPipe:
-    def __init__(self):
-        self.reader, self.writer = sys.stdin.fileno(), sys.stdout.buffer
-    def sendall(self, data):
-        self.writer.write(data)
-        self.writer.flush()
-    def close(self): pass
 
 def send(sock, item):
     sock.sendall((json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8"))
 
+def recv(sock, buffer):
+    while b"\n" not in buffer:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise EOFError("controller disconnected")
+        buffer += chunk
+    line, buffer = buffer.split(b"\n", 1)
+    return json.loads(line), buffer
+
 async def main():
-    token, target = sys.argv[1:3]
-    sock = ControlPipe()
+    host, port, token, target, project_root, executable = sys.argv[1:7]
+    sock = socket.create_connection((host, int(port)), timeout=20)
+    sock.settimeout(None)
     send(sock, {"type": "hello", "token": token})
     target_parts = urlsplit(target)
-    http_lock = asyncio.Lock()
-    inbox, waiting = asyncio.Queue(), {}
-    execution = {"id": None, "request": 0}
-    loop = asyncio.get_running_loop()
-    def deliver(message):
-        if message.get("type") == "http_response":
-            future = waiting.pop(message.get("request_id"), None)
-            if future is not None and not future.done():
-                future.set_result(message)
-        else:
-            inbox.put_nowait(message)
-    def read_control():
-        buffer = b""
-        try:
-            while True:
-                chunk = os.read(sock.reader, 65536)
-                if not chunk:
-                    break
-                buffer += chunk
-                if len(buffer) > 12_000_000:
-                    raise ValueError("Controller message too large")
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    loop.call_soon_threadsafe(deliver, json.loads(line))
-        finally:
-            if not loop.is_closed():
-                loop.call_soon_threadsafe(deliver, {"type": "stop"})
-    threading.Thread(target=read_control, daemon=True).start()
-    async def request_http(url, method="GET", headers=None):
-        exec_id = execution["id"]
-        if exec_id is None:
-            raise RuntimeError("No active execution")
-        async with http_lock:
-            execution["request"] += 1
-            request_id = execution["request"]
-            future = waiting[request_id] = loop.create_future()
-            send(sock, {"type": "http_request", "exec_id": exec_id, "request_id": request_id,
-                        "url": url, "method": method, "headers": headers or {}})
-            try:
-                reply = await future
-            finally:
-                waiting.pop(request_id, None)
-            if reply.get("error"):
-                raise RuntimeError(reply.get("error", "Invalid HTTP broker reply"))
-            reply["body"] = base64.b64decode(reply["body"])
-            return reply
     def origin_key(url):
         parts = urlsplit(url)
         hostname = (parts.hostname or "").encode("idna").decode("ascii")
@@ -171,6 +130,8 @@ async def main():
     selected_origin = origin_key(target)
     async with async_playwright() as playwright:
         options = {"headless": True}
+        if executable:
+            options["executable_path"] = executable
         browser = await playwright.chromium.launch(**options)
         context = await browser.new_context(service_workers="block", accept_downloads=False)
         async def guard(route):
@@ -179,13 +140,7 @@ async def main():
             allowed = (origin_key(request.url) == selected_origin and request.method in ("GET", "HEAD")
                        and parts.username is None and parts.password is None)
             if allowed:
-                try:
-                    response = await request_http(request.url, request.method, await request.all_headers())
-                    headers = {k: v for k, v in response["headers"].items()
-                               if k.lower() not in {"connection", "transfer-encoding", "content-length"}}
-                    await route.fulfill(status=response["status"], headers=headers, body=response["body"])
-                except Exception:
-                    await route.abort()
+                await route.continue_()
             else:
                 await route.abort()
         await context.route("**/*", guard)
@@ -199,13 +154,14 @@ async def main():
             """GET a URL within the target origin and return its response text."""
             if not _same_origin(url):
                 raise ValueError("get_text is restricted to the target origin " + target_origin)
-            response = await request_http(url)
-            return response["body"].decode("utf-8", errors="replace")
+            response = await context.request.get(url, max_redirects=0)
+            return await response.text()
         async def get_json(url):
             """GET a URL within the target origin and return parsed JSON."""
             if not _same_origin(url):
                 raise ValueError("get_json is restricted to the target origin " + target_origin)
-            return json.loads(await get_text(url))
+            response = await context.request.get(url, max_redirects=0)
+            return await response.json()
         async def goto_and_render(url, timeout=15000, settle_ms=1200):
             """Navigate within the target origin and let the SPA route render.
 
@@ -222,10 +178,10 @@ async def main():
             non-JSON: status, ok, content type, length, a body snippet, and parsed json or a parse_error."""
             if not _same_origin(url):
                 raise ValueError("http_get is restricted to the target origin " + target_origin)
-            response = await request_http(url)
-            body = response["body"].decode("utf-8", errors="replace")
-            ctype = next((v for k, v in response["headers"].items() if k.lower() == "content-type"), "")
-            result = {"url": url, "status": response["status"], "ok": 200 <= response["status"] < 300,
+            response = await context.request.get(url, max_redirects=0)
+            body = await response.text()
+            ctype = response.headers.get("content-type", "")
+            result = {"url": url, "status": response.status, "ok": response.ok,
                       "content_type": ctype, "length": len(body), "body": body[:2000]}
             if "json" in ctype:
                 try:
@@ -318,19 +274,21 @@ async def main():
                         "baseline_sample_stable": stable},
                     "scope": "Visible result count and first five text samples only; empty samples may mean a wrong selector. Not vulnerability confirmation.",
                     "samples": samples}
+
+
         helpers = {"get_text": get_text, "get_json": get_json, "http_get": http_get,
                    "goto_and_render": goto_and_render, "list_inputs": list_inputs,
                    "submit_input": submit_input, "compare_inputs": compare_inputs, "target_origin": target_origin}
         send(sock, {"type": "ready"})
+        buffer = b""
         try:
             while True:
-                message = await inbox.get()
+                message, buffer = await asyncio.to_thread(recv, sock, buffer)
                 if message.get("type") == "stop":
                     break
                 if message.get("type") != "execute":
                     continue
                 exec_id = message["exec_id"]
-                execution["id"] = exec_id
                 source = Path(message["path"])
                 limit = message.get("timeout")
                 timed_out = False
@@ -381,7 +339,6 @@ async def main():
                             exit_code = 1
                         out.flush()
                         err.flush()
-                execution["id"] = None
                 send(sock, {"type": "result", "exec_id": exec_id, "exit_code": exit_code,
                             "timed_out": timed_out, "exception": detail[-4000:],
                             "failure_source": failure_source, "cause_code": cause_code,
@@ -414,7 +371,6 @@ class ExecutionResult:
     cause_code: str | None = None
     exception_type: str | None = None
     retryable: bool | None = None
-    http_evidence: list[dict] = field(default_factory=list)
 
 
 class CommandRuntime:
@@ -429,7 +385,8 @@ class CommandRuntime:
         self._jobs: dict[int, object] = {}
         self._worker: subprocess.Popen | None = None
         self._browser_procs: dict[int, float] = {}
-        self._conn = None
+        self._conn: socket.socket | None = None
+        self._control_buffer = b""
         self._active_exec_id: str | None = None
         self._call_by_exec: dict[str, str] = {}
         self._output: dict[str, dict] = {}
@@ -438,19 +395,20 @@ class CommandRuntime:
         self._exec_counter = 0
         self._browser_enabled = False
         self.target = "http://127.0.0.1:3000/"
-        self._control_queue = queue.Queue()
-        self._containers = set(log.metadata.get("sandbox_containers", []))
-        self._evidence = None
 
     def _check_run(self, run_id: str) -> None:
         if validate_run_id(run_id) != self.run_id:
             raise ValueError("Runtime belongs to another run")
 
     def _environment(self) -> dict:
-        # Only the trusted Docker CLI receives host settings; no host environment is passed to its container.
-        return {key: value for key, value in os.environ.items() if key in {
-            'PATH', 'HOME', 'USERPROFILE', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR',
-            'DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH'}}
+        env = dict(os.environ)
+        env.pop("OPENROUTER_API_KEY", None)
+        temporary = self.runtime_dir / "tmp"
+        env.update({"TEMP": str(temporary), "TMP": str(temporary), "TMPDIR": str(temporary),
+                    "PIP_CACHE_DIR": str(temporary / "pip-cache"),
+                    "PYTHONPYCACHEPREFIX": str(temporary / "pycache"),
+                    "npm_config_cache": str(temporary / "npm-cache")})
+        return env
 
     def start_session(self, run_id: str, *, target: str = "http://127.0.0.1:3000/", browser: bool = True) -> None:
         self._check_run(run_id)
@@ -458,7 +416,6 @@ class CommandRuntime:
             if self.runtime_dir.exists():
                 raise RuntimeError("Runtime already exists")
             self.target = target
-            self._evidence = EvidenceBroker(target, self.log)
             self.log.update(runtime_path=str(self.runtime_dir), runtime_creation_intent=True)
             for folder in ("tools", "work", "tmp", "deps", "browser"):
                 (self.runtime_dir / folder).mkdir(parents=True, exist_ok=True)
@@ -591,49 +548,26 @@ class CommandRuntime:
         self._browser_procs.clear()
 
     def _start_browser_worker(self) -> None:
-        self._remove_containers()
         worker_path = self.runtime_dir / "tools" / "_browser_worker.py"
-        with open_beneath(self.runtime_dir, "tools/_browser_worker.py", os.O_WRONLY | os.O_CREAT | os.O_TRUNC) as descriptor:
-            with os.fdopen(descriptor, 'w', encoding='utf-8', closefd=False) as stream:
-                stream.write(WORKER_SOURCE)
+        worker_path.write_text(WORKER_SOURCE, encoding="utf-8")
         token = uuid.uuid4().hex
-        name = f"agent-{self.run_id}-browser-{uuid.uuid4().hex[:8]}"
-        args = sandbox_command(name, self.run_id, self.runtime_dir,
-                               ["python", "-u", "/work/tools/_browser_worker.py", token, self.target])
-        args = self._prepare_container(name, args)
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        server.settimeout(20)
+        executable = installed_chromium() or ""
+        args = [self.python, "-u", str(worker_path), "127.0.0.1", str(server.getsockname()[1]),
+                token, self.target, str(Path(__file__).resolve().parent), executable]
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         process = subprocess.Popen(args, cwd=self.runtime_dir, env=self._environment(),
-                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    creationflags=flags, bufsize=0)
         self._worker = process
         self._register(process, "browser_worker")
-        self._start_output_readers(process, "", channels=("stderr",))
-        self._conn = process.stdin
-        messages = self._control_queue = queue.Queue(maxsize=128)
-        def read_control():
-            try:
-                while True:
-                    line = process.stdout.readline(12_000_001)
-                    if not line or len(line) > 12_000_000:
-                        break
-                    try:
-                        message = json.loads(line)
-                    except (ValueError, UnicodeError):
-                        message = {"type": "protocol_error"}
-                    try:
-                        messages.put_nowait(message)
-                    except queue.Full:
-                        break
-            finally:
-                process.stdout.close()
-                try:
-                    messages.put_nowait({"type": "disconnected"})
-                except queue.Full:
-                    pass
-        reader = threading.Thread(target=read_control, daemon=True)
-        reader.start()
-        self._output_threads.append(reader)
+        self._start_output_readers(process, "")
         try:
+            conn, _ = server.accept()
+            self._conn = conn
             hello = self._wait_control(5)
             if hello.get("type") != "hello" or hello.get("token") != token:
                 raise RuntimeError("Browser worker handshake failed")
@@ -647,31 +581,13 @@ class CommandRuntime:
             self._unregister(process)
             self._worker = None
             raise
-
-    def _track_container(self, name: str) -> None:
-        self._containers.add(name)
-        self.log.update(sandbox_containers=sorted(self._containers))
-        self.log.append("sandbox_created", {"container": name})
-
-    def _prepare_container(self, name: str, create_command: list[str]) -> list[str]:
-        self._track_container(name)
-        # Create before attaching, so cancelling a client cannot race a still-starting container.
-        subprocess.run(create_command, check=True, capture_output=True, env=self._environment(), timeout=30)
-        return [create_command[0], 'start', '--attach', '--interactive', name]
-
-    def _remove_containers(self, *, record=True) -> None:
-        for name in list(self._containers):
-            remove_container(name, self.run_id)
-            self._containers.remove(name)
-            if record:
-                self.log.update(sandbox_containers=sorted(self._containers))
-                self.log.append("sandbox_removed", {"container": name})
+        finally:
+            server.close()
 
     def _send_control(self, message: dict) -> None:
         if self._conn is None:
             raise RuntimeError("Browser worker is unavailable")
-        self._conn.write((json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8"))
-        self._conn.flush()
+        self._conn.sendall((json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8"))
 
     def _wait_control(self, timeout: float, on_poll=None) -> dict:
         if self._conn is None:
@@ -680,32 +596,20 @@ class CommandRuntime:
         while True:
             if on_poll is not None:
                 on_poll()
+            if b"\n" in self._control_buffer:
+                line, self._control_buffer = self._control_buffer.split(b"\n", 1)
+                return json.loads(line)
             if self._cancel.is_set():
                 raise InterruptedError("Execution cancelled")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Browser code timed out")
-            try:
-                message = self._control_queue.get(timeout=min(0.1, remaining))
-            except queue.Empty:
-                continue
-            if not isinstance(message, dict) or message.get("type") in {"protocol_error", "disconnected"}:
-                raise RuntimeError("Browser worker protocol failed")
-            if message.get("type") != "http_request":
-                return message
-            try:
-                if message.get("exec_id") != self._active_exec_id or type(message.get("request_id")) is not int:
-                    raise ValueError("Stale or invalid HTTP execution identity")
-                if not isinstance(message.get("headers", {}), dict):
-                    raise ValueError("Invalid HTTP request headers")
-                response = self._evidence.fetch(message.get("method"), message.get("url"),
-                                                message.get("headers"), timeout=remaining)
-                response["body"] = base64.b64encode(response["body"]).decode("ascii")
-                self._send_control({"type": "http_response", "request_id": message["request_id"], **response})
-            except LogFailure:
-                raise
-            except (OSError, ValueError, TypeError) as exc:
-                self._send_control({"type": "http_response", "request_id": message.get("request_id"), "error": str(exc)[:200]})
+            readable, _, _ = select.select([self._conn], [], [], min(0.1, remaining))
+            if readable:
+                chunk = self._conn.recv(65536)
+                if not chunk:
+                    raise RuntimeError("Browser worker exited")
+                self._control_buffer += chunk
 
     def _add_output(self, exec_id: str, channel: str, chunk: str) -> None:
         with self._lock:
@@ -726,9 +630,9 @@ class CommandRuntime:
             if len(prior) + len(chunk) > 65536:
                 record["truncated"] = True
 
-    def _start_output_readers(self, process: subprocess.Popen, exec_id: str, channels=("stdout", "stderr")) -> list[threading.Thread]:
+    def _start_output_readers(self, process: subprocess.Popen, exec_id: str) -> list[threading.Thread]:
         threads = []
-        for channel in channels:
+        for channel in ("stdout", "stderr"):
             pipe = getattr(process, channel)
             def read_output(stream=pipe, name=channel):
                 try:
@@ -751,13 +655,16 @@ class CommandRuntime:
         resolved = target.resolve(strict=False)
         if not resolved.is_relative_to(self.runtime_dir) or target.is_symlink():
             raise ValueError("File path escapes runtime")
+        if writing:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.parent.resolve().is_relative_to(self.runtime_dir):
+                raise ValueError("File path escapes runtime")
         return target
 
     def _tail_python_output(self, paths: dict, offsets: dict, decoders: dict,
                             exec_id: str, *, final: bool = False) -> None:
         for channel, path in paths.items():
-            with open_beneath(self.runtime_dir, path.relative_to(self.runtime_dir).as_posix()) as descriptor, \
-                    os.fdopen(descriptor, "rb", closefd=False) as stream:
+            with path.open("rb") as stream:
                 stream.seek(offsets[channel])
                 while True:
                     data = stream.read(65536)
@@ -773,9 +680,7 @@ class CommandRuntime:
                     self._add_output(exec_id, channel, remaining)
 
     def _run_command(self, command: str, exec_id: str, timeout: float) -> int:
-        name = f"agent-{self.run_id}-{exec_id.lower()}"
-        shell = sandbox_command(name, self.run_id, self.runtime_dir, ["/bin/sh", "-c", command])
-        shell = self._prepare_container(name, shell)
+        shell = ["cmd.exe", "/D", "/S", "/C", command] if os.name == "nt" else ["/bin/sh", "-c", command]
         process = subprocess.Popen(shell, cwd=self.runtime_dir, env=self._environment(),
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), bufsize=0)
@@ -801,10 +706,6 @@ class CommandRuntime:
             for thread in threads:
                 thread.join(timeout=2)
             self._unregister(process)
-            remove_container(name, self.run_id)
-            self._containers.discard(name)
-            self.log.update(sandbox_containers=sorted(self._containers))
-            self.log.append("sandbox_removed", {"container": name})
 
     def run(self, run_id: str, command: dict, *, call_id: str = "", timeout: float = 30,
             on_output=None) -> ExecutionResult:
@@ -820,19 +721,14 @@ class CommandRuntime:
         stage = "input"
         began = time.monotonic()
         self._call_by_exec[exec_id] = call_id
-        self._active_exec_id = exec_id
         self.log.append("exec_started", {"exec_id": exec_id, "call_id": call_id, "action": action,
                                          "cwd": str(self.runtime_dir)})
-        if self._evidence is not None:
-            self._evidence.begin(exec_id, call_id)
         try:
             if action == "read_file":
                 stage = "file_api"
                 path = self._file_path(command["path"], writing=False)
                 result.path = str(path)
-                with open_beneath(self.runtime_dir, command['path']) as descriptor, \
-                        os.fdopen(descriptor, 'r', encoding='utf-8', closefd=False) as stream:
-                    result.stdout = stream.read(65536)
+                result.stdout = path.read_text(encoding="utf-8")[:65536]
                 result.exit_code = 0
             elif action == "write_file":
                 stage = "file_api"
@@ -841,13 +737,9 @@ class CommandRuntime:
                 content = command["content"]
                 if not isinstance(content, str) or len(content.encode("utf-8")) > 2_000_000:
                     raise ValueError("Invalid file content")
-                with open_beneath(self.runtime_dir, command['path'], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, parents=True) as descriptor, \
-                        os.fdopen(descriptor, 'w', encoding='utf-8', closefd=False) as stream:
-                    stream.write(content)
-                    stream.flush()
-                    written_bytes = os.fstat(descriptor).st_size
+                path.write_text(content, encoding="utf-8")
                 self.log.append("file_changed", {"exec_id": exec_id, "call_id": call_id,
-                                                  "path": command["path"], "change": "write", "bytes": written_bytes})
+                                                  "path": command["path"], "change": "write", "bytes": path.stat().st_size})
                 result.exit_code = 0
             elif action == "run_command":
                 script = command["command"]
@@ -877,6 +769,7 @@ class CommandRuntime:
                         except OSError:
                             pass
                         self._conn = None
+                    self._control_buffer = b""
                     self.log.append("browser_respawn", {"exec_id": exec_id, "reason": "worker_unavailable"})
                     self._start_browser_worker()
                 stage = "input"
@@ -885,9 +778,7 @@ class CommandRuntime:
                     raise ValueError("Python code required")
                 stage = "executor"
                 source = self.runtime_dir / "tools" / f"{exec_id}.py"
-                with open_beneath(self.runtime_dir, f'tools/{exec_id}.py', os.O_WRONLY | os.O_CREAT | os.O_TRUNC) as descriptor, \
-                        os.fdopen(descriptor, 'w', encoding='utf-8', closefd=False) as stream:
-                    stream.write(code)
+                source.write_text(code, encoding="utf-8")
                 snapshot = self.log.preserve_bytes(f"code/{exec_id}.py", code.encode("utf-8"))
                 result.artifact_path = snapshot["path"]
                 result.path = str(source)
@@ -903,14 +794,13 @@ class CommandRuntime:
                 else:
                     paths = {name: self.runtime_dir / "tmp" / f"{exec_id}.{name}" for name in ("stdout", "stderr")}
                     for path in paths.values():
-                        with open_beneath(self.runtime_dir, path.relative_to(self.runtime_dir).as_posix(), os.O_WRONLY | os.O_CREAT):
-                            pass
+                        path.touch()
                     offsets = {name: 0 for name in paths}
                     decoders = {name: codecs.getincrementaldecoder("utf-8")("replace") for name in paths}
                     def poll_output():
                         self._tail_python_output(paths, offsets, decoders, exec_id)
-                    self._send_control({"type": "execute", "exec_id": exec_id, "path": f"/work/tools/{source.name}",
-                                        "stdout_path": f"/work/tmp/{paths['stdout'].name}", "stderr_path": f"/work/tmp/{paths['stderr'].name}",
+                    self._send_control({"type": "execute", "exec_id": exec_id, "path": str(source),
+                                        "stdout_path": str(paths["stdout"]), "stderr_path": str(paths["stderr"]),
                                         "timeout": timeout})
                     # The worker cancels the code at `timeout` and reports back; give it extra grace
                     # so we only hard-kill (and lose the browser) when the worker is truly unresponsive.
@@ -966,8 +856,6 @@ class CommandRuntime:
             result.retryable = True
         finally:
             self._active_exec_id = None
-            if self._evidence is not None:
-                result.http_evidence = self._evidence.end(exec_id)
             output = self._output.pop(exec_id, {})
             result.stdout = result.stdout or output.get("stdout", "")
             result.stderr = output.get("stderr", "")
@@ -999,10 +887,6 @@ class CommandRuntime:
             except subprocess.TimeoutExpired:
                 pass
         errors = []
-        try:
-            self._remove_containers(record=record and not self.log.failed)
-        except Exception as exc:
-            errors.append(exc)
         for pid, record in list(self._owned.items()):
             try:
                 if pid in self._jobs:
@@ -1096,7 +980,7 @@ class CommandRuntime:
 
     def destroy(self, run_id: str, timeout: float = 10) -> None:
         self._check_run(run_id)
-        if self._owned or self._containers:
+        if self._owned:
             raise RuntimeError("Managed processes remain")
         expected = self.log.run_dir / "runtime"
         if self.runtime_dir != expected or self.runtime_dir.resolve() != expected.absolute():
@@ -1120,5 +1004,4 @@ class CommandRuntime:
         self._check_run(run_id)
         return {"runtime_exists": self.runtime_dir.exists(),
                 "managed_processes": list(self._owned.values()),
-                "sandbox_containers": sorted(self._containers),
                 "browser_alive": self._worker is not None and self._worker.poll() is None}
