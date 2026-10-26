@@ -476,6 +476,26 @@ function showTab(name){
   if(name==='evidence')loadEvidenceFiles();
 }
 
+let scoreShownKey='';
+async function loadScore(state){
+  const panel=$('scorePanel'), id=state.run_id;
+  if(!id||!state.run_result){panel.hidden=true;return;}   // 스코어는 종료 후 집계
+  const key=`${id}:${state.run_result}:${(state.findings||[]).length}`;
+  if(key===scoreShownKey)return;                           // 같은 상태면 재요청하지 않음
+  try{
+    const s=await jsonRequest(`/api/runs/${id}/score`);
+    const cost=s.cost_usd==null?'—':`$${Number(s.cost_usd).toFixed(4)}`;
+    const cards=$('scoreCards'); cards.replaceChildren();
+    for(const [label,value] of [['점수',s.score],['증거',s.evidence],['실패',s.failed],
+        ['반복',s.repeats],['압축',s.compactions],['비용',cost]]){
+      const card=document.createElement('div');
+      card.append(textNode('strong',value),textNode('p',label,'field-note'));
+      cards.append(card);
+    }
+    panel.hidden=false; scoreShownKey=key;
+  }catch(_){panel.hidden=true;}
+}
+
 function renderRunHeader(state){
   currentRun=state; setText('runGoal',state.goal||'목표 기록 없음'); setText('runModel',state.model||'—'); setText('runId',runId);
   const provider=state.model?.startsWith('openrouter:')?'openrouter':'ollama';
@@ -502,6 +522,7 @@ function renderRunHeader(state){
   setText('settingsValue',JSON.stringify({run_id:state.run_id,target:state.target,goal:state.goal,model:state.model,
     model_settings:state.model_settings,budgets:state.budgets,scenario_source:state.scenario_source,chain_mode:state.chain_mode},null,2));
   renderAgentStatus();
+  loadScore(state);
   $('exportLink').href=`/api/runs/${runId}/export`;
   if(!state.live_available&&stream){stream.close();stream=null;setText('connectionStatus','저장 기록');refreshEvents();}
   if(!state.live_available&&!stream)setText('connectionStatus','저장 기록');

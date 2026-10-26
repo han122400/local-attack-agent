@@ -28,6 +28,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.concurrency import run_in_threadpool
 
+import scorecard
+
 
 TARGET = "http://127.0.0.1:3000/"
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
@@ -708,6 +710,13 @@ def run_state(run_id: str) -> JSONResponse:
     return JSONResponse({**state, "live_available": live_available(run_id),
                          "runtime_exists": (EXPLORER.store.root / run_id / "runtime").is_dir()},
                         headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/runs/{run_id}/score")
+def run_score(run_id: str) -> JSONResponse:
+    state = existing_run(run_id)
+    run_dir = EXPLORER.store.root / validate_run_id(run_id)
+    return JSONResponse(scorecard.score_run(state, run_dir), headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/runs/{run_id}/events")
