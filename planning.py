@@ -50,6 +50,33 @@ SYSTEM_PROMPT_VERSION = "v4"
 SYSTEM_PROMPT = (Path(__file__).resolve().parent / "prompts" / "system"
                  / f"{SYSTEM_PROMPT_VERSION}.txt").read_text(encoding="utf-8")
 SYSTEM_PROMPT_SHA256 = sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+def available_prompt_versions() -> list[str]:
+    prompt_dir = Path(__file__).resolve().parent / "prompts" / "system"
+
+    return sorted(
+        file.stem
+        for file in prompt_dir.glob("*.txt")
+        if file.is_file()
+    )
+
+
+def load_prompt(version: str) -> tuple[str, str]:
+    if version not in available_prompt_versions():
+        raise ValueError(f"Unknown prompt version: {version}")
+
+    prompt_path = (
+        Path(__file__).resolve().parent
+        / "prompts"
+        / "system"
+        / f"{version}.txt"
+    )
+
+    system_prompt = prompt_path.read_text(encoding="utf-8")
+    system_prompt_sha256 = sha256(
+        system_prompt.encode("utf-8")
+    ).hexdigest()
+
+    return system_prompt, system_prompt_sha256
 
 
 @dataclass(frozen=True)
