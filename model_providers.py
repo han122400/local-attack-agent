@@ -174,6 +174,9 @@ def _request_payload(payload: dict, info: dict) -> dict:
         request["provider"]["require_parameters"] = True
     elif "response_format" in supported:
         request["response_format"] = {"type": "json_object"}
+    # Ask OpenRouter to return the actual billed cost (per the chosen provider and any caching) in the
+    # final usage object, so per-run cost is exact rather than a token*price estimate for a guessed provider.
+    request["usage"] = {"include": True}
     return request
 
 
@@ -215,6 +218,8 @@ def openrouter_stream(payload: dict):
                     for source, destination in (("prompt_tokens", "prompt_eval_count"), ("completion_tokens", "eval_count")):
                         if usage.get(source) is not None:
                             completion[destination] = usage[source]
+                    if usage.get("cost") is not None:
+                        completion["cost"] = usage["cost"]
                     for choice in chunk.get("choices") or []:
                         if choice.get("index", 0) != 0:
                             continue

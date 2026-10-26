@@ -63,6 +63,7 @@ class Harness:
         self.stop_requested = stop_requested or (lambda: False)
         self.calls = 0
         self.last_prompt_tokens = None   # prompt_eval_count of the most recent model call (real num_ctx usage)
+        self.total_cost = 0.0            # summed OpenRouter billed cost (USD) across this run's calls
         self.output_num_predict_floor = None   # raised, persisted output budget after a length-truncation
 
     def decide(self, run_id: str, context: dict, *, model: str, settings: dict,
@@ -120,13 +121,15 @@ class Harness:
                     if chunk.get("done"):
                         completion = {key: chunk[key] for key in (
                             "done_reason", "eval_count", "prompt_eval_count", "total_duration",
-                            "eval_duration", "prompt_eval_duration", "load_duration") if key in chunk}
+                            "eval_duration", "prompt_eval_duration", "load_duration", "cost") if key in chunk}
                 raw = "".join(content)
                 self.log.append("model_response", {"call_id": call_id, "output": raw,
                                                    "thinking": "".join(thinking),
                                                    "elapsed": round(time.monotonic() - started, 3), **completion})
                 if completion.get("prompt_eval_count") is not None:
                     self.last_prompt_tokens = completion["prompt_eval_count"]
+                if completion.get("cost") is not None:
+                    self.total_cost += completion["cost"]
                 if completion.get("done_reason") == "length":
                     limit = payload["options"].get("num_predict", "model default")
                     raise ModelFailure("output_limit", f"Model reached the output limit (num_predict={limit}, "

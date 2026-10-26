@@ -283,9 +283,11 @@ class ExplorerV3:
             dropped = min(len(history), 30) - window
             if dropped > 0:
                 log.append("context_compacted", {"dropped": dropped, "kept_steps": window, "chars": context_chars})
-            # Expose both the char budget (pre-call proxy) and the real token usage of the last call.
+            # Expose both the char budget (pre-call proxy) and the real token usage of the last call,
+            # plus the accumulated OpenRouter billed cost (USD; 0 for local Ollama runs).
             usage = {"context_chars": context_chars, "context_budget": budget,
-                     "prompt_tokens": harness.last_prompt_tokens, "num_ctx": num_ctx}
+                     "prompt_tokens": harness.last_prompt_tokens, "num_ctx": num_ctx,
+                     "cost_usd": round(harness.total_cost, 6)}
             self._recent_state.update(**usage)
             log.update(**usage)
             if history and history[-1].get("repeat_of"):
