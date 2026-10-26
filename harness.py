@@ -10,7 +10,8 @@ import httpx2 as httpx
 
 from model_settings import validate_model_settings
 from model_providers import OpenRouterError, is_openrouter, openrouter_stream, strip_tool_call_framing
-from planning import COMMAND_SCHEMA, SYSTEM_PROMPT, Command, normalize_command_inputs, validate_command
+from planning import (COMMAND_SCHEMA, SYSTEM_PROMPT, SYSTEM_PROMPT_SHA256, SYSTEM_PROMPT_VERSION,
+                      Command, normalize_command_inputs, validate_command)
 from session_log import SessionLog
 
 
@@ -99,7 +100,9 @@ class Harness:
             call_id = f"CALL-{self.calls:04d}"
             started = time.monotonic()
             self.log.append("model_request", {"call_id": call_id, "input": payload,
-                                              "settings": selected, "attempt": self.calls})
+                                              "settings": selected, "attempt": self.calls,
+                                              "system_prompt_version": SYSTEM_PROMPT_VERSION,
+                                              "system_prompt_sha256": SYSTEM_PROMPT_SHA256})
             content: list[str] = []
             thinking: list[str] = []
             completion: dict = {}

@@ -122,6 +122,12 @@ async def main():
     sock.settimeout(None)
     send(sock, {"type": "hello", "token": token})
     target_parts = urlsplit(target)
+    def origin_key(url):
+        parts = urlsplit(url)
+        hostname = (parts.hostname or "").encode("idna").decode("ascii")
+        port = parts.port if parts.port is not None else {"http": 80, "https": 443}.get(parts.scheme)
+        return parts.scheme, hostname, port
+    selected_origin = origin_key(target)
     async with async_playwright() as playwright:
         options = {"headless": True}
         if executable:
@@ -131,8 +137,7 @@ async def main():
         async def guard(route):
             request = route.request
             parts = urlsplit(request.url)
-            allowed = (parts.scheme == target_parts.scheme and parts.hostname == target_parts.hostname
-                       and parts.port == target_parts.port and request.method in ("GET", "HEAD")
+            allowed = (origin_key(request.url) == selected_origin and request.method in ("GET", "HEAD")
                        and parts.username is None and parts.password is None)
             if allowed:
                 await route.continue_()
@@ -143,19 +148,19 @@ async def main():
         target_origin = target_parts.scheme + "://" + target_parts.netloc
         def _same_origin(url):
             p = urlsplit(url)
-            return (p.scheme == target_parts.scheme and p.hostname == target_parts.hostname
-                    and p.port == target_parts.port)
+            return (origin_key(url) == selected_origin
+                    and p.username is None and p.password is None)
         async def get_text(url):
             """GET a URL within the target origin and return its response text."""
             if not _same_origin(url):
                 raise ValueError("get_text is restricted to the target origin " + target_origin)
-            response = await context.request.get(url)
+            response = await context.request.get(url, max_redirects=0)
             return await response.text()
         async def get_json(url):
             """GET a URL within the target origin and return parsed JSON."""
             if not _same_origin(url):
                 raise ValueError("get_json is restricted to the target origin " + target_origin)
-            response = await context.request.get(url)
+            response = await context.request.get(url, max_redirects=0)
             return await response.json()
         async def goto_and_render(url, timeout=15000, settle_ms=1200):
             """Navigate within the target origin and let the SPA route render.
@@ -173,7 +178,7 @@ async def main():
             non-JSON: status, ok, content type, length, a body snippet, and parsed json or a parse_error."""
             if not _same_origin(url):
                 raise ValueError("http_get is restricted to the target origin " + target_origin)
-            response = await context.request.get(url)
+            response = await context.request.get(url, max_redirects=0)
             body = await response.text()
             ctype = response.headers.get("content-type", "")
             result = {"url": url, "status": response.status, "ok": response.ok,

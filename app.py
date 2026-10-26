@@ -454,7 +454,7 @@ class Explorer:
         return ({"api": 0, "page": 1, "form": 1, "route": 2, "script": 3}.get(kind, 4), 0 if url.endswith("main.js") else 1)
 
 
-from explorer import ExplorerV3  # noqa: E402 - v1 helpers above remain for unrelated regression tests.
+from explorer import ExplorerV3, safe_target  # noqa: E402 - v1 helpers above remain for unrelated regression tests.
 from lab import get_status as get_lab_status, start_lab
 from model_settings import settings_schema, validate_model_settings, model_presets
 from model_providers import get_openrouter_models, is_openrouter, openrouter_model
@@ -614,7 +614,7 @@ async def start(request: Request) -> dict:
         body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
         if not isinstance(body, dict):
             raise ValueError("실험 설정은 JSON 객체여야 합니다.")
-        target = body.get("target", TARGET)
+        target = safe_target(body.get("target", TARGET))
         model = body.get("model", MODEL)
         goal = body.get("goal", "")
         if not isinstance(goal, str) or not goal.strip():

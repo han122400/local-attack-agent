@@ -6,7 +6,7 @@
   <title>Juice Explorer · 로컬 실험</title>
   <link rel="stylesheet" href="/style.css?v=3-model-prices">
   <script src="/model-settings-config.js?v=1-provider-settings" defer></script>
-  <script src="/app.js?v=3-provider-settings" defer></script>
+  <script src="/app.js?v=4-target-selection" defer></script>
 </head>
 <body>
   <button id="menuToggle" class="menu-toggle" type="button" aria-controls="sidebar" aria-expanded="false">☰ 메뉴</button>
@@ -21,13 +21,13 @@
       <div class="side-status">
         <p><span id="sideOllamaLabel">Ollama</span><strong id="sideOllama">확인 중</strong></p>
         <p id="sideProviderRow" hidden><span id="sideProviderLabel">OpenRouter</span><strong id="sideProviderStatus">확인 중</strong></p>
-        <p><span>Juice Shop</span><strong id="sideLab">확인 중</strong></p>
+        <p><span id="sideTargetLabel">Juice Shop</span><strong id="sideLab">확인 중</strong></p>
         <small id="sideChecked">상태 확인 전</small>
       </div>
     </aside>
 
     <main id="mainView" class="content" hidden>
-      <header class="page-head"><p class="eyebrow">LOCAL EXPERIMENT</p><h1 id="mainHeading">새 실험</h1><p id="mainLead">모델과 목표를 정하고 로컬 Juice Shop 탐색을 시작합니다.</p></header>
+      <header class="page-head"><p class="eyebrow">LOCAL EXPERIMENT</p><h1 id="mainHeading">새 실험</h1><p id="mainLead">모델, 대상 URL과 목표를 정하고 탐색을 시작합니다.</p></header>
       <section id="setupSection" class="main-stack">
         <div id="startNotice" class="notice" role="status" aria-live="polite">준비 상태를 확인하고 있습니다.</div>
         <a id="activeRunBanner" class="active-banner" href="/" hidden>진행 중인 실험으로 이동</a>
@@ -60,10 +60,11 @@
           <p id="modelStatus" class="field-note">설치된 모델을 읽고 있습니다.</p>
           <h2>실험 설정</h2>
           <div class="form-grid">
-            <label>대상 URL<input id="targetInput" type="url" value="http://127.0.0.1:3000/" readonly></label>
+            <label>대상 URL<input id="targetInput" type="url" value="http://127.0.0.1:3000/" maxlength="2048" required aria-describedby="targetHelp"></label>
             <label>시나리오 소스<select id="scenarioSelect"><option value="manual">수동 목표</option><option value="auto" disabled>자동 생성 · 준비 중</option></select></label>
             <label>세션 체인<select id="chainSelect"><option value="none">단일 세션</option><option value="campaign" disabled>캠페인 · 준비 중</option></select></label>
           </div>
+          <p id="targetHelp" class="field-note">본인이 소유하거나 탐색 권한이 있는 사이트의 HTTP(S) 주소를 입력하세요. Juice Shop 외 사이트는 자동 초기화하지 않습니다.</p>
           <p class="field-note">자동 시나리오와 캠페인 체인은 준비 중입니다. 현재 수동 목표·단일 세션만 실행합니다.</p>
           <label for="goalInput">탐색 목표</label>
           <div id="goalSuggestions" class="goal-suggestions" role="group" aria-label="탐색 목표 자동완성">
@@ -95,7 +96,7 @@
           <div class="form-actions"><button id="startButton" class="button primary" type="submit" disabled>실험 시작</button><button id="saveInputsButton" class="button secondary" type="button">설정 저장</button><span id="saveStatus" class="field-note" role="status" aria-live="polite"></span><span id="startError" class="error-text" role="alert"></span></div>
         </form>
         <section class="panel"><div class="section-head"><h2>준비 상태</h2><div class="inline-controls"><button id="labStartButton" class="button secondary" type="button" hidden>실습환경 켜기</button><button id="refreshReadinessButton" class="button secondary" type="button">상태 새로고침</button></div></div>
-          <div class="readiness-grid"><div><strong id="readinessProviderLabel">Ollama</strong><p id="ollamaReadiness">확인 중</p></div><div><strong>Juice Shop</strong><p id="labReadiness">확인 중</p></div></div>
+          <div class="readiness-grid"><div><strong id="readinessProviderLabel">Ollama</strong><p id="ollamaReadiness">확인 중</p></div><div><strong id="readinessTargetLabel">Juice Shop</strong><p id="labReadiness">확인 중</p></div></div>
           <details id="processorDetails"><summary>모델 CPU / GPU 배치</summary><p class="field-note">메모리 배치 비율입니다. GPU 연산 사용률과는 다릅니다.</p><div id="processorList">확인 중</div></details>
         </section>
         <section class="panel"><div class="section-head"><h2>최근 실험</h2><a href="/?view=history">전체 기록 보기</a></div><div id="recentRuns" class="run-list"></div></section>
@@ -105,7 +106,7 @@
 
     <main id="runView" class="content run-content" hidden>
       <header class="page-head run-head"><p class="eyebrow">LIVE INVESTIGATION</p><h1>실험 관찰</h1><p id="runGoal" class="run-goal">실험 기록</p>
-        <div class="run-meta"><span>모델 <strong id="runModel">—</strong></span><span>run_id <code id="runId">—</code></span><span>경과 <strong id="runElapsed">—</strong></span></div>
+        <div class="run-meta"><span>모델 <strong id="runModel">—</strong></span><span>대상 <strong id="runTarget">—</strong></span><span>run_id <code id="runId">—</code></span><span>경과 <strong id="runElapsed">—</strong></span></div>
         <div class="context-bar" id="contextBar" hidden title="모델에 전달되는 컨텍스트 크기(문자 예산 대비). 넘치면 오래된 기억을 압축합니다."><span class="context-bar-label">컨텍스트</span><div class="context-bar-track"><div class="context-bar-fill" id="contextBarFill"></div></div><span id="contextBarText" class="context-bar-text">—</span></div>
         <div class="run-controls"><span id="runStatus" class="status-badge">확인 중</span><span id="connectionStatus">저장 기록 조회 중</span><button id="stopButton" class="button secondary" type="button" hidden>중단</button><button id="recoverButton" class="button secondary" type="button" hidden>복구 재시도</button></div>
         <p id="runError" class="error-text" role="alert"></p>
