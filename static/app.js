@@ -4,7 +4,7 @@ const runId = runMatch ? runMatch[1] : null;
 const historyMode = !runId && new URLSearchParams(location.search).get('view') === 'history';
 const validRunId = value => /^[0-9a-f]{32}$/.test(String(value || ''));
 const dateText = value => value ? new Date(value * 1000).toLocaleString('ko-KR') : '—';
-const statusText = value => ({preparing:'준비 중',running:'탐색 중',stopping:'중단 중',finalizing:'정리 중',resetting:'환경 초기화 중',finished:'종료',recovery_required:'복구 필요',completed:'관찰 수집 완료',inconclusive:'증거 부족 · 판단 보류',stopped:'중단됨',timed_out:'시간 초과',error:'오류',succeeded:'완료',not_applicable:'해당 없음',pending:'대기',failed:'실패',preserved:'보존됨',finalized:'확정됨',collecting:'수집 중'})[value] || value || '확인 중';
+const statusText = value => ({preparing:'준비 중',running:'탐색 중',stopping:'중단 중',finalizing:'정리 중',resetting:'환경 초기화 중',finished:'종료',recovery_required:'복구 필요',completed:'완료',stopped:'중단됨',timed_out:'시간 초과',error:'오류',succeeded:'완료',not_applicable:'해당 없음',pending:'대기',failed:'실패',preserved:'보존됨',finalized:'확정됨',collecting:'수집 중'})[value] || value || '확인 중';
 const textNode = (tag, value, className='') => { const item=document.createElement(tag); item.textContent=String(value ?? ''); if(className)item.className=className; return item; };
 const setText = (id, value) => { $(id).textContent=String(value ?? ''); };
 async function jsonRequest(url, options) {
@@ -224,7 +224,8 @@ function renderAgentStatus(){
     const result=latestExecution;
     setText('observationStatus',`${result.exec_id} · ${executionLabel(result)} · ${result.elapsed??'—'}초`);
     const failure=result.exception?.trim().split('\n').at(-1);
-    setText('latestObservation',[failure,result.stdout,result.stderr].filter(Boolean).join('\n').slice(0,2400)||`${actionLabel(result.action)} 완료${result.path?'\n'+result.path:''} · 출력 없음`);
+    const blocks=(result.blocked_requests||[]).map(item=>`하네스 요청 차단: ${item.method} ${item.url} · ${{outside_target_origin:'대상 범위 밖',unsupported_method:'지원하지 않는 HTTP 메서드',invalid_url:'올바르지 않은 URL',websocket_not_supported:'WebSocket 연결 미지원'}[item.reason]||item.reason}`).join('\n');
+    setText('latestObservation',[failure,blocks,result.stdout,result.stderr].filter(Boolean).join('\n').slice(0,2400)||`${actionLabel(result.action)} 완료${result.path?'\n'+result.path:''} · 출력 없음`);
     $('observationStatus').classList.toggle('error-text',result.exit_code!==0);
   }
 }
@@ -433,7 +434,7 @@ async function startRun(event) {
   }
   const info=availableModels.find(model=>model.name===selectedModelName);
   const body={target:$('targetInput').value.trim(),model:selectedModelName,goal,
-    scenario_source:'manual',chain_mode:'none',
+    scenario_source:'manual',chain_mode:'none',prompt_version:$('promptVersionSelect').value,
     model_settings:ModelSettingsConfig.encode($('providerSelect').value,info,currentModelSettingsValues()),
     budgets:{seconds:Number($('secondsInput').value),model_calls:Number($('modelCallsInput').value),
       tool_calls:Number($('toolCallsInput').value),command_seconds:Number($('commandSecondsInput').value),finalize_seconds:120}};
@@ -452,6 +453,24 @@ async function startRun(event) {
   }
 }
 
+async function loadPrompts(savedVersion){
+  try{
+    const data=await jsonRequest('/api/prompts');
+    if(!Array.isArray(data.versions)||!data.versions.length||!data.versions.includes(data.default)){
+      throw new Error('프롬프트 목록이 올바르지 않습니다.');
+    }
+    const select=$('promptVersionSelect');
+    select.replaceChildren(...data.versions.map(version=>{
+      const option=document.createElement('option');
+      option.value=version; option.textContent=version+(version===data.default?' (기본)':''); return option;
+    }));
+    select.value=(savedVersion&&data.versions.includes(savedVersion))?savedVersion:data.default;
+    setText('promptVersionHint','탐색 지침 프롬프트 버전');
+  }catch(_){
+    setText('promptVersionHint','프롬프트 목록을 불러오지 못했습니다. 새로고침하거나 앱 서버를 재시작하세요.');
+  }
+}
+
 function initMain(){
   $('mainView').hidden=false; $('runView').hidden=true;
   $('setupSection').hidden=historyMode; $('historySection').hidden=!historyMode;
@@ -465,6 +484,7 @@ function initMain(){
   if(saved.model)selectedModelName=saved.model;
   if(typeof saved.target==='string')$('targetInput').value=saved.target;
   if(typeof saved.goal==='string')$('goalInput').value=saved.goal;
+  loadPrompts(saved.prompt_version);
   $('targetInput').addEventListener('input',()=>{updateTargetReadiness();updateStartControls();});
   updateTargetReadiness();
   if(Object.keys(saved).length)setText('saveStatus','저장된 설정을 불러왔습니다.');
@@ -472,7 +492,7 @@ function initMain(){
   $('saveInputsButton').addEventListener('click',()=>{
     rememberModelSettings();
     saveDash({target:$('targetInput').value.trim(),goal:$('goalInput').value, provider:$('providerSelect').value,
-      model:selectedModelName, settings:Object.fromEntries(modelSettingsDrafts)});
+      model:selectedModelName, prompt_version:$('promptVersionSelect').value, settings:Object.fromEntries(modelSettingsDrafts)});
     setText('saveStatus',`저장됨 ✓ · ${new Date().toLocaleTimeString('ko-KR')}`);
   });
   for(const button of $('goalSuggestions').querySelectorAll('button[data-goal]'))button.addEventListener('click',()=>{

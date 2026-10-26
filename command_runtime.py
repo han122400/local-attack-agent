@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -103,6 +103,7 @@ from urllib.parse import urlsplit
 project = Path(sys.argv[5])
 sys.path.insert(0, str(project / ".deps"))
 from playwright.async_api import async_playwright
+from browser_http import BrowserHTTP
 
 def send(sock, item):
     sock.sendall((json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8"))
@@ -122,44 +123,25 @@ async def main():
     sock.settimeout(None)
     send(sock, {"type": "hello", "token": token})
     target_parts = urlsplit(target)
-    def origin_key(url):
-        parts = urlsplit(url)
-        hostname = (parts.hostname or "").encode("idna").decode("ascii")
-        port = parts.port if parts.port is not None else {"http": 80, "https": 443}.get(parts.scheme)
-        return parts.scheme, hostname, port
-    selected_origin = origin_key(target)
     async with async_playwright() as playwright:
         options = {"headless": True}
         if executable:
             options["executable_path"] = executable
         browser = await playwright.chromium.launch(**options)
         context = await browser.new_context(service_workers="block", accept_downloads=False)
-        async def guard(route):
-            request = route.request
-            parts = urlsplit(request.url)
-            allowed = (origin_key(request.url) == selected_origin and request.method in ("GET", "HEAD")
-                       and parts.username is None and parts.password is None)
-            if allowed:
-                await route.continue_()
-            else:
-                await route.abort()
-        await context.route("**/*", guard)
+        http = BrowserHTTP(context, target)
+        await context.route("**/*", http.guard)
+        await context.route_web_socket("**/*", http.guard_web_socket)
         page = await context.new_page()
         target_origin = target_parts.scheme + "://" + target_parts.netloc
-        def _same_origin(url):
-            p = urlsplit(url)
-            return (origin_key(url) == selected_origin
-                    and p.username is None and p.password is None)
         async def get_text(url):
             """GET a URL within the target origin and return its response text."""
-            if not _same_origin(url):
-                raise ValueError("get_text is restricted to the target origin " + target_origin)
+            http._check(url, "GET")
             response = await context.request.get(url, max_redirects=0)
             return await response.text()
         async def get_json(url):
             """GET a URL within the target origin and return parsed JSON."""
-            if not _same_origin(url):
-                raise ValueError("get_json is restricted to the target origin " + target_origin)
+            http._check(url, "GET")
             response = await context.request.get(url, max_redirects=0)
             return await response.json()
         async def goto_and_render(url, timeout=15000, settle_ms=1200):
@@ -168,27 +150,10 @@ async def main():
             Uses domcontentloaded + a short settle wait. networkidle is avoided on purpose:
             this app keeps polling, so networkidle may never fire and would hang until timeout.
             """
-            if not _same_origin(url):
-                raise ValueError("goto_and_render is restricted to the target origin " + target_origin)
+            http._check(url, "GET")
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
             await page.wait_for_timeout(settle_ms)
             return page
-        async def http_get(url):
-            """GET within the target origin and return a structured observation that never raises on
-            non-JSON: status, ok, content type, length, a body snippet, and parsed json or a parse_error."""
-            if not _same_origin(url):
-                raise ValueError("http_get is restricted to the target origin " + target_origin)
-            response = await context.request.get(url, max_redirects=0)
-            body = await response.text()
-            ctype = response.headers.get("content-type", "")
-            result = {"url": url, "status": response.status, "ok": response.ok,
-                      "content_type": ctype, "length": len(body), "body": body[:2000]}
-            if "json" in ctype:
-                try:
-                    result["json"] = json.loads(body)
-                except Exception as exc:
-                    result["parse_error"] = str(exc)[:200]
-            return result
         async def list_inputs():
             """Return the page's visible inputs (index/tag/type/name/id/label/value) and nearby button
             labels, so you can pick the right field instead of guessing with a raw selector."""
@@ -236,49 +201,10 @@ async def main():
             else:
                 result["text_sample"] = await page.evaluate("() => (document.body ? document.body.innerText : '').slice(0, 400)")
             return result
-        async def compare_inputs(index, normal_value, test_value, result_selector, settle_ms=1200):
-            """Collect normal/test/normal with one model command; compare visible samples, never verdicts."""
-            if type(index) is not int or index < 0 or not isinstance(normal_value, str) or not isinstance(test_value, str):
-                raise ValueError("Use a visible input index and string input values")
-            if not isinstance(result_selector, str) or not result_selector.strip():
-                raise ValueError("A result_selector is required for comparison")
-            if normal_value == test_value:
-                raise ValueError("Normal and test values must differ")
-            if type(settle_ms) is not int or settle_ms < 0:
-                raise ValueError("settle_ms must be a nonnegative integer")
-            samples, identity = {}, None
-            def signature(field):
-                return tuple(field.get(key, "") for key in ("tag", "type", "name", "id", "label"))
-            for stage, value in (("normal", normal_value), ("test", test_value), ("recheck", normal_value)):
-                try:
-                    fields = (await list_inputs())["inputs"]
-                    field = next((row for row in fields if row["index"] == index), None)
-                    if field is None or (identity is not None and signature(field) != identity):
-                        raise ValueError("The input disappeared or changed identity; locate it again")
-                    identity = signature(field)
-                    if sum(signature(row) == identity for row in fields) != 1:
-                        raise ValueError("Input identity is ambiguous; compare manually")
-                    sample = await submit_input(index, value, result_selector, settle_ms=settle_ms)
-                    samples[stage] = sample
-                    if (not sample.get("submitted") or type(sample.get("result_count")) is not int
-                            or not isinstance(sample.get("result_sample"), list)):
-                        raise ValueError("Submission or result sample could not be observed")
-                except Exception as exc:
-                    return {"status": "inconclusive", "stage": stage, "error": str(exc)[:240], "samples": samples}
-            normal, test, recheck = (samples[key] for key in ("normal", "test", "recheck"))
-            stable = (normal["result_count"], normal["result_sample"]) == (recheck["result_count"], recheck["result_sample"])
-            observed = any(sample["result_count"] > 0 for sample in samples.values())
-            return {"status": "compared" if stable and observed else "inconclusive", "comparison": {
-                        "result_count_delta": test["result_count"] - normal["result_count"],
-                        "sample_changed": test["result_sample"] != normal["result_sample"],
-                        "baseline_sample_stable": stable},
-                    "scope": "Visible result count and first five text samples only; empty samples may mean a wrong selector. Not vulnerability confirmation.",
-                    "samples": samples}
-
-
-        helpers = {"get_text": get_text, "get_json": get_json, "http_get": http_get,
+        helpers = {"get_text": get_text, "get_json": get_json, "http_get": http.http_get,
                    "goto_and_render": goto_and_render, "list_inputs": list_inputs,
-                   "submit_input": submit_input, "compare_inputs": compare_inputs, "target_origin": target_origin}
+                   "submit_input": submit_input, "target_origin": target_origin,
+                   "captured_requests": http.captured_requests, "replay_request": http.replay_request}
         send(sock, {"type": "ready"})
         buffer = b""
         try:
@@ -289,6 +215,7 @@ async def main():
                 if message.get("type") != "execute":
                     continue
                 exec_id = message["exec_id"]
+                http.begin_step(exec_id)
                 source = Path(message["path"])
                 limit = message.get("timeout")
                 timed_out = False
@@ -342,7 +269,8 @@ async def main():
                 send(sock, {"type": "result", "exec_id": exec_id, "exit_code": exit_code,
                             "timed_out": timed_out, "exception": detail[-4000:],
                             "failure_source": failure_source, "cause_code": cause_code,
-                            "exception_type": exception_type})
+                            "exception_type": exception_type, "blocked_requests": http.blocked_requests,
+                            "request_templates": http.captured_requests()})
         finally:
             await context.close()
             await browser.close()
@@ -371,6 +299,8 @@ class ExecutionResult:
     cause_code: str | None = None
     exception_type: str | None = None
     retryable: bool | None = None
+    blocked_requests: list[dict] = field(default_factory=list)
+    request_templates: list[dict] = field(default_factory=list)
 
 
 class CommandRuntime:
@@ -550,6 +480,7 @@ class CommandRuntime:
     def _start_browser_worker(self) -> None:
         worker_path = self.runtime_dir / "tools" / "_browser_worker.py"
         worker_path.write_text(WORKER_SOURCE, encoding="utf-8")
+        shutil.copyfile(Path(__file__).with_name("browser_http.py"), worker_path.with_name("browser_http.py"))
         token = uuid.uuid4().hex
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.bind(("127.0.0.1", 0))
@@ -813,6 +744,8 @@ class CommandRuntime:
                     result.failure_source = reply.get("failure_source")
                     result.cause_code = reply.get("cause_code")
                     result.exception_type = reply.get("exception_type")
+                    result.blocked_requests = reply.get("blocked_requests", [])
+                    result.request_templates = reply.get("request_templates", [])
                     if result.exit_code != 0:
                         result.retryable = True
                     if reply.get("timed_out"):

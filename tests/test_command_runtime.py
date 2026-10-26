@@ -3,6 +3,7 @@ import unittest
 import sys
 import time
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 
@@ -112,6 +113,22 @@ class RuntimeTests(unittest.TestCase):
         self.runtime.destroy(RUN_ID, 5)
         self.assertFalse(self.runtime.inspect(RUN_ID)["runtime_exists"])
         self.assertTrue((self.log.run_dir / evidence[0]["artifact"]["path"]).is_file())
+
+    def test_worker_blocks_and_request_templates_reach_execution_result(self):
+        blocks = [{"url": "https://outside.invalid/", "method": "GET", "reason": "outside_target_origin"}]
+        templates = [{"id": "REQ-0001", "url": "http://127.0.0.1:3000/form", "method": "POST", "fields": ["q"], "step": "EXEC-0001"}]
+        reply = {"type": "result", "exec_id": "EXEC-0001", "exit_code": 1, "exception": "after request",
+                 "blocked_requests": blocks, "request_templates": templates}
+        self.runtime._browser_enabled = True
+        with patch.object(self.runtime, "_worker", SimpleNamespace(poll=lambda: None)), \
+             patch.object(self.runtime, "_send_control"), patch.object(self.runtime, "_wait_control", return_value=reply), \
+             patch.object(self.runtime, "_capture_browser_tree"), patch("command_runtime.time.sleep"):
+            result = self.runtime.run(RUN_ID, {"action": "run_python", "code": "print('observed')"})
+        self.assertEqual(result.blocked_requests, blocks)
+        self.assertEqual(result.request_templates, templates)
+        finished = next(event for event in self.log.read_events() if event["kind"] == "exec_finished")
+        self.assertEqual(finished["blocked_requests"], blocks)
+        self.assertEqual(finished["request_templates"], templates)
 
 
 class BrowserWorkerTests(unittest.TestCase):

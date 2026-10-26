@@ -8,8 +8,8 @@ from dataclasses import replace
 
 import httpx2 as httpx
 
+from j1_policy import pack_j1_context
 from model_settings import validate_model_settings
-from context_limits import compact_context, context_char_budget
 from model_providers import OpenRouterError, is_openrouter, openrouter_stream, strip_tool_call_framing
 from planning import (COMMAND_SCHEMA, SYSTEM_PROMPT, SYSTEM_PROMPT_SHA256, SYSTEM_PROMPT_VERSION,
                       Command, normalize_command_inputs, validate_command)
@@ -21,10 +21,11 @@ _NUM_PREDICT_MAX = 65536   # mirrors the num_predict field ceiling in model_sett
 
 
 class ModelFailure(RuntimeError):
-    def __init__(self, kind: str, message: str, call_id: str = ""):
+    def __init__(self, kind: str, message: str, call_id: str = "", *, retryable: bool = False):
         super().__init__(message)
         self.kind = kind
         self.call_id = call_id
+        self.retryable = retryable
 
 
 def decode_first_command(raw: str) -> tuple[object, str]:
@@ -54,10 +55,17 @@ def _ollama_stream(payload: dict):
 class Harness:
     def __init__(self, log: SessionLog, *, transport=None, max_calls: int = 40,
                  stop_requested=None, max_decode_attempts: int = 6,
-                 max_transport_retries: int = 3, transport_retry_backoff: float = 0.5):
+                 max_transport_retries: int = 3, transport_retry_backoff: float = 0.5,
+                 system_prompt: str = SYSTEM_PROMPT, system_prompt_version: str = SYSTEM_PROMPT_VERSION,
+                 system_prompt_sha256: str = SYSTEM_PROMPT_SHA256, command_guard=None, report_reserve: int = 0):
         self.log = log
         self.run_id = log.run_id
         self.transport = transport or _model_stream
+        self.system_prompt = system_prompt
+        self.system_prompt_version = system_prompt_version
+        self.system_prompt_sha256 = system_prompt_sha256
+        self.command_guard = command_guard
+        self.report_reserve = report_reserve
         self.max_calls = max_calls
         self.max_decode_attempts = max_decode_attempts
         self.max_transport_retries = max_transport_retries
@@ -73,11 +81,15 @@ class Harness:
         if run_id != self.run_id:
             raise ValueError("Harness belongs to another run")
         selected = validate_model_settings(settings)
-        try:
-            input_budget = context_char_budget(selected["options"].get("num_ctx", 8192))
-            context = compact_context(context, input_budget)
-        except ValueError as exc:
-            raise ModelFailure("context", str(exc)) from exc
+        j1_budget = int(selected["options"].get("num_ctx", 8192) * 3.3 * 0.65) - len(self.system_prompt)
+        if self.system_prompt_version == "J1":
+            try:
+                context = pack_j1_context(context, j1_budget)
+            except ValueError as exc:
+                raise ModelFailure("context", str(exc)) from exc
+        report_only = self.report_reserve > 0 and bool(context.get("remaining", {}).get("finish_soon"))
+        call_limit = (min(self.max_calls, self.calls + self.report_reserve) if report_only
+                      else self.max_calls - self.report_reserve)
         options = dict(selected["options"])
         # Persist a raised output budget across steps: once a length-truncation forced num_predict up,
         # keep at least that floor so later steps do not truncate at the original cap again.
@@ -85,7 +97,7 @@ class Harness:
             options["num_predict"] = max(int(options.get("num_predict", 0)), self.output_num_predict_floor)
         payload = {"model": model, "stream": True, "format": COMMAND_SCHEMA,
                    "options": options,
-                   "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                   "messages": [{"role": "system", "content": self.system_prompt},
                                 {"role": "user", "content": json.dumps(context, ensure_ascii=False)}]}
         if selected["think"] is not None:
             payload["think"] = selected["think"]
@@ -96,7 +108,7 @@ class Harness:
         # Retry recoverable format/output errors with feedback instead of failing the whole run
         # after a single retry. The global model-call budget below is the real ceiling.
         for _ in range(self.max_decode_attempts):
-            if self.calls >= self.max_calls:
+            if self.calls >= call_limit:
                 raise ModelFailure("budget", "Model call budget exhausted")
             if self.stop_requested():
                 raise ModelFailure("cancelled", "Run stopped")
@@ -107,8 +119,8 @@ class Harness:
             started = time.monotonic()
             self.log.append("model_request", {"call_id": call_id, "input": payload,
                                               "settings": selected, "attempt": self.calls,
-                                              "system_prompt_version": SYSTEM_PROMPT_VERSION,
-                                              "system_prompt_sha256": SYSTEM_PROMPT_SHA256})
+                                              "system_prompt_version": self.system_prompt_version,
+                                              "system_prompt_sha256": self.system_prompt_sha256})
             content: list[str] = []
             thinking: list[str] = []
             completion: dict = {}
@@ -166,6 +178,10 @@ class Harness:
                         self.log.append("command_normalized", {"call_id": call_id, "action": answer.get("action"),
                                                                "fields": normalized_fields})
                     command = validate_command(answer)
+                    if report_only and command.action != "finish":
+                        raise ValueError("Report reserve is active: return action finish; do not execute more tools")
+                    if self.command_guard is not None:
+                        self.command_guard(command, report_only)
                 except (ValueError, TypeError) as exc:
                     raise ModelFailure("format", f"Invalid Command: {exc}", call_id) from exc
                 self.log.append("command_decoded", {"call_id": call_id, "action": command.action,
@@ -175,11 +191,11 @@ class Harness:
                 self.log.append("model_error", {"call_id": call_id, "error_kind": exc.kind,
                                                 "message": str(exc), "elapsed": round(time.monotonic() - started, 3)})
                 last_error = exc
-                if exc.kind not in {"format", "output_limit"} or self.calls >= self.max_calls:
+                if exc.kind not in {"format", "output_limit"} or self.calls >= call_limit:
                     raise
                 # Keep the failed answer available for correction without allowing a large
                 # response to consume the entire context. The full raw response is logged.
-                previous = raw[:400] + ("\n[truncated invalid output]" if len(raw) > 400 else "")
+                previous = raw if len(raw) <= 6000 else raw[:4000] + "\n[response middle omitted]\n" + raw[-2000:]
                 retry_options = dict(payload["options"])
                 if exc.kind == "output_limit":
                     # Reasoning models can spend the whole output budget thinking and never emit the
@@ -202,18 +218,20 @@ class Harness:
                                   "read_file uses path. Every action including finish requires nonempty plan and reason. "
                                   "Unused path/content/command/code fields must be empty strings. "
                                   "Produce one small step with concise code, without explanatory comments.")
-                feedback_messages = [
-                    {"role": "assistant", "content": previous},
-                    {"role": "user", "content": feedback}]
-                try:
-                    retry_context = compact_context(
-                        context, input_budget - sum(len(message["content"]) for message in feedback_messages))
-                except ValueError as error:
-                    raise ModelFailure("context", str(error), call_id) from error
-                payload = {**payload, "options": retry_options, "messages": [payload["messages"][0],
-                    {"role": "user", "content": json.dumps(retry_context, ensure_ascii=False)}, *feedback_messages]}
+                if self.system_prompt_version == "J1":
+                    previous = raw[:500] + ("\n[invalid output preview]" if len(raw) > 500 else "")
+                    retry_feedback = [{"role": "assistant", "content": previous}, {"role": "user", "content": feedback}]
+                    try:
+                        context = pack_j1_context(context, j1_budget - sum(len(m["content"]) for m in retry_feedback))
+                    except ValueError as error:
+                        raise ModelFailure("context", str(error), call_id) from error
+                    messages = [payload["messages"][0], {"role": "user", "content": json.dumps(context, ensure_ascii=False)}, *retry_feedback]
+                else:
+                    messages = [*payload["messages"], {"role": "assistant", "content": previous}, {"role": "user", "content": feedback}]
+                payload = {**payload, "options": retry_options, "messages": messages}
             except (OpenRouterError, httpx.HTTPError, OSError, TimeoutError, json.JSONDecodeError) as exc:
-                failure = ModelFailure("transport", str(exc)[:300], call_id)
+                failure = ModelFailure("transport", str(exc)[:300], call_id,
+                                       retryable=getattr(exc, "retryable", True))
                 self.log.append("model_error", {"call_id": call_id, "error_kind": failure.kind,
                                                 "message": str(failure), "elapsed": round(time.monotonic() - started, 3)})
                 last_error = failure
@@ -222,9 +240,9 @@ class Harness:
                 # connections) usually clear on a retry; auth/billing/permission failures do not, so
                 # OpenRouterError marks those non-retryable. Back off briefly, bounded by attempts,
                 # the call budget, the deadline and a stop request.
-                retryable = getattr(exc, "retryable", True)
+                retryable = failure.retryable
                 if (not retryable or transport_retries > self.max_transport_retries
-                        or self.calls >= self.max_calls or self.stop_requested()
+                        or self.calls >= call_limit or self.stop_requested()
                         or (deadline is not None and time.monotonic() >= deadline)):
                     raise failure from exc
                 self.log.append("transport_retry", {"call_id": call_id, "attempt": transport_retries})

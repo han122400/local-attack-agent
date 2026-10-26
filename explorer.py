@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import queue
@@ -14,11 +13,11 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from command_runtime import CommandRuntime
-from context_limits import context_char_budget
 from harness import Harness, ModelFailure
+from j1_policy import J1Policy, pack_j1_context
 from lab import reset_lab
 from model_settings import default_model_settings, validate_model_settings
-from planning import SYSTEM_PROMPT
+from planning import SYSTEM_PROMPT, SYSTEM_PROMPT_VERSION, available_prompt_versions, load_prompt
 from session_log import ControllerLease, LogFailure, SessionLog, SessionStore, validate_run_id
 
 
@@ -27,6 +26,19 @@ MODEL = "qwen3.5:2b"
 RUNS_ROOT = Path(__file__).resolve().parent / "runs"
 DEFAULT_BUDGETS = {"seconds": 1200, "model_calls": 40, "tool_calls": 80,
                    "command_seconds": 30, "finalize_seconds": 120}
+
+# The full prompt (system + context) must fit num_ctx with room left for the model's output. We budget the
+# CONTEXT (the user message) in chars — a token proxy, since tokens are only known after a call — after
+# subtracting the system prompt and reserving ~35% of num_ctx for output. When the context exceeds this
+# budget the oldest structured history is dropped and a context_compacted event is emitted.
+_CHARS_PER_TOKEN = 3.3        # rough for mixed Korean/English/code
+_PROMPT_FRACTION = 0.65       # share of num_ctx used for the prompt (rest reserved for output)
+
+
+def context_char_budget(num_ctx: int, system_prompt: str = SYSTEM_PROMPT) -> int:
+    total_prompt_chars = int(max(1024, num_ctx) * _CHARS_PER_TOKEN * _PROMPT_FRACTION)
+    return max(2000, total_prompt_chars - len(system_prompt))
+
 
 def _digest(text: str, limit: int = 240) -> str:
     """Head+tail digest so a long output keeps its start AND end, not only the trailing noise."""
@@ -37,37 +49,7 @@ def _digest(text: str, limit: int = 240) -> str:
     return (text[:head] + " … " + text[-(limit - head - 3):]).strip()
 
 
-def _pack_model_context(context: dict, budget: int) -> dict:
-    """Preview execution detail without changing executable commands, goals or stored findings."""
-    fields = {"plan", "reason", "claim", "observed", "error", "stdout", "stderr", "exception", "command", "code", "content"}
-    def preview(value, limit, field=""):
-        if isinstance(value, str) and field in fields and len(value) > limit:
-            marker = "\n[preview; full value in run log]\n"
-            head = (limit - len(marker)) * 2 // 3
-            return value[:head] + marker + value[-(limit - len(marker) - head):]
-        if isinstance(value, dict):
-            return {key: preview(child, limit, key) for key, child in value.items()}
-        if isinstance(value, list):
-            return [preview(child, limit, field) for child in value]
-        return value
-    def size():
-        return len(json.dumps(result, ensure_ascii=False))
-    for limit in (1200, 600, 240, 80):
-        result = {**context, **{key: preview(context[key], limit) for key in ("history", "recent", "feedback") if key in context}}
-        while size() > budget and len(result.get("history", [])) > 1:
-            result["history"].pop(0)
-        if size() <= budget:
-            return result
-    while size() > budget and len(result.get("recent", [])) > 1:
-        result["recent"].pop(0)
-    if size() > budget:
-        result["history"] = []
-    if size() > budget:
-        raise ModelFailure("context", "Required model context exceeds the input budget; shorten the goal or increase num_ctx")
-    return result
-
-
-def compose_report(findings: list[dict], run_result: str, model_reason: str) -> str:
+def compose_report(findings: list[dict], run_result: str, model_reason: str, *, j1_state: dict | None = None) -> str:
     """Deterministic report built from the preserved findings, so every run ends with an actual result
     (confirmed observations / inconclusive / failures) even when the model never produced a finish summary."""
     findings = findings or []
@@ -75,11 +57,11 @@ def compose_report(findings: list[dict], run_result: str, model_reason: str) -> 
     inconclusive = [f for f in findings if f.get("status") == "ok" and not f.get("evidence")]
     failed = [f for f in findings if f.get("status") in ("error", "timeout")]
     lines = [f"결과: {run_result} · 스텝 {len(findings)}개 "
-             f"(증거 {len(evidence)} · 미확정 {len(inconclusive)} · 실패 {len(failed)})"]
+             f"({'실행 출력' if j1_state else '증거'} {len(evidence)} · 미확정 {len(inconclusive)} · 실패 {len(failed)})"]
     if model_reason:
-        lines.append(f"모델 종료 요약: {model_reason}")
+        lines.append(f"모델 종료 요약{'(미검증 주장)' if j1_state else ''}: {model_reason}")
     if evidence:
-        lines.append("확인된 관찰:")
+        lines.append("기록된 실행 출력(HTTP/취약점 미검증):" if j1_state else "확인된 관찰:")
         for f in evidence[:12]:
             lines.append(f"  - [{f['step']}] {f.get('plan', '')} → {str(f.get('observed', ''))[:140]}")
     else:
@@ -90,6 +72,31 @@ def compose_report(findings: list[dict], run_result: str, model_reason: str) -> 
     if failed:
         steps = ", ".join(str(f["step"]) for f in failed[:8])
         lines.append(f"실패/타임아웃: {len(failed)}건 (스텝 {steps}).")
+    partial = [f for f in findings if f.get("partial_observation")]
+    if partial:
+        lines.append("실패 단계의 부분 출력(미검증·전체 단계 성공을 의미하지 않음):")
+        for item in partial[:8]:
+            lines.append(f"  - [{item['step']}] {str(item['observed'])[:200]}")
+    for item in findings:
+        for blocked in item.get("blocked_requests", []):
+            lines.append(f"하네스 요청 차단 [{item['step']}]: {blocked['method']} {blocked['url']} · {blocked['reason']} · 대상 사이트 오류의 증거가 아님")
+    if j1_state:
+        active_checks = {check: item for check, item in j1_state["coverage"].items()
+                         if item["state"] != "not_started"}
+        if active_checks:
+            lines.append("J1 조사 기록(단계 실행 기록이며 취약점 확정/방어 입증이 아님):")
+        for check, item in active_checks.items():
+            lines.append(f"  - {check}: {item['state']} · 단계 {', '.join(item['stages']) or '없음'} · 스텝 {item['steps']}"
+                         + (f" · 미검증 사유: {item['limits']}" if item['limits'] else ""))
+            if item.get("basis"):
+                lines.append(f"    후보 선택 근거(모델 진술·미검증): {item['basis']}")
+        for item in j1_state.get("candidates", {}).values():
+            lines.append(f"  - 후보 baseline={item['baseline_step']} · {item['check']}: {item['state']}"
+                         f" · 단계 {item['stage_steps']} · 미검증 사유: {item['limits']}")
+        for item in j1_state["request_memory"]:
+            lines.append(f"  - 기준 코드 [{item['step']}]: {item['source_path']} · 필드 {item['form_fields']} · HTTP 성공은 미검증")
+        if j1_state.get("unlinked_steps"):
+            lines.append(f"추적 정보가 부족한 실행 단계: {j1_state['unlinked_steps']}")
     return "\n".join(lines)
 
 
@@ -161,7 +168,7 @@ class ExplorerV3:
 
     def start(self, target: str = TARGET, model: str = MODEL, *, goal: str = "Explore the local lab",
               model_settings: dict | None = None, scenario_source: str = "manual", chain_mode: str = "none",
-              budgets: dict | None = None) -> str | bool:
+              budgets: dict | None = None, prompt_version: str | None = None) -> str | bool:
         if scenario_source != "manual" or chain_mode != "none":
             raise ValueError("Only manual scenario with none chain is implemented")
         if not isinstance(goal, str) or not goal.strip() or len(goal) > 2000:
@@ -169,6 +176,9 @@ class ExplorerV3:
         target = safe_target(target, self.allowed_target)
         if not isinstance(model, str) or not model.strip() or len(model) > 256:
             raise ValueError("Installed model name is required")
+        prompt_version = prompt_version or SYSTEM_PROMPT_VERSION
+        if prompt_version not in available_prompt_versions():
+            raise ValueError("Unknown system prompt version")
         selected = default_model_settings() if model_settings is None else validate_model_settings(model_settings)
         selected_budgets = validate_budgets(budgets)
         with self.lock:
@@ -189,6 +199,7 @@ class ExplorerV3:
                         "initial_lab_status": "pending" if uses_juice_lab(target) else "not_applicable",
                         "model": model, "model_settings": selected, "budgets": selected_budgets,
                         "scenario_source": scenario_source, "chain_mode": chain_mode,
+                        "prompt_version": prompt_version,
                         "started_at": time.time(), "finished_at": None, "finish_reason": "",
                         "managed_processes": []}
             try:
@@ -274,16 +285,25 @@ class ExplorerV3:
         metadata = log.metadata
         budgets = metadata["budgets"]
         deadline = time.monotonic() + budgets["seconds"]
+        prompt_version = metadata.get("prompt_version", SYSTEM_PROMPT_VERSION)
+        system_prompt, system_prompt_sha256 = load_prompt(prompt_version)
+        policy = J1Policy(metadata["target"]) if prompt_version == "J1" else None
+        report_reserve = 1
         harness = Harness(log, transport=self.transport, max_calls=budgets["model_calls"],
-                          stop_requested=self.stop_event.is_set)
+                          stop_requested=self.stop_event.is_set, system_prompt=system_prompt,
+                          system_prompt_version=prompt_version, system_prompt_sha256=system_prompt_sha256,
+                          command_guard=policy.allow_action if policy else None, report_reserve=report_reserve)
         num_ctx = (metadata.get("model_settings", {}).get("options", {}) or {}).get("num_ctx", 8192)
-        budget = context_char_budget(num_ctx)
+        budget = context_char_budget(num_ctx, system_prompt)
         recent: list[dict] = []
+        request_templates: list[dict] = []
         history: list[dict] = []       # structured memory of every step; survives recent trimming
-        last_signature = None
-        repeat_start_step = None
+        seen: dict[str, int] = {}      # observation digest -> step that first produced it (repetition)
         durations: list[float] = []    # recent decide() wall times, to reserve time for a final summary
-        for tool_index in range(budgets["tool_calls"]):
+        tool_index, report_required = 0, False
+        if policy:
+            log.update(j1_state=policy.snapshot())
+        while True:
             if self.stop_event.is_set():
                 log.update(findings=history)
                 return "stopped", "User stopped the run"
@@ -292,92 +312,147 @@ class ExplorerV3:
                 log.update(findings=history)
                 return "timed_out", "Run time budget exhausted"
             avg_call = sum(durations[-3:]) / len(durations[-3:]) if durations else 45.0
-            finish_soon = remaining < max(avg_call * 1.5, 45)
+            finish_soon = (remaining < max(avg_call * 1.5, 45) or report_required
+                           or harness.calls >= budgets["model_calls"] - report_reserve
+                           or tool_index >= budgets["tool_calls"])
 
             def build_context(window: int) -> dict:
                 ctx = {"goal": metadata["goal"], "target": metadata["target"],
                        "runtime_path": str(runtime.runtime_dir), "python": runtime.python,
-                       "browser_api": "run_python has page/context/browser and helpers get_text/get_json/"
-                                      "http_get/goto_and_render/list_inputs/submit_input/compare_inputs; top-level await.",
+                       "browser_api": "run_python has page/context/browser; top-level await. Await get_text/get_json/"
+                                      "http_get/goto_and_render/list_inputs/submit_input/replay_request. "
+                                      "http_get returns headers, body (up to 2000 chars), body_truncated and binary; "
+                                      "get_text reads full text. goto_and_render returns a Page. "
+                                      "captured_requests() lists recent browser form request IDs and exact field names. "
+                                      "await replay_request(id, fields={'observed_name':'new_value'}) keeps other fields and uses current cookies. "
+                                      "Do not treat blocked_requests as site errors or bypass scope guards.",
                        # history = structured memory of all prior steps (avoid forgetting/repeating);
                        # recent = fuller detail for the latest steps.
                        "history": history[-window:], "recent": recent[-2:],
                        "remaining": {"seconds": max(0, int(remaining)),
                                      "model_calls": budgets["model_calls"] - harness.calls,
                                      "tool_calls": budgets["tool_calls"] - tool_index,
-                                     "avg_call_seconds": round(avg_call, 1), "finish_soon": finish_soon}}
+                                     "avg_call_seconds": round(avg_call, 1), "finish_soon": finish_soon,
+                                     "report_reserve": report_reserve}}
+                if policy:
+                    ctx["j1"] = policy.context()
+                if request_templates:
+                    ctx["request_templates"] = request_templates
                 return ctx
 
-            context = build_context(min(len(history), 30))
-            if history and history[-1]["status"] in {"error", "timeout"}:
-                last = history[-1]
-                context["feedback"] = {"step": last["step"], "action": last["action"], "error": last["error"],
-                    "repeat_of": last.get("repeat_of"),
-                    "instruction": "Use the recent command and error to fix the cause. Preserve useful prior observations; failed execution is not a finding."}
-            if history and history[-1].get("repeat_of"):
-                context["note"] = ("The last command and outcome match the preceding attempt. "
-                                   "If this is an intentional control, state its purpose; otherwise revise the command or approach.")
-            if finish_soon:
-                context["instruction"] = ("Time is almost up. Call finish now with the actual result: the "
-                                          "confirmed facts (each with its evidence), the failures, and what "
-                                          "remains unverified, from history and recent. No new exploration.")
-            before_chars = len(json.dumps(context, ensure_ascii=False))
-            context = _pack_model_context(context, budget)
+            # Compaction: keep the assembled context under a char budget (token proxy) by dropping the
+            # oldest structured history first; emit an event and expose usage so the UI can show it.
+            window = min(len(history), 30)
+            context = build_context(window)
             context_chars = len(json.dumps(context, ensure_ascii=False))
-            if context_chars < before_chars:
-                kept = len(context["history"])
-                log.append("context_compacted", {"dropped": min(len(history), 30) - kept,
-                    "kept_steps": kept, "chars": context_chars, "before_chars": before_chars})
+            while context_chars > budget and window > 1:
+                window -= 1
+                context = build_context(window)
+                context_chars = len(json.dumps(context, ensure_ascii=False))
+            dropped = min(len(history), 30) - window
+            if dropped > 0:
+                log.append("context_compacted", {"dropped": dropped, "kept_steps": window, "chars": context_chars})
+            # Expose both the char budget (pre-call proxy) and the real token usage of the last call,
+            # plus the accumulated OpenRouter billed cost (USD; 0 for local Ollama runs).
             usage = {"context_chars": context_chars, "context_budget": budget,
                      "prompt_tokens": harness.last_prompt_tokens, "num_ctx": num_ctx,
                      "cost_usd": round(harness.total_cost, 6)}
             self._recent_state.update(**usage)
             log.update(**usage)
+            if history and history[-1].get("repeat_of"):
+                context["note"] = ("An observation digest repeated. This may be an intentional baseline/control/recheck; "
+                                   "compare the actual candidate, input and response before deciding to change course. "
+                                   "Reuse a working request instead of reconstructing it without new information." if policy else
+                                   "Your last step repeated an earlier observation with no new evidence. "
+                                   "Try a different route, feature, or approach — do not repeat it.")
+            if finish_soon:
+                context["instruction"] = ("The reporting phase is active. Call finish now with the actual result: the "
+                                          "confirmed facts (each with its evidence), the failures, and what "
+                                          "remains unverified, from history and recent. No new exploration.")
+            if policy:
+                try:
+                    context = pack_j1_context(context, budget)
+                except ValueError as exc:
+                    raise ModelFailure("context", str(exc)) from exc
+                log.update(context_chars=len(json.dumps(context, ensure_ascii=False)))
+                self._recent_state["context_chars"] = log.metadata["context_chars"]
             started = time.monotonic()
-            command = harness.decide(run_id, context, model=metadata["model"],
-                                     settings=metadata["model_settings"], deadline=deadline)
-            durations.append(time.monotonic() - started)
+            try:
+                command = harness.decide(run_id, context, model=metadata["model"],
+                                         settings=metadata["model_settings"], deadline=deadline)
+            except ModelFailure as exc:
+                if (exc.kind in {"budget", "format", "output_limit"}
+                        or (exc.kind == "transport" and exc.retryable)):
+                    if not finish_soon and harness.calls < budgets["model_calls"]:
+                        report_required = True
+                        log.append("report_requested", {"reason": str(exc)[:240], "calls_used": harness.calls})
+                        continue
+                    return "error", f"Model report unavailable ({exc.kind}); see the preserved observations and deterministic report."
+                raise
+            finally:
+                log.update(findings=history, cost_usd=round(harness.total_cost, 6))
+                if policy:
+                    log.update(j1_state=policy.snapshot())
+                durations.append(time.monotonic() - started)
             log.update(plan=command.plan, reason=command.reason, last_call_id=command.call_id)
             if command.action == "finish":
                 log.append("run_finished_by_model", {"call_id": command.call_id, "reason": command.reason,
                                                      "plan": command.plan})
                 log.update(findings=history)
                 return "completed", command.reason
+            command_timeout = budgets["command_seconds"]
+            if policy:
+                if self.stop_event.is_set():
+                    return "stopped", "User stopped the run"
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return "timed_out", "Run time budget exhausted before command execution"
+                command_timeout = min(command_timeout, left)
             execution = runtime.run(run_id, command.runtime_payload(), call_id=command.call_id,
-                                    timeout=budgets["command_seconds"])
+                                    timeout=command_timeout)
             record = asdict(execution)
+            if execution.request_templates:
+                request_templates = execution.request_templates
+            record.pop("request_templates", None)
+            record["stdout"] = _digest(record["stdout"], 1500)
+            record["stderr"] = record["stderr"][-800:]
+            record["exception"] = record["exception"][-800:]
             recent.append({"call_id": command.call_id, "plan": command.plan, "reason": command.reason,
                            "command": {"action": command.action, "path": command.path,
-                                       "command": command.command, "code": command.code},
+                                       "command": command.command, "code": command.code[-800:]},
                            "result": record})
-            recent = recent[-2:]  # Full originals remain in model/runtime events, not in the model's window.
             # Structured memory: keep the model's claim (plan/reason) separate from the actual observation,
             # and code-success (status) separate from investigation-success (evidence present).
-            if execution.timed_out:
-                status, observed, error = "timeout", "", "code timed out"
+            if policy and execution.cancelled:
+                status, observed, error = "error", "", "execution cancelled"
+            elif execution.timed_out:
+                status, observed, error = "timeout", _digest(execution.stdout), "code timed out"
             elif execution.exit_code == 0:
                 status, observed, error = "ok", _digest(execution.stdout), ""
             else:
-                status, observed, error = "error", "", _digest(execution.exception or execution.stderr, 200)
-            error_lines = (execution.exception or execution.stderr).strip().splitlines()
-            outcome = {"stdout": execution.stdout, "exit_code": execution.exit_code, "timed_out": execution.timed_out,
-                       "error": error_lines[-1] if error_lines else ""}
-            signature = hashlib.sha256(json.dumps([command.runtime_payload(), outcome], sort_keys=True).encode()).hexdigest()
-            repeat_of = repeat_start_step if signature == last_signature and (observed or error) else None
-            if repeat_of is None:
-                repeat_start_step = tool_index + 1
-            last_signature = signature
-            entry = {"step": tool_index + 1, "exec_id": execution.exec_id,
-                     "action": command.action, "plan": command.plan[:140],
+                status, observed, error = "error", _digest(execution.stdout), _digest(execution.exception or execution.stderr, 200)
+            repeat_of = seen.get(observed) if observed and status == "ok" else None
+            if observed and status == "ok" and repeat_of is None:
+                seen[observed] = tool_index + 1
+            entry = {"step": tool_index + 1, "action": command.action, "plan": command.plan[:140],
                      "claim": command.reason[:200], "status": status,
                      "observed": observed or "(no evidence)", "error": error,
                      "evidence": bool(observed) and status == "ok"}
+            if observed and status != "ok":
+                entry["partial_observation"] = True
+            if execution.blocked_requests:
+                entry["blocked_requests"] = execution.blocked_requests
+            if execution.request_templates:
+                entry["request_refs"] = [item["id"] for item in execution.request_templates
+                                         if item["step"] == execution.exec_id]
             if repeat_of is not None:
                 entry["repeat_of"] = repeat_of
             history.append(entry)
+            if policy:
+                policy.record(command, execution, tool_index + 1)
+                log.update(j1_state=policy.snapshot())
             log.update(last_exec_id=execution.exec_id, tool_calls=tool_index + 1, findings=history)
-        log.update(findings=history)
-        return "error", "Tool call budget exhausted"
+            tool_index += 1
 
     def _finalize(self, run_id: str, log: SessionLog, runtime: CommandRuntime,
                   run_result: str, reason: str) -> None:
@@ -389,7 +464,8 @@ class ExplorerV3:
         # Deterministic report from the preserved findings, so a timed-out/stopped run still ends with an
         # actual result instead of only a deadline message. Best-effort; the full record stays on disk.
         try:
-            report = compose_report(log.metadata.get("findings") or [], run_result, reason)
+            report = compose_report(log.metadata.get("findings") or [], run_result, reason,
+                                    j1_state=log.metadata.get("j1_state"))
             log.update(report=report)
             self._recent_state.update(report=report)
         except LogFailure:
@@ -402,8 +478,7 @@ class ExplorerV3:
         try:
             log.update(run_result=run_result, finish_reason=reason, phase="finalizing")
             log.append("finalize_started", {"run_result": run_result, "reason": reason})
-            if (log.metadata.get("cleanup_status") != "succeeded" or runtime.inspect(run_id)["runtime_exists"]
-                    or runtime.inspect(run_id)["managed_processes"]):
+            if log.metadata.get("cleanup_status") != "succeeded" or runtime.inspect(run_id)["runtime_exists"] or runtime.inspect(run_id)["managed_processes"]:
                 log.update(cleanup_status="running")
                 runtime.stop(run_id, remaining(20))
                 if runtime.inspect(run_id)["managed_processes"]:
@@ -453,7 +528,7 @@ class ExplorerV3:
             try:
                 failed = {"phase": "recovery_required", "finish_reason": reason,
                           "cleanup_error": str(exc)[:500]}
-                if (runtime.inspect(run_id)["runtime_exists"] or runtime.inspect(run_id)["managed_processes"]):
+                if runtime.inspect(run_id)["runtime_exists"] or runtime.inspect(run_id)["managed_processes"]:
                     failed["cleanup_status"] = "failed"
                 elif log.metadata.get("cleanup_status") != "succeeded":
                     failed["cleanup_status"] = "failed"

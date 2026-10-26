@@ -11,6 +11,7 @@ High precision over recall: only flag what is almost certainly wrong, so valid c
 from __future__ import annotations
 
 import ast
+from collections import Counter
 
 # page/context/browser methods that are coroutines (must be awaited). Kept to the common ones.
 _PAGE_ASYNC = {
@@ -22,7 +23,7 @@ _PAGE_ASYNC = {
 }
 _PAGE_OBJECTS = {"page", "context", "browser"}
 # injected async helpers, called as bare names: await get_json(...), await submit_input(...)
-_HELPER_FUNCS = {"get_text", "get_json", "http_get", "goto_and_render", "list_inputs", "submit_input", "compare_inputs"}
+_HELPER_FUNCS = {"get_text", "get_json", "http_get", "goto_and_render", "list_inputs", "submit_input", "replay_request"}
 
 
 def check_generated_code(code: str) -> list[str]:
@@ -38,7 +39,46 @@ def check_generated_code(code: str) -> list[str]:
             parents[child] = node
 
     problems: list[str] = []
+    bindings = {target.id: node.value for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                for target in node.targets if isinstance(target, ast.Name)}
+    writes = Counter(node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store))
+    writes.update(node.arg for node in ast.walk(tree) if isinstance(node, ast.arg))
+    responses, pages = set(), set()
+    for name, value in bindings.items():
+        if writes[name] != 1 or not isinstance(value, ast.Await) or not isinstance(value.value, ast.Call):
+            continue
+        call = value.value.func
+        if isinstance(call, ast.Attribute) and ast.unparse(call.value) in {"context.request", "page.request"}:
+            if call.attr in {"get", "post", "put", "patch", "delete", "head", "fetch"}:
+                responses.add(name)
+        if isinstance(call, ast.Name) and call.id == "goto_and_render":
+            pages.add(name)
+    main_defined = any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "main"
+                       or isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "main"
+                       or isinstance(node, ast.alias) and (node.asname or node.name.split(".")[0]) == "main"
+                       for node in ast.walk(tree))
+    dynamic_namespace = any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                            and node.func.id in {"exec", "eval", "globals", "locals"} for node in ast.walk(tree))
+    if not main_defined and not dynamic_namespace:
+        for stmt in tree.body:
+            value = getattr(stmt, "value", None)
+            value = value.value if isinstance(value, ast.Await) else value
+            if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "main":
+                problems.append("main is not defined in this call; define async def main(page, context, browser) or remove its call.")
     for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncWith) and any(ast.unparse(item.context_expr) in {"context.request", "page.request"}
+                                                 for item in node.items):
+            problems.append("context.request is already provided and is not an async context manager; await its get/post methods directly.")
+        if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in responses
+                and node.attr in {"text", "body", "json"}):
+            usage = parents.get(node)
+            if isinstance(usage, ast.BoolOp):
+                usage = parents.get(usage)
+            if isinstance(usage, (ast.Subscript, ast.BinOp)):
+                problems.append(f"Response.{node.attr} is a method; use await response.{node.attr}(), not the attribute.")
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name) and node.func.value.id in pages and node.func.attr == "get"):
+            problems.append("goto_and_render returns a Page, not a dictionary; use page.url or awaited Page methods.")
         # asyncio.run(...) inside the already-running loop
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "run" and isinstance(node.func.value, ast.Name)

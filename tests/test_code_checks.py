@@ -31,6 +31,32 @@ class CodeCheckTests(unittest.TestCase):
         self.assertEqual(check_generated_code("y = type(5)\nprint(y)"), [])
         self.assertEqual(check_generated_code("items = [1, 2]\nfirst = items[0]"), [])
 
+    def test_undefined_main_is_caught_before_prior_side_effects_execute(self):
+        problems = check_generated_code("print('request already sent')\nawait main(page, context, browser)")
+        self.assertTrue(any("main" in p and "defined" in p for p in problems))
+        for source in ("async def main(page, context, browser):\n    pass\nawait main(page, context, browser)",
+                       "from hooks import main\nawait main(page, context, browser)",
+                       "main = handler\nawait main(page, context, browser)"):
+            self.assertEqual(check_generated_code(source), [])
+
+    def test_observed_request_api_mistakes_get_precise_feedback(self):
+        self.assertTrue(any("context manager" in p for p in check_generated_code(
+            "async with context.request as request:\n    pass")))
+        self.assertTrue(any("text()" in p for p in check_generated_code(
+            "r = await context.request.get('https://fixture.invalid/')\nprint(r.text[:100])")))
+        self.assertTrue(any("Page" in p for p in check_generated_code(
+            "r = await goto_and_render('https://fixture.invalid/')\nprint(r.get('status'))")))
+        self.assertEqual(check_generated_code(
+            "r = await context.request.get('https://fixture.invalid/')\nprint(await r.text())"), [])
+        self.assertEqual(check_generated_code("r = {'text':'value'}\nprint(r.get('text'))"), [])
+
+    def test_response_checks_allow_method_references_gather_and_rebound_variables(self):
+        for source in ("r = await context.request.get('x')\ncallback = r.text",
+                       "r = await context.request.get('x')\nawait asyncio.gather(r.text())",
+                       "r = await context.request.get('x')\nfor r in rows:\n    print(r.text[:10])"):
+            with self.subTest(source=source):
+                self.assertEqual(check_generated_code(source), [])
+
 
 if __name__ == "__main__":
     unittest.main()
