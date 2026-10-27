@@ -62,7 +62,7 @@ def load_prompt(version: str) -> tuple[str, str]:
     return text, sha256(text.encode("utf-8")).hexdigest()
 
 
-SYSTEM_PROMPT_VERSION = "v2"
+SYSTEM_PROMPT_VERSION = "v3"
 SYSTEM_PROMPT, SYSTEM_PROMPT_SHA256 = load_prompt(SYSTEM_PROMPT_VERSION)
 
 
