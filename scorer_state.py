@@ -10,7 +10,7 @@ from decision_provider import ProviderError, estimated_cost, validate_pin
 from experiment_config import validate_experiment_config
 from risk_rubric import (CONTRACT_VERSION, PROJECTION_VERSION, RUBRIC_VERSION, CRITERIA,
                          ScoreContractError, build_score_request, canonical_bytes, fingerprint,
-                         project_node, validate_answer, validate_usage)
+                         is_finite_number, project_node, validate_answer, validate_usage)
 from v4_contracts import ContractError
 
 
@@ -69,7 +69,7 @@ def usage(state: dict) -> dict:
     known_cost = sum(item["cost"] for item in known)
     reserved = sum(item["estimated_cost_usd"] for item in unknown)
     seconds = sum(item["finish"]["elapsed_seconds"] if "finish" in item else item["timeout_seconds"] for item in requests)
-    seconds += (state["configuration"] or {}).get("catalog_elapsed_seconds", 0)
+    seconds += (state["configuration"] or state["halt"] or {}).get("catalog_elapsed_seconds", 0)
     return {"requests": len(requests), "questions": sum(len(item["node_ids"]) for item in requests),
             "completed_requests": sum("finish" in item for item in requests),
             "pending_requests": sum("finish" not in item for item in requests),
@@ -83,7 +83,7 @@ def usage(state: dict) -> dict:
 
 
 def numeric(value):
-    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+    if not is_finite_number(value) or value < 0:
         raise ContractError("Invalid scoring accounting value")
     return value
 
@@ -131,6 +131,10 @@ def apply_scoring_event(tree: dict, kind: str, payload: dict) -> None:
             raise ContractError("Invalid scorer stop reason")
         if state["halt"] is not None:
             raise ContractError("Scorer already halted")
+        if "catalog_elapsed_seconds" in payload:
+            numeric(payload["catalog_elapsed_seconds"])
+            if state["configuration"] is not None or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", payload["catalog_error"]):
+                raise ContractError("Invalid catalog failure accounting")
         state["halt"] = copy.deepcopy(payload)
         return
     configuration = state["configuration"]

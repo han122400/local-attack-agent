@@ -74,6 +74,13 @@ class ProviderTests(unittest.TestCase):
             self.assertNotIn("SECRET", str(caught.exception))
             self.assertEqual(len(calls), 2)
 
+    def test_catalog_decoding_failure_is_a_safe_provider_error(self):
+        adapter = self.adapter(lambda request: httpx.Response(200, headers={"Content-Encoding": "gzip"}, content=b"PRIVATE_CORRUPT_BODY"))
+        with self.assertRaises(ProviderError) as caught:
+            adapter.resolve("typesafe/jev-1.14")
+        self.assertEqual(caught.exception.code, "invalid_response_encoding")
+        self.assertNotIn("PRIVATE", str(caught.exception))
+
     def test_oversize_input_makes_no_post_and_invalid_contract_keeps_known_usage(self):
         posts = []
         def handler(request):

@@ -266,6 +266,43 @@ class ScorerSessionTests(unittest.TestCase):
         self.assertEqual(scorer.score_children(self.root)["stop_reason"], "time_budget")
         self.assertEqual(scorer.usage()["elapsed_seconds"], 3)
 
+    def test_failed_catalog_is_time_bounded_and_its_elapsed_time_survives_replay(self):
+        now, observed = [0.0], []
+        adapter = FakeAdapter()
+        def fail_catalog(model, *, timeout_seconds):
+            observed.append(timeout_seconds)
+            now[0] += 1
+            raise ProviderError("timeout", retryable=True)
+        adapter.resolve = fail_catalog
+        scorer = self.scorer(adapter, time_budget_seconds=1, timeout_seconds=20)
+        scorer.clock = lambda: now[0]
+        self.assertEqual(scorer.score_children(self.root)["stop_reason"], "scorer_unavailable")
+        self.assertEqual(observed, [1])
+        self.assertEqual(scorer.usage()["elapsed_seconds"], 1)
+        self.assertFalse(adapter.calls)
+        self.tree.rebuild()
+        self.assertEqual(scorer.usage()["elapsed_seconds"], 1)
+
+    def test_decoding_failure_finishes_reserved_request_and_retains_unknown_cost(self):
+        import httpx2 as httpx
+        from decision_provider import OpenRouterDecisions
+        from test_scorer_provider import CATALOG
+        def handler(request):
+            if request.method == "GET":
+                return httpx.Response(200, json=CATALOG)
+            return httpx.Response(200, headers={"Content-Encoding": "gzip"}, content=b"corrupt")
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        self.addCleanup(client.close)
+        scorer = self.scorer(OpenRouterDecisions(api_key="TEST_ONLY", client=client))
+        self.assertEqual(scorer.score_children(self.root)["stop_reason"], "scorer_unavailable")
+        accounting = scorer.usage()
+        self.assertEqual(accounting["completed_requests"], 1)
+        self.assertEqual(accounting["pending_requests"], 0)
+        self.assertEqual(accounting["unknown_cost_requests"], 1)
+        self.assertIsNone(accounting["cost_usd"])
+        request = next(iter(self.tree.state["scorer"]["requests"].values()))
+        self.assertEqual(request["finish"]["error"]["code"], "invalid_response_encoding")
+
     def test_replay_rejects_invalid_pin_as_log_failure(self):
         scorer = self.scorer()
         scorer.score_children(self.root)

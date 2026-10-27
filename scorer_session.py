@@ -28,6 +28,8 @@ class RiskScorer:
 
     def configure(self) -> dict:
         state = self.tree.refresh()["scorer"]
+        if state["halt"]:
+            raise ContractError("A halted scorer cannot be reconfigured")
         settings = effective_settings(self.log.metadata)
         existing = state["configuration"]
         if existing:
@@ -37,7 +39,13 @@ class RiskScorer:
                 raise ContractError("A run cannot change its scorer model/provider/settings")
             return existing
         started = self.clock()
-        pin = self.adapter.resolve(self.log.metadata["scorer_model"], timeout_seconds=settings["timeout_seconds"])
+        try:
+            pin = self.adapter.resolve(self.log.metadata["scorer_model"],
+                timeout_seconds=min(settings["timeout_seconds"], settings["time_budget_seconds"]))
+        except ProviderError as exc:
+            self.tree.record_scoring("scorer_halted", {"reason": "scorer_unavailable",
+                "catalog_elapsed_seconds": self.clock() - started, "catalog_error": exc.code})
+            raise
         if pin["id"] != self.log.metadata["scorer_model"]:
             raise ContractError("Catalog resolved a different scorer model")
         configuration = {"provider": "openrouter", "model_pin": pin, "settings": settings,

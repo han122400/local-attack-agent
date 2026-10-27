@@ -137,8 +137,17 @@ def build_score_request(model: str, parent: dict, siblings: list[dict], node_ids
                       "parent": project_node(parent), "nodes": nodes}}
 
 
+def is_finite_number(value) -> bool:
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def _number(value, low=0.0, high=math.inf) -> float:
-    if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high:
+    if not is_finite_number(value) or not low <= value <= high:
         raise ScoreContractError("invalid_number")
     return float(value)
 
@@ -210,7 +219,7 @@ def validate_response(response: dict, allowed_model_ids: set[str], node_ids: lis
             probabilities = raw.get("probabilities")
             probabilities = probabilities if isinstance(probabilities, dict) else {}
             def safe_number(value):
-                return value if type(value) in (int, float) and math.isfinite(value) else None
+                return value if is_finite_number(value) else None
             diagnostics[node_id] = {"reason": str(exc), "score": safe_number(raw.get("score")),
                 "confidence": safe_number(raw.get("confidence")),
                 "probabilities": {str(i): safe_number(probabilities.get(str(i))) for i in range(len(CRITERIA))},

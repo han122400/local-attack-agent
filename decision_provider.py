@@ -92,7 +92,9 @@ class OpenRouterDecisions:
             raise
         except httpx.TimeoutException:
             raise ProviderError("timeout", retryable=True) from None
-        except httpx.TransportError:
+        except httpx.DecodingError:
+            raise ProviderError("invalid_response_encoding") from None
+        except httpx.RequestError:
             raise ProviderError("transport_error", retryable=True) from None
         except (ValueError, RecursionError):
             raise ProviderError("invalid_response_json") from None

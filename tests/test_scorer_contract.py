@@ -94,6 +94,13 @@ class ScorerContractTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ScoreContractError):
                 validate_response({**response, **change}, {"typesafe/jev-1.14-20261014"}, ["N0002", "N0003"])
 
+    def test_large_json_integer_stays_a_local_answer_error_including_diagnostics(self):
+        response = {"model": "typesafe/jev-1.14", "answers": {"risk_N0002": answer(10 ** 400)},
+                    "usage": {"input_tokens": 100, "output_tokens": 0, "cost": .0000042}}
+        result = validate_response(response, {"typesafe/jev-1.14"}, ["N0002"])
+        self.assertEqual(result["node_errors"], {"N0002": "invalid_answer"})
+        self.assertIsNone(result["diagnostics"]["N0002"]["score"])
+
 
 if __name__ == "__main__":
     unittest.main()
