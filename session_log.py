@@ -9,9 +9,11 @@ import hashlib
 import json
 import os
 import re
+import stat
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
 
 from event_classification import classify_event, event_view
@@ -40,6 +42,27 @@ def safe_relative_path(value: str) -> Path:
     if any(part in ("", ".", "..") or ":" in part for part in parts):
         raise ValueError("Path escapes session")
     return Path(*parts)
+
+
+def atomic_write_json(path: Path, value: dict) -> None:
+    """Replace one JSON snapshot after fsync; this is not a multi-file transaction."""
+    path = Path(path)
+    temporary = path.with_name(f"{path.stem}-{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        for attempt in range(40):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError as exc:
+                if os.name != "nt" or getattr(exc, "winerror", None) not in (5, 32) or attempt == 39:
+                    raise
+                time.sleep(0.025)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class SessionLog:
@@ -110,28 +133,36 @@ class SessionLog:
             return self._seq
 
     def _write_metadata(self) -> None:
-        temp_path = self.run_dir / f"session-{uuid.uuid4().hex}.tmp"
         try:
-            with temp_path.open("w", encoding="utf-8", newline="\n") as stream:
-                json.dump(self.metadata, stream, ensure_ascii=False, indent=2)
-                stream.flush()
-                os.fsync(stream.fileno())
-            # On Windows a concurrent read briefly denies replacement of the
-            # destination. Keep the new complete file and retry only sharing
-            # errors; a persistent failure still fails the session writer.
-            for attempt in range(40):
-                try:
-                    os.replace(temp_path, self.session_path)
-                    break
-                except PermissionError as exc:
-                    if os.name != "nt" or getattr(exc, "winerror", None) not in (5, 32) or attempt == 39:
-                        raise
-                    time.sleep(0.025)
+            atomic_write_json(self.session_path, self.metadata)
         except Exception as exc:
             self.failed = True
             raise LogFailure(f"Metadata write failed: {exc}") from exc
-        finally:
-            temp_path.unlink(missing_ok=True)
+
+    @contextmanager
+    def locked_writer(self):
+        """Serialize a read/decision/append operation; no rollback is implied."""
+        with self._lock:
+            self._require_open()
+            yield
+
+    def snapshot_events(self) -> list[dict]:
+        """Read a complete ordered prefix while the shared writer is quiescent."""
+        with self._lock:
+            events = []
+            try:
+                with self.events_path.open("r", encoding="utf-8") as stream:
+                    for expected, line in enumerate(stream, 1):
+                        event = json.loads(line)
+                        if (not isinstance(event, dict) or event.get("run_id") != self.run_id
+                                or type(event.get("seq")) is not int or event["seq"] != expected):
+                            raise ValueError("Event identity or sequence mismatch")
+                        events.append(event)
+            except (OSError, ValueError, UnicodeError) as exc:
+                raise LogFailure("Cannot read complete session events") from exc
+            if len(events) != self._seq:
+                raise LogFailure("Event log changed outside the session writer")
+            return events
 
     def update(self, **fields) -> dict:
         with self._lock:
@@ -177,6 +208,20 @@ class SessionLog:
         with self._lock:
             self._listeners.discard(callback)
 
+    def _check_artifact_destination(self, path: Path) -> None:
+        if not path.resolve().is_relative_to(self.artifacts_dir):
+            raise ValueError("Artifact destination escapes its directory")
+        current = path
+        while current.is_relative_to(self.run_dir):
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                    raise ValueError("Artifact links and reparse points are not allowed")
+            current = current.parent
+
     def preserve_bytes(self, name: str, data: bytes) -> dict:
         with self._lock:
             self._require_open()
@@ -186,9 +231,9 @@ class SessionLog:
             saved_name = relative.with_name(f"{relative.stem}-{uuid.uuid4().hex}{relative.suffix}")
             path = self.artifacts_dir / saved_name
             try:
+                self._check_artifact_destination(path)
                 path.parent.mkdir(parents=True, exist_ok=True)
-                if any(part.is_symlink() for part in (path.parent, *path.parents)):
-                    raise ValueError("Artifact link is not allowed")
+                self._check_artifact_destination(path)
                 with path.open("xb") as stream:
                     stream.write(data)
                     stream.flush()
@@ -301,6 +346,8 @@ class SessionStore:
             pass
         outstanding = set()
         result = None
+        v4_configuration = None
+        has_v4_events = False
         events_path = directory / "events.jsonl"
         if events_path.exists():
             try:
@@ -308,6 +355,8 @@ class SessionStore:
                     event = json.loads(line)
                     if event.get("run_id") != run_id:
                         raise ValueError("Event run_id mismatch")
+                    if str(event.get("kind", "")).startswith(("tree_", "node_", "v4_")):
+                        has_v4_events = True
                     process = event.get("process") or {}
                     identity = (process.get("pid"), process.get("created_at"))
                     if event.get("kind") == "process_started":
@@ -316,10 +365,18 @@ class SessionStore:
                         outstanding.discard(identity)
                     elif event.get("kind") in {"finalize_started", "run_finalized"}:
                         result = event.get("run_result") or result
+                    elif event.get("kind") == "v4_preparation_created":
+                        config = event.get("configuration")
+                        if (v4_configuration is not None or not isinstance(config, dict)
+                                or config.get("experiment_mode") != "v4" or config.get("v4_stage") != "foundation"):
+                            raise ValueError("Invalid v4 preparation identity")
+                        v4_configuration = config
             except (ValueError, UnicodeDecodeError, TypeError) as exc:
                 raise LogFailure("Cannot establish process ownership from events") from exc
         if outstanding:
             raise LogFailure("Cannot repair metadata with unconfirmed managed processes")
+        if has_v4_events and v4_configuration is None:
+            raise LogFailure("Cannot infer v4 settings without its preparation creation record")
         if session_path.exists():
             artifact = directory / "artifacts" / "recovery"
             artifact.mkdir(parents=True, exist_ok=True)
@@ -333,6 +390,20 @@ class SessionStore:
                     "log_status": "collecting", "lab_reset_status": "pending",
                     "runtime_creation_intent": False, "managed_processes": [],
                     "metadata_rebuilt": True}
+        if v4_configuration is not None:
+            # Keep a lost v4 preparation from entering the legacy v3 lab/reset
+            # finalizer. Only configuration fields from the creation event are
+            # restored; resource/lifecycle ownership is never inferred from it.
+            from experiment_config import validate_experiment_config
+            try:
+                selected = validate_experiment_config(v4_configuration)
+            except ValueError as exc:
+                raise LogFailure("Cannot restore v4 preparation settings") from exc
+            keys = ("target", "goal", "model", "model_settings", "budgets", "prompt_version",
+                    "tree_schema_version", "result_schema_version")
+            metadata.update({key: v4_configuration.get(key) for key in keys})
+            metadata.update(selected, v4_stage="foundation", execution_ready=False, scorer_validation="syntax_only",
+                            run_result=None, lab_reset_status="not_applicable", initial_lab_status="not_applicable")
         temporary = directory / f"session-repair-{uuid.uuid4().hex}.tmp"
         try:
             with temporary.open("w", encoding="utf-8", newline="\n") as stream:
@@ -361,6 +432,12 @@ class SessionStore:
             path = self.root / meta["run_id"]
             if meta.get("metadata_error"):
                 return False, f"{meta['run_id']}: session metadata needs recovery"
+            if (meta.get("experiment_mode") == "v4" and meta.get("v4_stage") == "foundation"
+                    and meta.get("phase") == "prepared" and meta.get("execution_ready") is False
+                    and meta.get("runtime_creation_intent") is False and not meta.get("managed_processes")
+                    and not (path / "runtime").exists() and meta.get("log_status") == "preserved"
+                    and meta.get("cleanup_status") == "succeeded" and meta.get("lab_reset_status") == "not_applicable"):
+                continue
             if ((path / "runtime").exists() or meta.get("phase") != "finished"
                     or meta.get("log_status") != "finalized"
                     or meta.get("cleanup_status") != "succeeded"

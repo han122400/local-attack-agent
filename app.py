@@ -29,6 +29,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.concurrency import run_in_threadpool
 
 import scorecard
+from experiment_config import validate_experiment_config, require_execution_ready, V4ExecutionUnavailable
 
 
 TARGET = "http://127.0.0.1:3000/"
@@ -621,6 +622,8 @@ async def start(request: Request) -> dict:
         body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
         if not isinstance(body, dict):
             raise ValueError("실험 설정은 JSON 객체여야 합니다.")
+        experiment = validate_experiment_config(body)
+        require_execution_ready(experiment)
         target = safe_target(body.get("target", TARGET))
         model = body.get("model", MODEL)
         goal = body.get("goal", "")
@@ -648,7 +651,9 @@ async def start(request: Request) -> dict:
                 raise ValueError(f"선택한 모델의 출력 한도는 {info['max_completion_tokens']} 토큰입니다.")
         started = EXPLORER.start(target, model, goal=goal, model_settings=settings,
                                  scenario_source=scenario_source, chain_mode=chain_mode,
-                                 budgets=body.get("budgets"), prompt_version=body.get("prompt_version"))
+                                 budgets=body.get("budgets"), prompt_version=body.get("prompt_version"), **experiment)
+    except V4ExecutionUnavailable as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -656,6 +661,30 @@ async def start(request: Request) -> dict:
     if not started:
         raise HTTPException(status_code=409, detail="Already running")
     return {"started": True, "run_id": started, "run_url": f"/runs/{started}"}
+
+
+@app.post("/api/v4/prepare", status_code=201)
+async def prepare_v4(request: Request) -> dict:
+    check_origin(request)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("실험 설정은 JSON 객체여야 합니다.")
+        config = validate_experiment_config({"experiment_mode": "v4", **body})
+        if config["experiment_mode"] != "v4":
+            raise ValueError("이 경로는 v4 준비 전용입니다.")
+        if body.get("scenario_source", "manual") != "manual" or body.get("chain_mode", "none") != "none":
+            raise ValueError("Only manual scenario with none chain is implemented")
+        run_id = await run_in_threadpool(EXPLORER.prepare_v4, body.get("target", TARGET), body.get("model", MODEL),
+            goal=body.get("goal", ""), scorer_provider=config["scorer_provider"], scorer_model=config["scorer_model"],
+            scorer_settings=config["scorer_settings"], model_settings=body.get("model_settings"),
+            budgets=body.get("budgets"), prompt_version=body.get("prompt_version"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (RuntimeError, OSError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"prepared": True, "started": False, "execution_ready": False,
+            "run_id": run_id, "run_url": f"/runs/{run_id}"}
 
 
 @app.post("/api/stop")
@@ -705,7 +734,7 @@ def run_list() -> JSONResponse:
     for state in EXPLORER.store.list_runs()[:50]:
         summaries.append({key: state.get(key) for key in (
             "run_id", "goal", "model", "started_at", "finished_at", "phase", "run_result",
-            "cleanup_status", "lab_reset_status", "metadata_error")})
+            "cleanup_status", "lab_reset_status", "metadata_error", "experiment_mode", "execution_ready")})
     return JSONResponse({"runs": summaries, "active_run_id": EXPLORER.active_run_id,
                          "can_start": can_start, "blocked_reason": reason},
                         headers={"Cache-Control": "no-store"})

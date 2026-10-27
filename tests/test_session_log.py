@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -74,6 +75,23 @@ class SessionLogTests(unittest.TestCase):
                 with self.subTest(path=path), self.assertRaises(ValueError):
                     log.preserve_bytes(path, b"x")
             log.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction containment")
+    def test_artifact_junction_is_rejected_before_creating_directories_outside_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            outside = root / "outside-artifacts"
+            outside.mkdir()
+            log = SessionLog(root, RUN_ID, {})
+            self.addCleanup(log.close)
+            junction = log.artifacts_dir / "node-results"
+            created = subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+                                     capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            if created.returncode:
+                self.skipTest("Windows junction creation unavailable")
+            with self.assertRaises(LogFailure):
+                log.preserve_bytes("node-results/new-directory/result.json", b"{}")
+            self.assertEqual(list(outside.iterdir()), [])
 
     def test_incomplete_session_blocks_start_after_store_restart(self):
         with tempfile.TemporaryDirectory() as temp:

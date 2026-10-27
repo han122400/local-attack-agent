@@ -10,6 +10,9 @@ import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
+from experiment_config import validate_experiment_config, require_execution_ready
+from v4_contracts import SCHEMA_VERSION
+from v4_tree import TreeStore
 from urllib.parse import urlsplit
 
 from command_runtime import CommandRuntime
@@ -142,7 +145,12 @@ class ExplorerV3:
 
     def start(self, target: str = TARGET, model: str = MODEL, *, goal: str = "Explore the local lab",
               model_settings: dict | None = None, scenario_source: str = "manual", chain_mode: str = "none",
-              budgets: dict | None = None, prompt_version: str | None = None) -> str | bool:
+              budgets: dict | None = None, prompt_version: str | None = None, experiment_mode: str = "v3",
+              scorer_provider: str | None = None, scorer_model: str | None = None,
+              scorer_settings: dict | None = None) -> str | bool:
+        experiment = validate_experiment_config({"experiment_mode": experiment_mode, "scorer_provider": scorer_provider,
+                                                "scorer_model": scorer_model, "scorer_settings": scorer_settings})
+        require_execution_ready(experiment)
         if scenario_source != "manual" or chain_mode != "none":
             raise ValueError("Only manual scenario with none chain is implemented")
         if not isinstance(goal, str) or not goal.strip() or len(goal) > 2000:
@@ -175,7 +183,7 @@ class ExplorerV3:
                         "scenario_source": scenario_source, "chain_mode": chain_mode,
                         "prompt_version": prompt_version,
                         "started_at": time.time(), "finished_at": None, "finish_reason": "",
-                        "managed_processes": []}
+                        "managed_processes": [], **experiment}
             try:
                 log = self.store.create(run_id, metadata)
                 log.append("run_created", {"owner_instance_id": self.instance_id, "goal": goal.strip()})
@@ -189,6 +197,76 @@ class ExplorerV3:
             self.worker = threading.Thread(target=self._thread_main, args=(run_id, log), daemon=True)
             self.worker.start()
             return run_id
+
+    def prepare_v4(self, target: str = TARGET, model: str = MODEL, *, goal: str,
+                   scorer_provider: str, scorer_model: str, scorer_settings: dict | None = None,
+                   model_settings: dict | None = None, budgets: dict | None = None,
+                   prompt_version: str | None = None) -> str:
+        """Persist A1/A2 inputs and a root. Never create a runtime or query models."""
+        experiment = validate_experiment_config({"experiment_mode": "v4", "scorer_provider": scorer_provider,
+                                                "scorer_model": scorer_model,
+                                                "scorer_settings": {} if scorer_settings is None else scorer_settings})
+        target = safe_target(target, self.allowed_target)
+        if not isinstance(goal, str) or not goal.strip() or len(goal) > 2000:
+            raise ValueError("Manual goal is required")
+        if not isinstance(model, str) or not model.strip() or len(model) > 256:
+            raise ValueError("Execution model name is required")
+        if prompt_version is not None:
+            raise ValueError("v4 compatible execution prompt is not implemented yet; omit prompt_version")
+        selected = default_model_settings() if model_settings is None else validate_model_settings(model_settings)
+        configuration = {**experiment, "target": target, "goal": goal.strip(), "model": model,
+                         "model_settings": selected, "budgets": validate_budgets(budgets), "prompt_version": None,
+                         "v4_stage": "foundation", "execution_ready": False, "scorer_validation": "syntax_only",
+                         "tree_schema_version": SCHEMA_VERSION, "result_schema_version": SCHEMA_VERSION}
+        with self.lock:
+            if self.worker and self.worker.is_alive():
+                raise RuntimeError("Another run is active or finalizing")
+            if not self.lease.acquire():
+                raise RuntimeError("Another controller owns the local lab")
+            log = None
+            try:
+                ready, reason = self.store.can_start()
+                if not ready:
+                    raise RuntimeError(reason)
+                run_id = uuid.uuid4().hex
+                log = self.store.create(run_id, {**configuration, "owner_instance_id": self.instance_id,
+                    "controller_pid": os.getpid(), "runtime_creation_intent": False, "managed_processes": [],
+                    "lab_reset_status": "not_applicable", "initial_lab_status": "not_applicable",
+                    "started_at": None, "finished_at": None})
+                log.append("v4_preparation_created", {"configuration": configuration})
+                TreeStore(log).initialize(target)
+                log.append("v4_preparation_completed", {})
+                log.update(phase="prepared", log_status="preserved", cleanup_status="succeeded")
+                log.flush()
+                return run_id
+            finally:
+                if log is not None:
+                    log.close()
+                self.lease.release()
+
+    def _recover_v4_preparation(self, run_id: str, metadata: dict) -> bool:
+        """Caller holds the controller lease. Foundation recovery has no execution side effects."""
+        if (metadata.get("v4_stage") != "foundation" or (self.store.root / run_id / "runtime").exists()
+                or metadata.get("managed_processes") or metadata.get("runtime_creation_intent")):
+            raise RuntimeError("v4 preparation recovery cannot manage runtime resources; A4 recovery is not implemented")
+        log = SessionLog(self.store.root, run_id, recovery=True)
+        try:
+            tree = TreeStore(log)
+            events = log.snapshot_events()
+            if not any(event["kind"] == "tree_initialized" for event in events):
+                # A preparation may have stopped after its creation record but
+                # before the root event was durably appended.
+                tree.initialize(safe_target(metadata["target"], self.allowed_target))
+            else:
+                tree.rebuild()
+            log.append("v4_preparation_recovered", {})
+            log.update(phase="prepared", log_status="preserved", cleanup_status="succeeded",
+                       lab_reset_status="not_applicable", execution_ready=False,
+                       recovery_attempts=int(metadata.get("recovery_attempts", 0)) + 1)
+            log.flush()
+            return True
+        finally:
+            log.close()
 
     def _broadcast(self, event: dict) -> None:
         with self.lock:
@@ -507,6 +585,11 @@ class ExplorerV3:
                     metadata = self.store.read(run_id)
                 except (KeyError, ValueError, LogFailure):
                     metadata = self.store.repair_unowned_metadata(run_id)
+                if metadata.get("experiment_mode") == "v4":
+                    try:
+                        return self._recover_v4_preparation(run_id, metadata)
+                    finally:
+                        self.lease.release()
                 if (metadata.get("phase") == "finished" and metadata.get("cleanup_status") == "succeeded"
                         and metadata.get("log_status") == "finalized"
                         and metadata.get("lab_reset_status") in {"succeeded", "not_applicable"}):
