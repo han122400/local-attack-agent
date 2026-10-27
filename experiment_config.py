@@ -18,12 +18,12 @@ _LOCAL_INTEGERS = {"num_ctx": (256, 1048576), "num_predict": (1, 131072)}
 
 
 class V4ExecutionUnavailable(RuntimeError):
-    """The foundation can be prepared but A3/A4 execution is not implemented."""
+    """Scoring is available; the A4 exploration/verification loop is not."""
 
 
 def require_execution_ready(config: dict) -> None:
     if config["experiment_mode"] == "v4":
-        raise V4ExecutionUnavailable("v4 execution requires A3/A4. Use POST /api/v4/prepare to prepare its configuration and tree.")
+        raise V4ExecutionUnavailable("v4 execution requires A4. Use POST /api/v4/prepare to prepare its configuration and tree.")
 
 
 def validate_experiment_config(body: dict) -> dict:
@@ -45,7 +45,7 @@ def validate_experiment_config(body: dict) -> dict:
     raw = body.get("scorer_settings", {})
     if not isinstance(raw, dict):
         raise ValueError("scorer_settings must be an object")
-    allowed = {*_INTEGER_LIMITS, "timeout_seconds", "rubric_version", "reevaluation_policy"}
+    allowed = {*_INTEGER_LIMITS, "timeout_seconds", "rubric_version", "reevaluation_policy", "max_cost_usd", "time_budget_seconds"}
     if provider == "local":
         allowed |= {*_LOCAL_INTEGERS, "base_url", "protocol", "temperature"}
     if raw.keys() - allowed:
@@ -54,7 +54,8 @@ def validate_experiment_config(body: dict) -> dict:
     for key, (minimum, maximum) in {**_INTEGER_LIMITS, **_LOCAL_INTEGERS}.items():
         if key in raw and (type(raw[key]) is not int or not minimum <= raw[key] <= maximum):
             raise ValueError(f"Invalid scorer {key}")
-    for key, minimum, maximum in (("timeout_seconds", 0.001, 300), ("temperature", 0, 2)):
+    for key, minimum, maximum in (("timeout_seconds", 0.001, 300), ("temperature", 0, 2),
+                                  ("max_cost_usd", 0.000001, 100), ("time_budget_seconds", 0.001, 3600)):
         if key in raw and (type(raw[key]) not in (int, float) or not math.isfinite(raw[key]) or not minimum <= raw[key] <= maximum):
             raise ValueError(f"Invalid scorer {key}")
     if "rubric_version" in raw and (not isinstance(raw["rubric_version"], str)

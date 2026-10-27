@@ -16,15 +16,17 @@ from pathlib import Path
 from session_log import LogFailure, SessionLog, atomic_write_json, safe_relative_path, validate_run_id
 from v4_contracts import (SCHEMA_VERSION, MAX_RESULT_BYTES, MAX_EVIDENCE_BYTES, MAX_TOTAL_EVIDENCE_BYTES,
                           ContractError, dedup_key, normalize_url, validate_discovery, validate_id, validate_result)
+from risk_rubric import observations
+from scorer_state import SCORING_EVENTS, apply_scoring_event, empty_scorer, usage as scorer_usage
 
 
 _KINDS = {"tree_initialized", "node_discovered", "node_selected", "node_state_changed",
-          "node_attempt_started", "node_result_imported"}
+          "node_attempt_started", "node_result_imported", "node_observations_changed", *SCORING_EVENTS}
 
 
 def _empty_state(run_id: str) -> dict:
     return {"schema_version": SCHEMA_VERSION, "run_id": validate_run_id(run_id), "root_id": None,
-            "current_id": None, "last_event_seq": 0, "nodes": {}, "attempts": {}, "executions": {}}
+            "current_id": None, "last_event_seq": 0, "nodes": {}, "attempts": {}, "executions": {}, "scorer": empty_scorer()}
 
 
 def _digest(value: dict) -> str:
@@ -37,8 +39,17 @@ def _node(node_id: str, parent_id: str | None, discovery: dict) -> dict:
             "dedup_key": dedup_key(discovery), "discovery_paths": [] if parent_id is None else [
                 {"parent_id": parent_id, "relation": discovery["relation"]}],
             "exploration_state": "discovered", "verification_state": "untested",
+            "observations": observations({}),
             "risk": {"status": "not_applicable" if parent_id is None else "pending", "score": None},
             "attempts": [], "evidence_refs": [], "verification": None}
+
+
+def _invalidate_children(state: dict, parent_id: str | None) -> None:
+    if parent_id is not None:
+        for child_id in state["nodes"][parent_id]["child_ids"]:
+            node = state["nodes"][child_id]
+            if node["exploration_state"] not in ("done", "blocked"):
+                node["risk"] = {"status": "pending", "score": None}
 
 
 def _discover(state: dict, parent_id: str, discovery: dict) -> str:
@@ -56,6 +67,7 @@ def _discover(state: dict, parent_id: str, discovery: dict) -> str:
     node_id = f"N{len(state['nodes']) + 1:04d}"
     state["nodes"][node_id] = _node(node_id, parent_id, discovery)
     parent["child_ids"].append(node_id)
+    _invalidate_children(state, parent_id)
     return node_id
 
 
@@ -110,7 +122,7 @@ def _apply(state: dict, event: dict) -> None:
             raise ContractError("Malformed execution result provenance")
         execution["finish"] = event
     if kind not in _KINDS:
-        if kind.startswith(("tree_", "node_")):
+        if kind.startswith(("tree_", "node_", "scorer_")):
             raise ContractError("Unsupported tree event")
         state["last_event_seq"] = event["seq"]
         return
@@ -127,6 +139,15 @@ def _apply(state: dict, event: dict) -> None:
         state["nodes"]["N0001"] = _node("N0001", None, discovery)
     elif state["root_id"] is None:
         raise ContractError("Tree has not been initialized")
+    elif kind in SCORING_EVENTS:
+        apply_scoring_event(state, kind, payload)
+    elif kind == "node_observations_changed":
+        node = state["nodes"][payload["node_id"]]
+        value = observations(payload["observations"])
+        if value != node["observations"]:
+            node["observations"] = value
+            _invalidate_children(state, node["parent_id"])
+            _invalidate_children(state, node["id"])
     elif kind == "node_discovered":
         _discover(state, payload["parent_id"], payload["discovery"])
     elif kind == "node_selected":
@@ -278,6 +299,18 @@ class TreeStore:
             index = {key: self._state[key] for key in ("schema_version", "run_id", "root_id", "current_id", "last_event_seq")}
             index["node_ids"] = list(self._state["nodes"])
             atomic_write_json(_safe_path(self.log.run_dir, "tree.json"), index)
+            if self._state["scorer"]["configuration"] is not None or self._state["scorer"]["halt"] is not None:
+                scorer = self._state["scorer"]
+                totals = scorer_usage(scorer)
+                atomic_write_json(_safe_path(self.log.run_dir, "scorer.json"),
+                    {"schema_version": 1, "last_event_seq": seq, "configuration": scorer["configuration"],
+                     "usage": totals, "halt": scorer["halt"], "request_ids": list(scorer["requests"])})
+                fields = {"scorer_usage": totals, "scorer_halt": scorer["halt"]}
+                if scorer["configuration"]:
+                    config = scorer["configuration"]
+                    fields.update(scorer_effective_settings=config["settings"], scorer_model_pin=config["model_pin"],
+                                  scorer_contract_version=config["contract_version"], scorer_validation="catalog_verified")
+                self.log.update(**fields)
         except (OSError, ValueError) as exc:
             self._snapshot_failed = True
             raise LogFailure("Tree snapshot write failed; committed events remain authoritative") from exc
@@ -299,6 +332,27 @@ class TreeStore:
             self._sync()
             self._commit("tree_initialized", {"target": normalize_url(target)})
             return self._state["root_id"]
+
+    def refresh(self) -> dict:
+        with self.log.locked_writer():
+            self._sync()
+            return self.state
+
+    def record_scoring(self, kind: str, payload: dict) -> None:
+        if kind not in SCORING_EVENTS:
+            raise ContractError("Unsupported scorer event")
+        with self.log.locked_writer():
+            self._sync()
+            self._commit(kind, payload)
+
+    def set_observations(self, node_id: str, value: dict) -> None:
+        """Replace categorical facts. Free text is dropped; this never confirms."""
+        with self.log.locked_writer():
+            self._sync()
+            node_id = validate_id(node_id)
+            value = observations(value)
+            if self._state["nodes"][node_id]["observations"] != value:
+                self._commit("node_observations_changed", {"node_id": node_id, "observations": value})
 
     def discover(self, parent_id: str, discovery: dict) -> str:
         with self.log.locked_writer():

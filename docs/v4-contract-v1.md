@@ -1,6 +1,6 @@
 # v4 A1·A2 구현 계약 v1
 
-현재 구현은 설정 준비·결과 보존·트리 저장/재생까지다. 실제 scorer, 탐욕 탐색 루프, 취약점 검증기는 A3·A4에서 연결한다. v4 준비 상태의 `execution_ready`는 항상 false이며 실제 탐색 시작 요청은 501로 거절한다.
+이 문서는 A1·A2의 설정 준비·결과 보존·트리 저장/재생 계약이다. 추가 구현된 A3 scorer는 [별도 계약](v4-scorer-v1.md)에 정리했다. 탐욕 탐색 루프·취약점 검증기는 A4에서 연결하므로 `execution_ready`는 false이며 실제 탐색 시작 요청은 501로 거절한다.
 
 ## 설정 준비 API
 
@@ -18,9 +18,9 @@
 }
 ```
 
-`scorer_provider`는 `openrouter` 또는 `local`이다. 별도 `scorer_settings`에는 `rubric_version`, `reevaluation_policy=scoring_fields_v1`, `timeout_seconds`, `max_retries`, `max_calls`, `max_calls_per_parent`, `batch_size`, `max_input_bytes`를 선택적으로 저장할 수 있다. 로컬에 한해 `base_url`, `protocol=ollama|decisions`, `num_ctx`, `num_predict`, `temperature`를 받는다. 범위는 `experiment_config.py`에서 검증한다. 자격증명이나 OpenRouter 생성 옵션은 받지 않는다. 아직 결정하지 않은 판정 설정의 기본값을 임의로 채우지 않는다.
+`scorer_provider`는 `openrouter` 또는 `local`이다. 별도 `scorer_settings`에는 `rubric_version`, `reevaluation_policy=scoring_fields_v1`, `timeout_seconds`, `max_retries`, `max_calls`, `max_calls_per_parent`, `batch_size`, `max_input_bytes`, `max_cost_usd`, `time_budget_seconds`를 선택적으로 저장할 수 있다. 로컬에 한해 `base_url`, `protocol=ollama|decisions`, `num_ctx`, `num_predict`, `temperature`를 받는다. 범위는 `experiment_config.py`에서 검증한다. 자격증명이나 OpenRouter 생성 옵션은 받지 않는다. 준비 API는 기본값을 채우지 않으며, A3 연결 시 버전이 있는 실효 설정을 별도 저장한다.
 
-실행 LLM의 `model_settings`, 기존 실행 `budgets`도 따로 저장할 수 있다. 이는 미래 v4 실행에 필요한 모든 예산이 확정됐다는 뜻이 아니다. A3 첫 요청 전 계약 값과 첫 대상 실행 전 v4 예산 설정은 여전히 선행조건이다. v4 실행 프롬프트는 아직 없으므로 준비 요청에서 `prompt_version`을 생략한다. v3의 `/api/start`는 기존 프롬프트·실행 경로를 유지하고 `experiment_mode` 생략 시 v3로 기록한다. v3에서는 전달받은 scorer 설정을 사용하거나 저장하지 않는다.
+실행 LLM의 `model_settings`, 기존 실행 `budgets`도 따로 저장할 수 있다. A3 판정 계약·scorer 기본값은 확정했지만, 첫 대상 실행 전 A4의 총 예산·검증/정리 예약을 연결해야 한다. v4 실행 프롬프트는 아직 없으므로 준비 요청에서 `prompt_version`을 생략한다. v3의 `/api/start`는 기존 프롬프트·실행 경로를 유지하고 `experiment_mode` 생략 시 v3로 기록한다. v3에서는 scorer 설정을 사용하거나 저장하지 않는다.
 
 준비 기록은 runtime·관리 프로세스가 없고 보존이 끝난 경우에만 다음 실험을 막지 않는다. `GET /api/runs/{run_id}`로 설정과 준비 상태를 읽을 수 있다. 기존 복구 API는 v4 준비 기록에 대해서 트리만 재구성한다. 준비 기록에 예상하지 못한 runtime·프로세스가 있으면 제거하지 않고 복구를 거절한다.
 

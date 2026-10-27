@@ -122,6 +122,34 @@ class V4PreparationTests(unittest.TestCase):
         self.assertTrue(self.explorer.recover(runs[0]["run_id"]))
         self.assertTrue(self.explorer.can_start()[0])
 
+    def test_scored_preparation_recovers_usage_and_risks_without_network(self):
+        from session_log import SessionLog
+        from v4_tree import TreeStore
+        from scorer_session import RiskScorer
+        from test_scorer_session import FakeAdapter
+        from test_v4_tree import surface
+        run_id = self._prepare()
+        log = SessionLog(self.root, run_id, recovery=True)
+        try:
+            tree = TreeStore(log)
+            tree.rebuild()
+            node_id = tree.discover("N0001", surface())
+            RiskScorer(tree, adapter=FakeAdapter()).score_children("N0001")
+        finally:
+            log.close()
+        (self.root / run_id / "session.json").unlink()
+        (self.root / run_id / "scorer.json").write_text("{broken", encoding="utf-8")
+        with patch("decision_provider.OpenRouterDecisions.resolve", side_effect=AssertionError("No catalog during replay")), \
+             patch("decision_provider.OpenRouterDecisions.evaluate", side_effect=AssertionError("No inference during replay")):
+            self.assertTrue(self.explorer.recover(run_id))
+        saved = self.explorer.get_run(run_id)
+        self.assertEqual(saved["scorer_validation"], "catalog_verified")
+        self.assertEqual(saved["scorer_usage"]["requests"], 1)
+        self.assertEqual(saved["scorer_usage"]["cost_usd"], .0000042)
+        node = json.loads((self.root / run_id / "nodes" / f"{node_id}.json").read_text(encoding="utf-8"))
+        self.assertEqual(node["risk"]["score"], 75)
+        self.assertFalse(saved["execution_ready"])
+
     def test_missing_v4_creation_identity_cannot_fall_back_to_legacy_recovery(self):
         run_id = self._prepare()
         directory = self.root / run_id
