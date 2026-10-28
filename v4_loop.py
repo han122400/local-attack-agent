@@ -107,7 +107,8 @@ class V4Runner:
         attempts = 0
         self.tree.select_node(node_id)
         for _ in range(self.settings["node_tool_calls"]):
-            self.gate.check()
+            if self.gate.check()["tool_calls"] >= self.gate.budgets["tool_calls"]:
+                raise V4BudgetStop("call_budget")
             if attempts >= self.settings["node_attempts"]:
                 break
             context = self._context(node_id)

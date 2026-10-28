@@ -1,6 +1,6 @@
 # v4 구현 계획 — 노드 트리, 선택형 위험도 평가, 탐욕적 탐색
 
-> 2026-10-28 기준. A1·A2 저장 계약, A3 점수화와 A4 탐욕 탐색·SQLi 실습 확인·보고서/복구 코드를 연결했다. A4는 관련 단위 검증을 통과하고 최종 코드 검토 중이다. A5 비교 실험과 B 대시보드·로컬 판정 어댑터는 별도다. 이 문서는 기존 `EXPLORATION_DESIGN_REVIEW.md`의 전역 frontier 설계를 합의한 트리 탐색으로 교체한다.
+> 2026-10-28 기준. A1·A2 저장 계약, A3 점수화와 A4 탐욕 탐색·SQLi 실습 확인·보고서/복구를 구현했다. A4 관련 단위 검증과 작성자 검토를 마쳤다. 독립 에이전트 검토는 계정 보안 조건으로 실행되지 않았으며 상세는 실행 계약에 기록했다. A5 비교 실험과 B 대시보드·로컬 판정 어댑터는 별도다. 이 문서는 기존 `EXPLORATION_DESIGN_REVIEW.md`의 전역 frontier 설계를 합의한 트리 탐색으로 교체한다.
 
 구현된 A1·A2는 [저장 계약](docs/v4-contract-v1.md), A3는 [scorer 계약](docs/v4-scorer-v1.md), A4의 확인 정책·예산·API 사용법은 [실행 계약](docs/v4-execution-v1.md)에 정리했다. A3의 합성 실호출은 `typesafe/jev-1.14` → `typesafe/jev-1.14-20261014`와 Score/usage 계약을 확인했으며 판단 품질 검증은 아니다. `/api/v4/prepare`는 계속 설정·루트만 보존한다. `/api/start`의 v4는 호환 프롬프트로 실제 트리 루프를 실행한다. 로컬 판정 제공자는 B 어댑터 전까지 501이다. 준비는 `execution_ready=false`, scorer 목록 확인 전 `syntax_only`, 확인 후 `catalog_verified`로 구분한다.
 

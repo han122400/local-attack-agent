@@ -668,6 +668,18 @@ class ExplorerV3:
             with self.lock:
                 self._runtime = runtime
             self._finalize(run_id, log, runtime, result, reason)
+        except Exception as exc:
+            if log.metadata.get("experiment_mode") != "v4":
+                raise
+            # Invalid ownership must not skip the reducer-independent report.
+            # Keep all runtime files and original ownership records for repair.
+            from v4_reporting import save_report, _metadata
+            try:
+                error = f"{type(exc).__name__}: {exc}"[:500]
+                save_report(log, result, reason, error=error)
+                _metadata(log, phase="recovery_required", cleanup_status="recovery_required", cleanup_error=error)
+            finally:
+                log.close()
         finally:
             with self.lock:
                 self._runtime = None

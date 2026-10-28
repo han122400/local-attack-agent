@@ -161,6 +161,16 @@ class LoopTests(unittest.TestCase):
             gate.check()
         self.assertEqual(caught.exception.reason, "cost_budget")
 
+    def test_exhausted_tool_budget_does_not_spend_another_model_call(self):
+        self.log.update(budgets={**self.log.metadata["budgets"], "tool_calls": 1})
+        calls = []
+        def callback(context):
+            calls.append(context)
+            return {**self.command(context), "action": "write_file", "path": "work/prep.py", "content": "pass", "command": ""}
+        result = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter()).run()
+        self.assertEqual(result[1], "call_budget")
+        self.assertEqual(len(calls), 1)
+
     def test_lab_oracle_is_wired_to_attempt_and_can_confirm_a_known_positive(self):
         from test_v4_oracle import OracleTests
         fixture = OracleTests()

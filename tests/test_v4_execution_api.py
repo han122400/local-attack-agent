@@ -148,6 +148,23 @@ class ExecutionApiTests(unittest.TestCase):
         self.assertTrue(runtime.runtime_dir.exists())
         self.assertFalse(self.explorer.can_start()[0])
 
+    def test_bad_recovery_ownership_still_produces_a_report_and_retains_runtime(self):
+        from command_runtime import CommandRuntime
+        from v4_tree import TreeStore
+        log = SessionStore(self.root).create("d" * 32, {**self.body, "v4_stage": "execution", "phase": "running",
+            "managed_processes": [{"pid": "invalid", "created_at": 1.0, "run_id": "d" * 32}],
+            "budgets": {"finalize_seconds": 10}, "lab_reset_status": "not_applicable"})
+        TreeStore(log).initialize(self.body["target"])
+        runtime = CommandRuntime(self.root, log)
+        runtime.start_session(log.run_id, browser=False)
+        log.close()
+        self.assertTrue(self.explorer.recover(log.run_id))
+        self.explorer.worker.join(10)
+        metadata = SessionStore(self.root).read(log.run_id)
+        self.assertEqual(metadata.get("report_status"), "degraded")
+        self.assertEqual(metadata["phase"], "recovery_required")
+        self.assertTrue(runtime.runtime_dir.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
