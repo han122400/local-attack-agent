@@ -46,7 +46,8 @@ class ResultContractTests(unittest.TestCase):
 
     def test_rejects_escaping_or_non_exported_evidence(self):
         for path in ("../outside", "/secret", "C:/secret", "work/../secret", "work\\file",
-                     "runtime/file.txt", "artifacts/old.txt", "work/file:stream", "work/NUL"):
+                     "runtime/file.txt", "artifacts/old.txt", "work/file:stream", "work/NUL",
+                     "work/node-results/A0001.json"):
             with self.subTest(path=path), self.assertRaises(ContractError):
                 validate_result(result(evidence_refs=[{"path": path, "description": "x"}]),
                                 attempt_id="A0001", node_id="N0001")

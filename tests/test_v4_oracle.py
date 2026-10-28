@@ -56,6 +56,13 @@ class OracleTests(unittest.TestCase):
         for request in self.requests[2:]:
             self.assertNotIn("Authorization", request.headers)
 
+    def test_oracle_requests_uncompressed_http_bodies(self):
+        token = self.oracle.begin(self.attempt, NODE)
+        self.solved = True
+        self.oracle.finish(token, self.attempt, NODE)
+        self.assertTrue(self.requests)
+        self.assertTrue(all(request.headers.get("Accept-Encoding") == "identity" for request in self.requests))
+
     def test_solved_flag_with_parameterized_behavior_is_inconclusive(self):
         token = self.oracle.begin(self.attempt, NODE)
         self.solved, self.patched = True, True

@@ -122,6 +122,8 @@ def evidence_path(value: str) -> str:
         raise ContractError(str(exc)) from exc
     if len(relative.parts) < 2 or relative.parts[0] not in ("work", "tools"):
         raise ContractError("Evidence must be under work/ or tools/")
+    if len(relative.parts) >= 3 and relative.parts[:2] == ("work", "node-results"):
+        raise ContractError("Result JSON cannot be used as independent evidence")
     for part in relative.parts:
         if part.rstrip(" .") != part or re.fullmatch(r"(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", part):
             raise ContractError("Invalid evidence filename")

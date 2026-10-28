@@ -3,6 +3,7 @@
 import json
 import threading
 import time
+from dataclasses import replace
 from urllib.parse import urlsplit
 
 from harness import Harness, ModelFailure
@@ -10,10 +11,11 @@ from model_providers import is_openrouter
 from planning import load_prompt
 from scorer_session import RiskScorer
 from v4_usage import summarize_usage
-from v4_contracts import ContractError, RESULT_SCHEMA
+from v4_contracts import ContractError, RESULT_SCHEMA, validate_result
 from v4_oracle import LabOracle
 from v4_policy import V4BudgetStop, execution_settings, supported_candidate
-from v4_tree import TreeStore
+from v4_tree import TreeStore, MAX_EVIDENCE_BYTES, _read_bounded
+from risk_rubric import observations, OBSERVATIONS_SCHEMA
 
 
 class BudgetGate:
@@ -94,6 +96,9 @@ class V4Runner:
         value = {"goal": self.log.metadata["goal"], "target": self.log.metadata["target"], "node": public(node),
                 "parent_path": path[-8:], "runtime_path": str(self.runtime.runtime_dir), "python": self.runtime.python,
                 "attempt": {"attempt_id": attempt_id, "node_id": node_id, "result_path": f"work/node-results/{attempt_id}.json"},
+                "result_template": {"schema_version": 1, "attempt_id": attempt_id, "node_id": node_id,
+                                    "discovered": [], "proposed_verdict": "inconclusive", "claim": "",
+                                    "evidence_refs": [], "next_observation": ""},
                 "result_schema": RESULT_SCHEMA, "recent": self.history[-2:], "sibling_ranks": ranks[:20], "total_siblings": len(siblings),
                 "remaining": {"seconds": max(0, int(self.gate.deadline - self.gate.clock())),
                               "model_calls": self.gate.budgets["model_calls"] - self.gate.usage()["model_calls"]}}
@@ -103,10 +108,46 @@ class V4Runner:
             raise V4BudgetStop("context_budget")
         return value
 
+    @staticmethod
+    def _sanitize_result_observations(value):
+        """Drop only invalid optional scorer features; never invent evidence or a verdict."""
+        if not isinstance(value, dict):
+            return value, []
+        removed = []
+        targets = [("result", value)]
+        if isinstance(value.get("discovered"), list):
+            targets.extend((f"discovered[{index}]", item) for index, item in enumerate(value["discovered"])
+                           if isinstance(item, dict))
+        for label, item in targets:
+            if "observations" not in item:
+                continue
+            raw = item["observations"]
+            if not isinstance(raw, dict):
+                item.pop("observations")
+                removed.append(label)
+                continue
+            accepted = {}
+            for field, field_value in raw.items():
+                if field not in OBSERVATIONS_SCHEMA["properties"]:
+                    removed.append(f"{label}.{field}")
+                    continue
+                try:
+                    accepted[field] = observations({field: field_value})[field]
+                except ValueError:
+                    removed.append(f"{label}.{field}")
+            if accepted:
+                item["observations"] = observations(accepted)
+            else:
+                item.pop("observations")
+        return value, removed
+
     def _investigate(self, node_id):
         attempts = 0
+        node_tools = 0
         self.tree.select_node(node_id)
         for _ in range(self.settings["node_tool_calls"]):
+            if node_tools >= self.settings["node_tool_calls"]:
+                break
             if self.gate.check()["tool_calls"] >= self.gate.budgets["tool_calls"]:
                 raise V4BudgetStop("call_budget")
             if attempts >= self.settings["node_attempts"]:
@@ -144,6 +185,7 @@ class V4Runner:
             if timeout <= 0:
                 raise V4BudgetStop("time_budget")
             output = self.runtime.run(self.log.run_id, command.runtime_payload(), call_id=command.call_id, timeout=timeout)
+            node_tools += 1
             self.history.append({"node_id": node_id, "action": command.action, "exit_code": output.exit_code,
                                  "stdout": output.stdout[-2500:], "stderr": output.stderr[-1000:]})
             if not attempt:
@@ -152,9 +194,71 @@ class V4Runner:
                 imported = self.tree.import_result(attempt["attempt_id"], exec_id=output.exec_id)
             except (ValueError, OSError) as exc:
                 reason = "missing_result" if not (self.runtime.runtime_dir / attempt["result_path"]).exists() else "invalid_result"
-                self.tree.fail_attempt(attempt["attempt_id"], reason=reason, exec_id=output.exec_id)
                 self.history[-1]["result_error"] = reason
-                continue
+                original_ref = None
+                if reason == "invalid_result":
+                    raw = _read_bounded(self.runtime.runtime_dir, attempt["result_path"], MAX_EVIDENCE_BYTES)
+                    original_ref = self.log.preserve_bytes(f"invalid-node-results/{attempt['attempt_id']}-before-repair.json", raw)
+                self.log.append("v4_result_repair_requested", {"attempt_id": attempt["attempt_id"],
+                    "node_id": node_id, "exec_id": output.exec_id, "reason": reason, "original_ref": original_ref})
+                if (node_tools >= self.settings["node_tool_calls"]
+                        or self.gate.check()["tool_calls"] >= self.gate.budgets["tool_calls"]):
+                    self.tree.fail_attempt(attempt["attempt_id"], reason=reason, exec_id=output.exec_id)
+                    continue
+                repair = self._context(node_id)
+                repair["attempt"] = {"attempt_id": attempt["attempt_id"], "node_id": node_id,
+                                     "result_path": attempt["result_path"]}
+                repair["result_template"]["attempt_id"] = attempt["attempt_id"]
+                repair.pop("result_schema", None)
+                repair["instruction"] = ("The preceding tool already ran for this attempt but its result JSON is "
+                    + reason + ". Use action=write_file, path=attempt.result_path, and content as a JSON string "
+                    "made from result_template. Include specific discovered input surfaces if observed. "
+                    "Keep every template field. evidence_refs may refer only to separately written observation files, "
+                    "never a node-results JSON or an absolute path. Do not run another target request in this response.")
+                def validate_correction(candidate):
+                    if candidate.action != "write_file" or candidate.path != attempt["result_path"]:
+                        raise ValueError("Use write_file at the exact pending attempt.result_path")
+                    value = json.loads(candidate.content)
+                    if isinstance(value, dict) and "next_observation" not in value:
+                        raise ValueError("Result JSON is missing next_observation")
+                    value, removed = self._sanitize_result_observations(value)
+                    validate_result(value, attempt_id=attempt["attempt_id"], node_id=node_id)
+                    if removed:
+                        self.log.append("v4_result_observations_dropped", {"attempt_id": attempt["attempt_id"],
+                            "fields": removed})
+                    return replace(candidate, content=json.dumps(value, ensure_ascii=False))
+
+                try:
+                    correction = self.harness.decide(self.log.run_id, repair, model=self.log.metadata["model"],
+                        settings=self.log.metadata["model_settings"], deadline=self.gate.deadline - reserve,
+                        command_validator=validate_correction)
+                except V4BudgetStop:
+                    self.tree.fail_attempt(attempt["attempt_id"], reason=reason, exec_id=output.exec_id)
+                    raise
+                except ModelFailure as model_exc:
+                    self.tree.fail_attempt(attempt["attempt_id"], reason=reason, exec_id=output.exec_id)
+                    if model_exc.kind in ("budget", "cancelled", "timed_out", "transport"):
+                        raise V4BudgetStop({"budget": "call_budget", "cancelled": "user_stopped",
+                            "timed_out": "time_budget", "transport": "model_unavailable"}[model_exc.kind]) from model_exc
+                    continue
+                self.gate.check()
+                fix_timeout = min(self.gate.budgets["command_seconds"], self.gate.deadline - self.gate.clock() - reserve)
+                if fix_timeout <= 0:
+                    self.tree.fail_attempt(attempt["attempt_id"], reason=reason, exec_id=output.exec_id)
+                    raise V4BudgetStop("time_budget")
+                fixed = self.runtime.run(self.log.run_id, correction.runtime_payload(), call_id=correction.call_id,
+                                         timeout=fix_timeout)
+                node_tools += 1
+                self.log.append("v4_result_repair_finished", {"attempt_id": attempt["attempt_id"],
+                    "call_id": correction.call_id, "exec_id": fixed.exec_id, "exit_code": fixed.exit_code})
+                if fixed.exit_code != 0 or fixed.timed_out:
+                    self.tree.fail_attempt(attempt["attempt_id"], reason=reason, exec_id=output.exec_id)
+                    continue
+                try:
+                    imported = self.tree.import_result(attempt["attempt_id"], exec_id=output.exec_id)
+                except (ValueError, OSError):
+                    self.tree.fail_attempt(attempt["attempt_id"], reason="invalid_result", exec_id=output.exec_id)
+                    continue
             if imported["execution_status"] != "succeeded":
                 continue
             origin = urlsplit(self.log.metadata["target"])

@@ -76,7 +76,7 @@ class Harness:
         self.output_num_predict_floor = None   # raised, persisted output budget after a length-truncation
 
     def decide(self, run_id: str, context: dict, *, model: str, settings: dict,
-               deadline: float | None = None) -> Command:
+               deadline: float | None = None, command_validator=None) -> Command:
         if run_id != self.run_id:
             raise ValueError("Harness belongs to another run")
         selected = validate_model_settings(settings)
@@ -172,6 +172,10 @@ class Harness:
                         self.log.append("command_normalized", {"call_id": call_id, "action": answer.get("action"),
                                                                "fields": normalized_fields})
                     command = validate_command(answer)
+                    if command_validator is not None:
+                        checked = command_validator(command)
+                        if checked is not None:
+                            command = checked
                 except (ValueError, TypeError) as exc:
                     raise ModelFailure("format", f"Invalid Command: {exc}", call_id) from exc
                 self.log.append("command_decoded", {"call_id": call_id, "action": command.action,

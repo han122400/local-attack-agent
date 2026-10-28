@@ -29,6 +29,10 @@ class Runtime:
         if payload["action"] == "run_command" and not self.missing:
             fixture = json.loads(payload["command"])
             (self.runtime_dir / "work" / "node-results" / (fixture["attempt_id"] + ".json")).write_text(json.dumps(fixture), encoding="utf-8")
+        if payload["action"] == "write_file":
+            path = self.runtime_dir / payload["path"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(payload["content"], encoding="utf-8")
         self.log.append("exec_finished", {"exec_id": exec_id, "call_id": call_id, "action": payload["action"],
             "exit_code": 0, "timed_out": False, "cancelled": False, "failure_source": None})
         return result
@@ -65,6 +69,9 @@ class LoopTests(unittest.TestCase):
             node = context["node"]["id"]
             visited.append(node)
             self.assertNotIn("dbSchemaChallenge", json.dumps(context))
+            self.assertEqual(context["result_template"]["attempt_id"], context["attempt"]["attempt_id"])
+            self.assertEqual(context["result_template"]["node_id"], node)
+            self.assertIn("next_observation", context["result_template"])
             if node == "N0001":
                 return self.command(context, [surface("https://example.test/low"), surface("https://example.test/high")])
             if node == "N0003":
@@ -103,6 +110,50 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(runtime.calls, 2)
         state = TreeStore(self.log).rebuild()
         self.assertTrue(all(item["status"] == "failed" for item in state["attempts"].values()))
+
+    def test_missing_result_can_be_submitted_by_a_separate_bound_write(self):
+        visited = []
+        def callback(context):
+            visited.append(context["node"]["id"])
+            if "result JSON" in context.get("instruction", ""):
+                discovered = surface("https://example.test/search")
+                discovered["observations"] = {"input_control": "free text should be dropped"}
+                value = {**context["result_template"], "discovered": [discovered]}
+                return {"action": "write_file", "plan": "save observed surface", "reason": "complete the bound result",
+                        "path": context["attempt"]["result_path"], "content": json.dumps(value), "command": "", "code": ""}
+            if context["node"]["id"] != "N0001":
+                return self.command(context, action="finish")
+            return self.command(context)
+        runner = V4Runner(self.log, Runtime(self.log, missing=True),
+                          transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        state = TreeStore(self.log).rebuild()
+        self.assertEqual(len(state["nodes"]), 2)
+        self.assertEqual(state["attempts"]["A0001"]["status"], "imported")
+        self.assertIn("v4_result_repair_finished", [event["kind"] for event in self.log.snapshot_events()])
+        self.assertIn("v4_result_observations_dropped", [event["kind"] for event in self.log.snapshot_events()])
+        self.assertEqual(visited, ["N0001", "N0001", "N0002"])
+
+    def test_repair_uses_remaining_node_tool_budget(self):
+        self.log.update(v4_settings={"node_tool_calls": 1})
+        called = []
+        def callback(context):
+            called.append(context)
+            return self.command(context)
+        runner = V4Runner(self.log, Runtime(self.log, missing=True),
+                          transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        self.assertEqual(len(called), 1)
+        self.assertEqual(TreeStore(self.log).rebuild()["attempts"]["A0001"]["status"], "failed")
+
+    def test_optional_observation_sanitizer_keeps_valid_fields(self):
+        value = {"observations": {"input_control": "full", "baseline_compared": True,
+                                  "query_behavior": "free form", "unexpected": "ignored"}}
+        clean, removed = V4Runner._sanitize_result_observations(value)
+        self.assertEqual(clean["observations"]["input_control"], "full")
+        self.assertTrue(clean["observations"]["baseline_compared"])
+        self.assertEqual(clean["observations"]["query_behavior"], "unknown")
+        self.assertEqual(set(removed), {"result.query_behavior", "result.unexpected"})
 
     def test_stop_is_honored_before_model_or_scorer(self):
         stop = threading.Event()

@@ -66,6 +66,25 @@ class TreeStoreTests(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in (self.log.run_dir / "nodes").glob("*.json")),
                          ["N0001.json", "N0002.json", "N0003.json"])
 
+    def test_import_treats_query_payload_as_same_input_surface(self):
+        surface_id = self.tree.discover(self.root_id, surface("https://example.test/search?q="))
+        attempt = self.tree.begin_attempt(surface_id, call_id="CALL-0001")
+        self.log.append("exec_started", {"exec_id": "EXEC-0001", "call_id": "CALL-0001", "action": "run_command"})
+        path = self.log.run_dir / "runtime" / attempt["result_path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"schema_version": 1, "attempt_id": attempt["attempt_id"],
+            "node_id": surface_id, "discovered": [surface("https://example.test/search?q=%27%20OR%201%3D1")],
+            "proposed_verdict": "inconclusive", "claim": "", "next_observation": "",
+            "evidence_refs": []}), encoding="utf-8")
+        self.log.append("exec_finished", {"exec_id": "EXEC-0001", "call_id": "CALL-0001", "action": "run_command",
+                       "exit_code": 0, "timed_out": False, "cancelled": False, "failure_source": None})
+        self.tree.import_result(attempt["attempt_id"], exec_id="EXEC-0001")
+        self.assertEqual(len(self.tree.state["nodes"]), 2)
+        imported = next(event for event in self.log.read_events() if event["kind"] == "node_result_imported")
+        self.assertEqual(imported["payload"]["result"]["discovered"][0]["locator"]["url"],
+                         "https://example.test/search?q=")
+        self.assertEqual(len(replay_tree(self.log.read_events(), RUN_ID)["nodes"]), 2)
+
     def test_selection_and_state_survive_replay_without_reexecuting_commands(self):
         node_id = self.tree.discover(self.root_id, surface())
         self.tree.select_node(node_id)

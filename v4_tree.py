@@ -12,6 +12,7 @@ import json
 import re
 import stat
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from session_log import LogFailure, SessionLog, atomic_write_json, safe_relative_path, validate_run_id
 from v4_contracts import (SCHEMA_VERSION, MAX_RESULT_BYTES, MAX_EVIDENCE_BYTES, MAX_TOTAL_EVIDENCE_BYTES,
@@ -452,6 +453,16 @@ class TreeStore:
             runtime = self.log.run_dir / "runtime"
             raw = _read_bounded(runtime, attempt["result_path"], MAX_RESULT_BYTES)
             result = validate_result(_json_result(raw), attempt_id=attempt_id, node_id=attempt["node_id"])
+            # Persist a stable input location in new events. The original
+            # model result is preserved below; replay of older events keeps
+            # its original reducer semantics.
+            for discovery in result["discovered"]:
+                locator = discovery["locator"]
+                parts = urlsplit(locator["url"])
+                if parts.query:
+                    names = sorted({name for name, _ in parse_qsl(parts.query, keep_blank_values=True)})
+                    locator["url"] = urlunsplit((parts.scheme, parts.netloc, parts.path,
+                                                  urlencode([(name, "") for name in names]), ""))
             captured = []
             total = 0
             for ref in result["evidence_refs"]:

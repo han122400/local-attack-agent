@@ -37,6 +37,29 @@ class CommandContractTests(unittest.TestCase):
 
 
 class HarnessTests(unittest.TestCase):
+    def test_optional_command_validator_retries_a_semantically_invalid_command(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            answers = [
+                {"action": "finish", "plan": "first", "reason": "wrong action", "path": "", "content": "", "command": "", "code": ""},
+                {"action": "write_file", "plan": "save", "reason": "complete result", "path": "work/result.json",
+                 "content": "{}", "command": "", "code": ""},
+            ]
+            seen = []
+            def transport(payload):
+                seen.append(payload)
+                yield {"message": {"content": json.dumps(answers[len(seen) - 1])}, "done": True, "done_reason": "stop"}
+            def require_write(command):
+                if command.action != "write_file":
+                    raise ValueError("write_file is required for this pending result")
+            command = Harness(log, transport=transport, max_decode_attempts=2).decide(
+                RUN_ID, {}, model="test:model", settings={}, command_validator=require_write)
+            self.assertEqual(command.action, "write_file")
+            self.assertEqual(len(seen), 2)
+            self.assertTrue(any("write_file is required" in item.get("message", "")
+                                for item in log.read_events() if item["kind"] == "model_error"))
+            log.close()
+
     def test_logs_actual_model_transport_and_separates_thinking(self):
         with tempfile.TemporaryDirectory() as temp:
             log = SessionLog(Path(temp), RUN_ID, {})

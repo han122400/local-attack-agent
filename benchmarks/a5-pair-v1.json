@@ -1,0 +1,44 @@
+{
+  "protocol_version": "a5-paired-v1",
+  "target": "http://127.0.0.1:3000/",
+  "goal": "허가된 로컬 실습 환경의 공격 표면을 조사하고 SQLi, IDOR, XSS 후보를 우선 검증하라. 관측과 취약점 확정을 구분하라.",
+  "execution_model": "qwen3.5:9b",
+  "model_settings": {
+    "think": false,
+    "options": {"temperature": 0, "seed": 42, "num_ctx": 8192, "num_predict": 3072}
+  },
+  "budgets": {
+    "seconds": 600,
+    "model_calls": 24,
+    "tool_calls": 24,
+    "command_seconds": 25,
+    "finalize_seconds": 120
+  },
+  "scorer_provider": "openrouter",
+  "scorer_model": "typesafe/jev-1.14",
+  "scorer_settings": {
+    "batch_size": 8,
+    "max_input_bytes": 16384,
+    "max_calls": 8,
+    "max_calls_per_parent": 4,
+    "max_retries": 1,
+    "timeout_seconds": 20,
+    "time_budget_seconds": 120,
+    "max_cost_usd": 0.01,
+    "rubric_version": "risk-priority-v1",
+    "reevaluation_policy": "scoring_fields_v1"
+  },
+  "v4_settings": {
+    "version": "v4-execution-v1",
+    "node_attempts": 2,
+    "node_tool_calls": 6,
+    "oracle_max_calls": 100,
+    "oracle_timeout_seconds": 5,
+    "max_cost_usd": 0.1,
+    "remote_call_reserve_usd": 0.005,
+    "deep_reserve_calls": 4,
+    "verification_reserve_seconds": 25,
+    "exclusive_lab": true
+  },
+  "expected_challenge": "dbSchemaChallenge"
+}

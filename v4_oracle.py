@@ -66,7 +66,8 @@ class LabOracle:
         started, ref, status = time.monotonic(), None, None
         try:
             with self.client.stream("GET", LAB_TARGET + path, params=params, timeout=timeout,
-                                    follow_redirects=False, headers={"Cache-Control": "no-store"}) as response:
+                                    follow_redirects=False, headers={"Cache-Control": "no-store",
+                                                                     "Accept-Encoding": "identity"}) as response:
                 status, raw = response.status_code, bytearray()
                 for chunk in response.iter_bytes():
                     raw.extend(chunk)
