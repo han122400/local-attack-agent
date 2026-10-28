@@ -43,7 +43,8 @@ def execution_settings(raw=None):
 
 
 def supported_candidate(node):
-    if not isinstance(node, dict) or node.get("kind") != "candidate" or (node.get("hypothesis") or {}).get("type") != "sqli":
+    if (not isinstance(node, dict) or node.get("kind") != "candidate"
+            or (node.get("hypothesis") or {}).get("type") not in {"sqli", "sql_injection"}):
         return False
     locator = node.get("locator", {})
     try:

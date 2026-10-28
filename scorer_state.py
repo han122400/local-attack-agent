@@ -6,21 +6,26 @@ import copy
 import math
 import re
 
-from decision_provider import ProviderError, estimated_cost, validate_pin
+from decision_provider import (ProviderError, build_local_chat_payload, estimated_cost,
+                               validate_local_pin, validate_pin)
 from experiment_config import validate_experiment_config
 from risk_rubric import (CONTRACT_VERSION, PROJECTION_VERSION, RUBRIC_VERSION, CRITERIA,
-                         ScoreContractError, build_score_request, canonical_bytes, fingerprint,
-                         is_finite_number, project_node, validate_answer, validate_usage)
+                         ScoreContractError, build_ordinal_request, build_score_request, canonical_bytes,
+                         fingerprint, is_finite_number, project_node, validate_answer,
+                         validate_ordinal_answer, validate_usage)
 from v4_contracts import ContractError
 
 
 SCORING_EVENTS = {"scorer_configured", "scorer_request_started", "scorer_request_finished",
                   "scorer_batch_applied", "scorer_halted"}
 SETTINGS_VERSION = "scorer-settings-v1"
+ORDINAL_CONTRACT_VERSION = "ordinal-label-v1"
 DEFAULT_SETTINGS = {"batch_size": 8, "max_input_bytes": 16384, "max_calls": 20,
                     "max_calls_per_parent": 4, "max_retries": 1, "timeout_seconds": 20,
                     "time_budget_seconds": 120, "max_cost_usd": .01,
                     "rubric_version": RUBRIC_VERSION, "reevaluation_policy": PROJECTION_VERSION}
+LOCAL_DEFAULT_SETTINGS = {"protocol": "ollama", "base_url": "http://127.0.0.1:11434/",
+                          "num_ctx": 8192, "num_predict": 512, "temperature": 0}
 _UNSCORED = {"invalid_input", "invalid_answer", "parent_limit", "input_limit"}
 _STOPS = {"call_budget", "cost_budget", "time_budget", "scorer_unavailable"}
 
@@ -31,15 +36,28 @@ def empty_scorer() -> dict:
 
 def effective_settings(metadata: dict) -> dict:
     config = validate_experiment_config(metadata)
-    if config["experiment_mode"] != "v4" or config["scorer_provider"] != "openrouter":
-        raise ContractError("A3 supports only the OpenRouter Decisions scorer; local support belongs to B")
-    settings = {**DEFAULT_SETTINGS, **config["scorer_settings"]}
+    if config["experiment_mode"] != "v4":
+        raise ContractError("Scoring requires v4")
+    settings = {**DEFAULT_SETTINGS,
+                **(LOCAL_DEFAULT_SETTINGS if config["scorer_provider"] == "local" else {}),
+                **config["scorer_settings"]}
     if "max_calls_per_parent" not in config["scorer_settings"]:
         settings["max_calls_per_parent"] = min(settings["max_calls_per_parent"], settings["max_calls"])
     validate_experiment_config({**config, "scorer_settings": settings})
     if settings["rubric_version"] != RUBRIC_VERSION or settings["reevaluation_policy"] != PROJECTION_VERSION:
         raise ContractError("Unsupported scoring contract version")
     return settings
+
+
+def score_request(configuration: dict, parent: dict, siblings: list[dict], ids: list[str]) -> dict:
+    builder = build_ordinal_request if configuration["provider"] == "local" else build_score_request
+    return builder(configuration["model_pin"]["id"], parent, siblings, ids)
+
+
+def scoring_request_bytes(configuration: dict, request: dict) -> int:
+    wire = (build_local_chat_payload(request, configuration["settings"])
+            if configuration["provider"] == "local" else request)
+    return len(canonical_bytes(wire))
 
 
 def context(tree: dict, parent_id: str, configuration: dict) -> dict:
@@ -66,8 +84,9 @@ def usage(state: dict) -> dict:
     requests = [item for item in state["requests"].values() if item.get("finish", {}).get("attempted", True)]
     known = [item["finish"]["usage"] for item in requests if item.get("finish", {}).get("usage") is not None]
     unknown = [item for item in requests if item.get("finish", {}).get("usage") is None]
+    unknown_cost = [] if (state["configuration"] or {}).get("provider") == "local" else unknown
     known_cost = sum(item["cost"] for item in known)
-    reserved = sum(item["estimated_cost_usd"] for item in unknown)
+    reserved = sum(item["estimated_cost_usd"] for item in unknown_cost)
     seconds = sum(item["finish"]["elapsed_seconds"] if "finish" in item else item["timeout_seconds"] for item in requests)
     seconds += (state["configuration"] or state["halt"] or {}).get("catalog_elapsed_seconds", 0)
     return {"requests": len(requests), "questions": sum(len(item["node_ids"]) for item in requests),
@@ -77,8 +96,8 @@ def usage(state: dict) -> dict:
             "output_tokens": None if unknown else sum(item["output_tokens"] for item in known),
             "known_input_tokens": sum(item["input_tokens"] for item in known),
             "known_output_tokens": sum(item["output_tokens"] for item in known),
-            "cost_usd": None if unknown else known_cost, "known_cost_usd": known_cost,
-            "unknown_cost_requests": len(unknown), "reserved_cost_usd": reserved,
+            "cost_usd": None if unknown_cost else known_cost, "known_cost_usd": known_cost,
+            "unknown_cost_requests": len(unknown_cost), "reserved_cost_usd": reserved,
             "accounted_cost_usd": known_cost + reserved, "elapsed_seconds": seconds}
 
 
@@ -88,9 +107,12 @@ def numeric(value):
     return value
 
 
-def _score(value: dict) -> dict:
-    parsed = validate_answer({"type": "score", "score": value["raw_score"], "probabilities": value["probabilities"],
-                              "confidence": value["confidence"], "legend": {str(i): text for i, text in enumerate(CRITERIA)}})
+def _score(value: dict, provider: str) -> dict:
+    if provider == "local":
+        parsed = validate_ordinal_answer(value["label"])
+    else:
+        parsed = validate_answer({"type": "score", "score": value["raw_score"], "probabilities": value["probabilities"],
+                                  "confidence": value["confidence"], "legend": {str(i): text for i, text in enumerate(CRITERIA)}})
     if value != parsed:
         raise ContractError("Invalid normalized score")
     return parsed
@@ -115,12 +137,13 @@ def apply_scoring_event(tree: dict, kind: str, payload: dict) -> None:
         if state["configuration"] is not None:
             raise ContractError("Scorer configuration is immutable")
         try:
-            pin = validate_pin(payload["model_pin"])
+            pin = (validate_local_pin if payload["provider"] == "local" else validate_pin)(payload["model_pin"])
         except ProviderError:
             raise ContractError("Invalid saved scorer model pin") from None
         settings = effective_settings({"experiment_mode": "v4", "scorer_provider": payload["provider"],
                                        "scorer_model": pin["id"], "scorer_settings": payload["settings"]})
-        if (settings != payload["settings"] or payload["settings_version"] != SETTINGS_VERSION or payload["contract_version"] != CONTRACT_VERSION
+        contract = ORDINAL_CONTRACT_VERSION if payload["provider"] == "local" else CONTRACT_VERSION
+        if (settings != payload["settings"] or payload["settings_version"] != SETTINGS_VERSION or payload["contract_version"] != contract
                 or payload["projection_version"] != PROJECTION_VERSION or payload["rubric_version"] != RUBRIC_VERSION):
             raise ContractError("Unsupported scorer configuration")
         numeric(payload["catalog_elapsed_seconds"])
@@ -151,11 +174,11 @@ def apply_scoring_event(tree: dict, kind: str, payload: dict) -> None:
         if (payload["context_key"] != current["key"] or not isinstance(ids, list) or not ids
                 or len(set(ids)) != len(ids) or not set(ids) <= set(current["eligible"])):
             raise ContractError("Stale or invalid scoring candidates")
-        expected = build_score_request(configuration["model_pin"]["id"], current["parent"], current["siblings"], ids)
+        expected = score_request(configuration, current["parent"], current["siblings"], ids)
         if payload["request"] != expected or payload["input_hash"] != fingerprint(expected):
             raise ContractError("Scoring input/provenance mismatch")
         settings = configuration["settings"]
-        if len(ids) > settings["batch_size"] or len(canonical_bytes(expected)) > settings["max_input_bytes"]:
+        if len(ids) > settings["batch_size"] or scoring_request_bytes(configuration, expected) > settings["max_input_bytes"]:
             raise ContractError("Scoring input exceeds fixed limits")
         numeric(payload["estimated_cost_usd"])
         numeric(payload["timeout_seconds"])
@@ -187,7 +210,7 @@ def apply_scoring_event(tree: dict, kind: str, payload: dict) -> None:
                     or payload["usage"] != result["usage"]):
                 raise ContractError("Invalid scorer answer mapping/usage")
             for score in scores.values():
-                _score(score)
+                _score(score, configuration["provider"])
         else:
             error = payload["error"]
             if (not isinstance(error, dict) or not isinstance(error.get("code"), str)
@@ -203,13 +226,13 @@ def apply_scoring_event(tree: dict, kind: str, payload: dict) -> None:
             if risk["status"] == "scored":
                 if risk["value"] != completed.get(node_id):
                     raise ContractError("Score has no matching completed request")
-                value = _score(risk["value"])
+                value = _score(risk["value"], configuration["provider"])
                 source = next(item for item in reversed(list(state["requests"].values())) if item["context_key"] == current["key"]
                               and node_id in (item.get("finish", {}).get("result") or {}).get("scores", {}))
                 tree["nodes"][node_id]["risk"] = {"status": "scored", **value, "context_key": current["key"],
                     "model": source["finish"]["result"]["model"], "requested_model": configuration["model_pin"]["id"],
                     "source_request_id": source["request_id"], "rubric_version": RUBRIC_VERSION,
-                    "contract_version": CONTRACT_VERSION}
+                    "contract_version": configuration["contract_version"]}
             elif risk["status"] == "unscored" and risk["reason"] in _UNSCORED:
                 tree["nodes"][node_id]["risk"] = {"status": "unscored", "score": None,
                     "reason": risk["reason"], "context_key": current["key"]}

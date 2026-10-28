@@ -1,6 +1,6 @@
 # v4 A3 scorer 구현 계약
 
-첫 라이브 요청 전에 고정한 계약이다. A4 탐색·취약점 확인 및 B 대시보드는 별도 단계다.
+첫 OpenRouter 라이브 요청 전에 고정한 A3 계약이다. 아래 B6 확장은 별도 로컬 계약을 사용한다.
 
 - 모델: `typesafe/jev-1.14`. 요청 직전 라이브 카탈로그의 정확한 ID·`decisions` 지원·canonical slug·가격·조회 시각을 보존한다. `latest`는 거절하고 다른 모델로 자동 전환하지 않는다.
 - 엔드포인트: `POST https://openrouter.ai/api/alpha/decisions`. `questions.risk_<node_id>`는 `type=score`, `criteria`는 5개다. 질문 ID는 모델에게 보이지 않으므로 지시문에서 `nodes.<node_id>`를 명시한다.
@@ -56,7 +56,15 @@
 | `time_budget_seconds` | 120 | 카탈로그 및 모든 추론 시도의 누적 시간 |
 | `max_cost_usd` | 0.01 | 기지출+미확정 예약+다음 요청 예약 초과 시 중단 |
 
-성능을 입증한 값이 아니라 초기 연구 설정이다. 부모 1개가 기본 전체 20회 중 최대 4회를 쓴다. 카탈로그 조회 timeout도 scorer 시간 예산 이내로 제한하며, 조회 실패 시간·오류 코드는 종료 이벤트에 보존한다. 비용 예약은 제공자 과금의 강제 상한이 아니므로 초과 비용도 그대로 기록하고 중단한다. A4의 실행 LLM·명령·검증·정리 예산 예약 및 총 wall-clock 한도, A5 비교 예산은 별도로 연결해야 한다. local 실호환성은 B에서 구현하며 A3는 명시적으로 거절한다.
+성능을 입증한 값이 아니라 초기 연구 설정이다. 부모 1개가 기본 전체 20회 중 최대 4회를 쓴다. 카탈로그 조회 timeout도 scorer 시간 예산 이내로 제한하며, 조회 실패 시간·오류 코드는 종료 이벤트에 보존한다. 비용 예약은 제공자 과금의 강제 상한이 아니므로 초과 비용도 그대로 기록하고 중단한다. A4의 실행 LLM·명령·검증·정리 예산 예약 및 총 wall-clock 한도는 별도로 적용된다.
+
+## B6 로컬 Ollama 확장
+
+- 로컬 모델은 `GET /api/tags`의 정확한 이름과 64자리 SHA-256 digest로 고정한다. 각 판정 전에 digest를 다시 조회해 이름이 다른 모델을 가리키면 중단한다. API 주소는 루프백 HTTP의 루트 경로만 허용한다.
+- `POST /api/chat`에 JSON schema, `stream=false`, `think=false`를 전달한다. 외부 Decisions 경로와 동일한 범주형 노드 투영 및 위험 오름차순 5단계 문구만 입력으로 사용한다. 모델은 노드마다 정수 등급 0~4를 반환한다.
+- 로컬 계약 `ordinal-label-v1`은 `score=100×label/4`, `score_method=ordinal_label`이며 `probabilities`와 `confidence`는 `null`이다. 토큰 수는 Ollama의 `prompt_eval_count`, `eval_count`를 보존하고 API 비용은 0으로 기록한다. v4 이벤트 재생은 제공자별 계약으로 검증한다.
+- `scorer_settings` 공통 예산과 별도로 `protocol=ollama`, `base_url`, `num_ctx`, `num_predict`, `temperature`를 저장한다. OpenRouter 기존 `decisions-score-v2-rounded` 이벤트는 그대로 재생한다. 목록 조회 API는 `/api/scorer/models`이며 실행 LLM 목록과 독립적이다.
+- `max_input_bytes`는 로컬 경로에서 실제 `/api/chat` JSON 전체의 UTF-8 크기로 계산한다. 기록용 범주형 요청만 한도 내이고 전송 JSON은 초과하는 경우, 송신 전에 해당 노드를 `input_limit`로 남긴다.
 
 ## 연결 확인 CLI
 

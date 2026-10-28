@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import re
+from urllib.parse import urlsplit
 
 from v4_contracts import normalize_url
 
@@ -22,8 +23,9 @@ class V4ExecutionUnavailable(RuntimeError):
 
 
 def require_execution_ready(config: dict) -> None:
-    if config["experiment_mode"] == "v4" and config["scorer_provider"] != "openrouter":
-        raise V4ExecutionUnavailable("Local v4 scoring requires the B adapter stage")
+    if (config["experiment_mode"] == "v4" and config["scorer_provider"] == "local"
+            and config["scorer_settings"].get("protocol", "ollama") != "ollama"):
+        raise V4ExecutionUnavailable("Only Ollama local scoring is currently supported")
 
 
 def compatible_prompt(mode: str, requested=None) -> str:
@@ -71,12 +73,17 @@ def validate_experiment_config(body: dict) -> dict:
         raise ValueError("Invalid rubric version")
     if "reevaluation_policy" in raw and raw["reevaluation_policy"] != "scoring_fields_v1":
         raise ValueError("Unknown reevaluation policy")
-    if "protocol" in raw and raw["protocol"] not in ("ollama", "decisions"):
+    if "protocol" in raw and raw["protocol"] != "ollama":
         raise ValueError("Unknown local scorer protocol")
     if "base_url" in raw:
+        if not isinstance(raw["base_url"], str):
+            raise ValueError("Local scorer URL must be a string")
+        parsed = urlsplit(raw["base_url"])
+        if (parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1")
+                or parsed.username or parsed.password or parsed.query or parsed.fragment
+                or parsed.path not in ("", "/")):
+            raise ValueError("Local scorer URL must be loopback HTTP at the API root")
         settings["base_url"] = normalize_url(raw["base_url"])
-        if "?" in settings["base_url"]:
-            raise ValueError("Local scorer URL must not contain query credentials")
     if "max_calls" in raw and raw.get("max_calls_per_parent", 0) > raw["max_calls"]:
         raise ValueError("Parent scorer budget exceeds total scorer budget")
     return {"experiment_mode": mode, "scorer_provider": provider, "scorer_model": model, "scorer_settings": settings}

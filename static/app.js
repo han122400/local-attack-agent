@@ -19,6 +19,7 @@ let activeRunId=null, canStart=false, modelReady=false, labReady=false, startPen
 let labStatus=null;
 const DEFAULT_TARGET='http://127.0.0.1:3000/';
 let readinessSerial=0, availableModels=[], selectedModelName='';
+let scorerModels=[], selectedScorerId='', scorerCatalogSerial=0, scorerReady=false;
 let configuredSettingsKey='';
 const modelSettingsDrafts=new Map();
 let currentRun=null, stream=null, lastSeq=0, readingEvents=false, pendingEvents=new Map();
@@ -256,10 +257,79 @@ function renderRunRows(containerId, runs) {
 
 function updateStartControls() {
   const modeOk=$('scenarioSelect').value==='manual' && $('chainSelect').value==='none';
-  const ready=canStart&&modelReady&&labReady&&!!targetInfo()&&!startPending&&modeOk;
+  const scorerOk=$('experimentModeSelect').value==='v3'||(scorerReady&&scorerModels.some(item=>item.id===selectedScorerId));
+  const ready=canStart&&modelReady&&labReady&&!!targetInfo()&&!startPending&&modeOk&&scorerOk;
   $('startButton').disabled=!ready;
   if(!modeOk) setText('startError','자동 시나리오와 캠페인 체인은 준비 중입니다.');
   else if(!startPending) setText('startError','');
+}
+
+function scorerSettings(){
+  const integer=id=>Number($(id).value);
+  const settings={batch_size:integer('scorerBatchSize'),max_input_bytes:integer('scorerMaxInputBytes'),
+    max_calls:integer('scorerMaxCalls'),max_calls_per_parent:integer('scorerParentCalls'),
+    max_retries:integer('scorerRetries'),timeout_seconds:integer('scorerTimeout'),
+    time_budget_seconds:integer('scorerTimeBudget'),max_cost_usd:integer('scorerMaxCost'),
+    rubric_version:'risk-priority-v1',reevaluation_policy:'scoring_fields_v1'};
+  if($('scorerProviderSelect').value==='local')Object.assign(settings,{protocol:'ollama',
+    base_url:$('scorerBaseUrl').value.trim(),num_ctx:integer('scorerNumCtx'),
+    num_predict:integer('scorerNumPredict'),temperature:integer('scorerTemperature')});
+  return settings;
+}
+
+function restoreScorerSettings(values){
+  if(!values||typeof values!=='object')return;
+  for(const [key,id] of Object.entries({batch_size:'scorerBatchSize',max_input_bytes:'scorerMaxInputBytes',
+      max_calls:'scorerMaxCalls',max_calls_per_parent:'scorerParentCalls',max_retries:'scorerRetries',
+      timeout_seconds:'scorerTimeout',time_budget_seconds:'scorerTimeBudget',max_cost_usd:'scorerMaxCost',
+      base_url:'scorerBaseUrl',num_ctx:'scorerNumCtx',num_predict:'scorerNumPredict',temperature:'scorerTemperature'})){
+    if(values[key]!==undefined)$(id).value=String(values[key]);
+  }
+}
+
+function updateScorerVisibility(){
+  const v4=$('experimentModeSelect').value==='v4';
+  $('scorerSetup').hidden=!v4;
+  const local=$('scorerProviderSelect').value==='local';
+  $('localScorerSettings').hidden=!local;
+  $('scorerRemoteNotice').hidden=local;
+  updateStartControls();
+}
+
+function renderScorerModels(){
+  const terms=$('scorerModelSearch').value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const matches=scorerModels.filter(item=>terms.every(term=>`${item.name} ${item.id}`.toLowerCase().includes(term)));
+  const select=$('scorerModelSelect');
+  select.replaceChildren(...matches.map(item=>{
+    const label=$('scorerProviderSelect').value==='local'?`${item.name} · 로컬 · ${(item.digest||'').slice(0,12)}`:
+      `${item.name} · ${item.id} · 입력 ${modelTokenPrice(item.pricing?.prompt)} / 출력 ${modelTokenPrice(item.pricing?.completion)}`;
+    const option=textNode('option',label);option.value=item.id;return option;
+  }));
+  select.disabled=!matches.length;
+  select.value=selectedScorerId;
+  const selected=scorerModels.find(item=>item.id===selectedScorerId);
+  setText('scorerSelected',selected?`${selected.name} (${selected.id})`:'없음');
+  updateStartControls();
+}
+
+async function loadScorerModels(){
+  if($('experimentModeSelect').value!=='v4')return;
+  const serial=++scorerCatalogSerial, provider=$('scorerProviderSelect').value;
+  scorerReady=false;setText('scorerStatus','판정 모델 목록 확인 중');updateStartControls();
+  try{
+    const url='/api/scorer/models?provider='+encodeURIComponent(provider)+
+      (provider==='local'?'&base_url='+encodeURIComponent($('scorerBaseUrl').value.trim()):'');
+    const data=await jsonRequest(url);
+    if(serial!==scorerCatalogSerial||provider!==$('scorerProviderSelect').value)return;
+    scorerModels=data.models||[];
+    if(!scorerModels.some(item=>item.id===selectedScorerId))selectedScorerId=scorerModels[0]?.id||'';
+    scorerReady=!!scorerModels.length;
+    setText('scorerStatus',scorerReady?`${scorerModels.length}개 판정 모델 · ${provider==='local'?'순서형 등급':'Decisions Score'}`:'사용 가능한 판정 모델이 없습니다.');
+  }catch(error){
+    if(serial!==scorerCatalogSerial)return;
+    scorerModels=[];selectedScorerId='';scorerReady=false;setText('scorerStatus',error.message);
+  }
+  renderScorerModels();
 }
 
 async function loadRunList() {
@@ -422,6 +492,10 @@ async function startRun(event) {
   if(!modelReady||!availableModels.some(model=>model.name===selectedModelName)){
     setText('startError','실행할 모델을 선택하세요.'); return;
   }
+  const experimentMode=$('experimentModeSelect').value;
+  if(experimentMode==='v4'&&(!scorerReady||!scorerModels.some(item=>item.id===selectedScorerId))){
+    setText('startError','판정 모델을 선택하세요.');return;
+  }
   if($('scenarioSelect').value!=='manual'||$('chainSelect').value!=='none'){
     setText('startError','이 모드는 준비 중입니다.'); return;
   }
@@ -433,10 +507,13 @@ async function startRun(event) {
   }
   const info=availableModels.find(model=>model.name===selectedModelName);
   const body={target:$('targetInput').value.trim(),model:selectedModelName,goal,
+    experiment_mode:experimentMode,
     scenario_source:'manual',chain_mode:'none',prompt_version:$('promptVersionSelect').value,
     model_settings:ModelSettingsConfig.encode($('providerSelect').value,info,currentModelSettingsValues()),
     budgets:{seconds:Number($('secondsInput').value),model_calls:Number($('modelCallsInput').value),
       tool_calls:Number($('toolCallsInput').value),command_seconds:Number($('commandSecondsInput').value),finalize_seconds:120}};
+  if(experimentMode==='v4')Object.assign(body,{scorer_provider:$('scorerProviderSelect').value,
+    scorer_model:selectedScorerId,scorer_settings:scorerSettings()});
   startPending=true; updateStartControls(); setText('startButton','시작 요청 중');
   try{
     const started=await jsonRequest('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -454,7 +531,9 @@ async function startRun(event) {
 
 async function loadPrompts(savedVersion){
   try{
-    const data=await jsonRequest('/api/prompts');
+    const mode=$('experimentModeSelect').value;
+    const data=await jsonRequest(`/api/prompts?experiment_mode=${mode}`);
+    if(mode!==$('experimentModeSelect').value)return;
     const select=$('promptVersionSelect');
     select.replaceChildren(...data.versions.map(version=>{
       const option=document.createElement('option');
@@ -475,9 +554,15 @@ function initMain(){
   for(const [key,value] of Object.entries(saved.settings||{}))modelSettingsDrafts.set(key,value);
   if(saved.provider)$('providerSelect').value=saved.provider;
   if(saved.model)selectedModelName=saved.model;
+  if(saved.experiment_mode)$('experimentModeSelect').value=saved.experiment_mode;
+  if(saved.scorer_provider)$('scorerProviderSelect').value=saved.scorer_provider;
+  if(saved.scorer_model)selectedScorerId=saved.scorer_model;
+  restoreScorerSettings(saved.scorer_settings);
+  updateScorerVisibility();
   if(typeof saved.target==='string')$('targetInput').value=saved.target;
   if(typeof saved.goal==='string')$('goalInput').value=saved.goal;
   loadPrompts(saved.prompt_version);
+  loadScorerModels();
   $('targetInput').addEventListener('input',()=>{updateTargetReadiness();updateStartControls();});
   updateTargetReadiness();
   if(Object.keys(saved).length)setText('saveStatus','저장된 설정을 불러왔습니다.');
@@ -485,7 +570,9 @@ function initMain(){
   $('saveInputsButton').addEventListener('click',()=>{
     rememberModelSettings();
     saveDash({target:$('targetInput').value.trim(),goal:$('goalInput').value, provider:$('providerSelect').value,
-      model:selectedModelName, prompt_version:$('promptVersionSelect').value, settings:Object.fromEntries(modelSettingsDrafts)});
+      model:selectedModelName, prompt_version:$('promptVersionSelect').value, settings:Object.fromEntries(modelSettingsDrafts),
+      experiment_mode:$('experimentModeSelect').value,scorer_provider:$('scorerProviderSelect').value,
+      scorer_model:selectedScorerId,scorer_settings:scorerSettings()});
     setText('saveStatus',`저장됨 ✓ · ${new Date().toLocaleTimeString('ko-KR')}`);
   });
   for(const button of $('goalSuggestions').querySelectorAll('button[data-goal]'))button.addEventListener('click',()=>{
@@ -493,6 +580,14 @@ function initMain(){
     input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();input.setSelectionRange(input.value.length,input.value.length);
   });
   for(const id of ['scenarioSelect','chainSelect'])$(id).addEventListener('change',updateStartControls);
+  $('experimentModeSelect').addEventListener('change',()=>{updateScorerVisibility();loadPrompts();loadScorerModels();});
+  $('scorerProviderSelect').addEventListener('change',()=>{
+    scorerModels=[];selectedScorerId='';scorerReady=false;updateScorerVisibility();loadScorerModels();
+  });
+  $('scorerModelSearch').addEventListener('input',renderScorerModels);
+  $('scorerModelSelect').addEventListener('change',()=>{selectedScorerId=$('scorerModelSelect').value;renderScorerModels();});
+  $('scorerRefreshButton').addEventListener('click',loadScorerModels);
+  $('scorerBaseUrl').addEventListener('change',loadScorerModels);
   $('providerSelect').addEventListener('change',()=>{
     $('modelSearch').value=''; selectedModelName=''; availableModels=[]; modelReady=false; renderModelPicker();
     configureModelControls();
@@ -527,11 +622,45 @@ function initMain(){
 }
 
 function showTab(name){
-  for(const tab of ['observe','evidence','settings']){
+  for(const tab of ['observe','tree','evidence','settings']){
     const active=tab===name; $(`${tab}Panel`).hidden=!active;
     $(`${tab}Tab`).setAttribute('aria-selected',String(active));
   }
   if(name==='evidence')loadEvidenceFiles();
+  if(name==='tree')loadTree();
+}
+
+let treeLoading=false, treeLastSeq=-1;
+async function loadTree(){
+  if(!runId||treeLoading||currentRun?.experiment_mode!=='v4')return;
+  treeLoading=true;
+  try{
+    const data=await jsonRequest(`/api/runs/${runId}/tree`);
+    if(treeLastSeq===data.last_event_seq)return;
+    treeLastSeq=data.last_event_seq;
+    const nodes=data.nodes||{}, list=$('treeList');list.replaceChildren();
+    const scorer=data.scorer||{}, usage=scorer.usage||{};
+    const count=Object.values(nodes).filter(node=>node.kind==='candidate').length;
+    setText('treeSummary',`노드 ${Object.keys(nodes).length}개 · 후보 ${count}개 · 판정 ${usage.requests||0}회 · 판정 비용 $${Number(usage.known_cost_usd||0).toFixed(5)} · ${scorer.configuration?.provider||'대기'} / ${scorer.configuration?.model_pin?.id||'미설정'}`);
+    const visit=(id,depth)=>{
+      const node=nodes[id];if(!node)return;
+      const score=node.risk?.score;
+      const risk=score==null?`${node.risk?.status||'미점수'}${node.risk?.reason?' / '+node.risk.reason:''}`:
+        `${Number(score).toFixed(1)} (${node.risk?.score_method||'점수'})`;
+      const line=`${node.id} · ${node.kind} · ${node.locator?.method||''} ${node.locator?.url||''} · 위험도 ${risk} · ${node.verification_state||'미검증'}`;
+      const button=textNode('button',line,'tree-node button secondary');
+      button.type='button';button.setAttribute('role','treeitem');button.style.marginLeft=`${Math.min(depth,12)*18}px`;
+      button.addEventListener('click',async()=>{
+        try{const detail=await jsonRequest(`/api/runs/${runId}/nodes/${id}`);
+          setText('treeNodeDetail',JSON.stringify({node:detail.node,attempts:detail.attempts},null,2));}
+        catch(error){setText('treeNodeDetail',error.message);}
+      });
+      list.append(button);
+      for(const child of node.child_ids||[])visit(child,depth+1);
+    };
+    visit(data.root_id,0);
+  }catch(error){setText('treeSummary',`트리 조회 실패: ${error.message}`);}
+  finally{treeLoading=false;}
 }
 
 let scoreShownKey='';
@@ -556,6 +685,7 @@ async function loadScore(state){
 
 function renderRunHeader(state){
   currentRun=state; setText('runGoal',state.goal||'목표 기록 없음'); setText('runModel',state.model||'—'); setText('runId',runId);
+  $('treeTab').hidden=state.experiment_mode!=='v4';
   setText('runTarget',state.target||'—');
   if(state.target&&$('targetInput').value!==state.target){
     $('targetInput').value=state.target;updateTargetReadiness();
@@ -582,7 +712,11 @@ function renderRunHeader(state){
   }
   setText('reportText',state.report||'보고서가 아직 생성되지 않았습니다.');
   setText('settingsValue',JSON.stringify({run_id:state.run_id,target:state.target,goal:state.goal,model:state.model,
-    model_settings:state.model_settings,budgets:state.budgets,scenario_source:state.scenario_source,chain_mode:state.chain_mode},null,2));
+    model_settings:state.model_settings,budgets:state.budgets,v4_settings:state.v4_settings,
+    scenario_source:state.scenario_source,chain_mode:state.chain_mode,
+    experiment_mode:state.experiment_mode,prompt_version:state.prompt_version,scorer_provider:state.scorer_provider,
+    scorer_model:state.scorer_model,scorer_settings:state.scorer_settings,scorer_model_pin:state.scorer_model_pin,
+    scorer_usage:state.scorer_usage},null,2));
   renderAgentStatus();
   loadScore(state);
   $('exportLink').href=`/api/runs/${runId}/export`;
@@ -831,7 +965,7 @@ async function loadEvidenceFiles(){
 function initRun(){
   $('mainView').hidden=true;$('runView').hidden=false;
   $('eventCategoryFilter').addEventListener('change',renderTimeline);
-  for(const name of ['observe','evidence','settings'])$(`${name}Tab`).addEventListener('click',()=>showTab(name));
+  for(const name of ['observe','tree','evidence','settings'])$(`${name}Tab`).addEventListener('click',()=>showTab(name));
   $('stopButton').addEventListener('click',async()=>{
     $('stopButton').disabled=true;
     try{await jsonRequest(`/api/runs/${runId}/stop`,{method:'POST'});await loadRunState();}
@@ -858,6 +992,7 @@ function initRun(){
   setInterval(()=>{if(currentRun?.runtime_exists&&fileSource==='runtime')loadFiles();},1700);
   setInterval(loadRunList,5000);
   setInterval(()=>{if(!stream)refreshEvents();},4000);
+  setInterval(()=>{if(!$('treePanel').hidden)loadTree();},4000);
   window.addEventListener('beforeunload',()=>{if(stream)stream.close();});
 }
 

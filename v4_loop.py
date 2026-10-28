@@ -6,15 +6,17 @@ import time
 from dataclasses import replace
 from urllib.parse import urlsplit
 
+from code_checks import check_generated_code
 from harness import Harness, ModelFailure
 from model_providers import is_openrouter
 from planning import load_prompt
+from session_log import atomic_write_json
 from scorer_session import RiskScorer
 from v4_usage import summarize_usage
-from v4_contracts import ContractError, RESULT_SCHEMA, validate_result
+from v4_contracts import ContractError, MAX_RESULT_BYTES, RESULT_SCHEMA, validate_result
 from v4_oracle import LabOracle
 from v4_policy import V4BudgetStop, execution_settings, supported_candidate
-from v4_tree import TreeStore, MAX_EVIDENCE_BYTES, _read_bounded
+from v4_tree import TreeStore, MAX_EVIDENCE_BYTES, _json_result, _read_bounded, _safe_path
 from risk_rubric import observations, OBSERVATIONS_SCHEMA
 
 
@@ -141,6 +143,46 @@ class V4Runner:
                 item.pop("observations")
         return value, removed
 
+    def _normalize_optional_result(self, attempt):
+        """Keep valid discoveries while dropping only malformed optional metadata."""
+        try:
+            raw = _read_bounded(self.runtime.runtime_dir, attempt["result_path"], MAX_RESULT_BYTES)
+            value = _json_result(raw)
+        except (ValueError, OSError):
+            return False
+        if not isinstance(value, dict):
+            return False
+        value, removed = self._sanitize_result_observations(value)
+        discoveries = value.get("discovered")
+        for index, item in enumerate(discoveries if isinstance(discoveries, list) else []):
+            locator = item.get("locator") if isinstance(item, dict) else None
+            if not isinstance(locator, dict) or "route_template" not in locator:
+                continue
+            template = locator["route_template"]
+            if (not isinstance(template, str) or not template.startswith("/") or template.startswith("//")
+                    or len(template) > 2048 or any(char in template for char in "?#\\")):
+                locator.pop("route_template")
+                removed.append(f"discovered[{index}].locator.route_template")
+        if not removed:
+            return False
+        try:
+            normalized = validate_result(value, attempt_id=attempt["attempt_id"], node_id=attempt["node_id"])
+        except ValueError:
+            return False
+        original_ref = self.log.preserve_bytes(f"invalid-node-results/{attempt['attempt_id']}-before-normalize.json", raw)
+        atomic_write_json(_safe_path(self.runtime.runtime_dir, attempt["result_path"]), normalized)
+        self.log.append("v4_result_optional_fields_dropped", {"attempt_id": attempt["attempt_id"],
+            "node_id": attempt["node_id"], "fields": removed, "original_ref": original_ref})
+        return True
+
+    def _import_result(self, attempt, exec_id):
+        try:
+            return self.tree.import_result(attempt["attempt_id"], exec_id=exec_id)
+        except (ValueError, OSError):
+            if self._normalize_optional_result(attempt):
+                return self.tree.import_result(attempt["attempt_id"], exec_id=exec_id)
+            raise
+
     def _investigate(self, node_id):
         attempts = 0
         node_tools = 0
@@ -156,7 +198,8 @@ class V4Runner:
             reserve = self.settings["verification_reserve_seconds"] if self.settings["exclusive_lab"] and supported_candidate(self.tree.state["nodes"][node_id]) else 0
             try:
                 command = self.harness.decide(self.log.run_id, context, model=self.log.metadata["model"],
-                    settings=self.log.metadata["model_settings"], deadline=self.gate.deadline - reserve)
+                    settings=self.log.metadata["model_settings"], deadline=self.gate.deadline - reserve,
+                    command_validator=lambda candidate: self._validate_command(candidate, context["attempt"]["result_path"]))
             except V4BudgetStop as exc:
                 if exc.reason == "node_limit":
                     self.log.append("v4_node_limit", {"node_id": node_id, "reason": "deep_calls_reserved"})
@@ -179,6 +222,7 @@ class V4Runner:
                 attempt = self.tree.begin_attempt(node_id, call_id=command.call_id)
                 if attempt["attempt_id"] != context["attempt"]["attempt_id"]:
                     raise ContractError("Attempt identity changed while deciding")
+                _safe_path(self.runtime.runtime_dir, attempt["result_path"]).parent.mkdir(parents=True, exist_ok=True)
                 attempts += 1
                 token = self.oracle.begin(attempt, self.tree.state["nodes"][node_id])
             timeout = min(self.gate.budgets["command_seconds"], self.gate.deadline - self.gate.clock() - reserve)
@@ -191,7 +235,7 @@ class V4Runner:
             if not attempt:
                 continue
             try:
-                imported = self.tree.import_result(attempt["attempt_id"], exec_id=output.exec_id)
+                imported = self._import_result(attempt, output.exec_id)
             except (ValueError, OSError) as exc:
                 reason = "missing_result" if not (self.runtime.runtime_dir / attempt["result_path"]).exists() else "invalid_result"
                 self.history[-1]["result_error"] = reason
@@ -255,7 +299,7 @@ class V4Runner:
                     self.tree.fail_attempt(attempt["attempt_id"], reason=reason, exec_id=output.exec_id)
                     continue
                 try:
-                    imported = self.tree.import_result(attempt["attempt_id"], exec_id=output.exec_id)
+                    imported = self._import_result(attempt, output.exec_id)
                 except (ValueError, OSError):
                     self.tree.fail_attempt(attempt["attempt_id"], reason="invalid_result", exec_id=output.exec_id)
                     continue
@@ -278,6 +322,16 @@ class V4Runner:
             # harness's next work, not another model-selected global target.
             break
         self.tree.finish_investigation(node_id)
+
+    @staticmethod
+    def _validate_command(command, result_path):
+        if command.action == "run_python":
+            problems = check_generated_code(command.code)
+            if problems:
+                raise ValueError("; ".join(problems[:3]))
+        if command.action == "run_python" and result_path not in command.code:
+            raise ValueError("run_python must write result JSON to attempt.result_path before it exits")
+        return command
 
     def run(self):
         try:

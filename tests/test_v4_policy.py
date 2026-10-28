@@ -24,6 +24,12 @@ class PolicyTests(unittest.TestCase):
     def test_known_lab_positive_can_be_confirmed(self):
         self.assertEqual(oracle_verdict(proof(), NODE, execution_status="succeeded")["verdict"], "confirmed")
 
+    def test_sql_injection_alias_still_requires_the_same_independent_proof(self):
+        alias = {**NODE, "hypothesis": {"type": "sql_injection"}}
+        self.assertEqual(oracle_verdict(proof(), alias, execution_status="succeeded")["verdict"], "confirmed")
+        self.assertEqual(oracle_verdict({**proof(), "source": "model_file"}, alias,
+                                        execution_status="succeeded")["verdict"], "inconclusive")
+
     def test_solved_claims_and_differences_alone_never_confirm(self):
         changes = [{"exclusive_lab": False}, {"fresh_reset": False}, {"source": "model_file"},
                    {"canary": {"control_absent": True, "test_present": False, "repeat_present": False}},

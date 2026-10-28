@@ -48,6 +48,19 @@ class ExecutionApiTests(unittest.TestCase):
         self.assertFalse((self.root / run_id / "runtime").exists())
         self.assertTrue((self.root / run_id / "report.json").is_file())
 
+    def test_api_accepts_local_ollama_scorer_settings(self):
+        body = {**self.body, "scorer_provider": "local", "scorer_model": "qwen3.5:9b",
+                "scorer_settings": {"protocol": "ollama", "base_url": "http://127.0.0.1:11434/"}}
+        with patch("app.get_ollama_models", return_value=[{"name": "mock:model"}]):
+            response = self.client.post("/api/start", json=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.explorer.worker.join(10)
+        self.assertFalse(self.explorer.worker.is_alive())
+        state = SessionStore(self.root).read(response.json()["run_id"])
+        self.assertEqual((state["experiment_mode"], state["scorer_provider"], state["scorer_model"]),
+                         ("v4", "local", "qwen3.5:9b"))
+        self.assertEqual(state["report_status"], "complete")
+
     def test_mode_prompt_mismatch_and_bad_settings_reject_before_model_lookup(self):
         for changes in ({"prompt_version": "v3"}, {"v4_settings": {"node_attempts": 0}}, {"experiment_mode": "v3", "prompt_version": "v4"}):
             with patch("app.get_ollama_models", side_effect=AssertionError("No lookup for invalid config")):
@@ -62,7 +75,7 @@ class ExecutionApiTests(unittest.TestCase):
             result = {"schema_version": 1, "node_id": context["node"]["id"], "attempt_id": context["attempt"]["attempt_id"],
                       "discovered": [], "proposed_verdict": "inconclusive", "claim": "temporary local fixture", "evidence_refs": [], "next_observation": ""}
             encoded = base64.b64encode(json.dumps(result).encode()).decode()
-            script = f"import base64,pathlib;p=pathlib.Path('{context['attempt']['result_path']}');p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(base64.b64decode('{encoded}'))"
+            script = f"import base64,pathlib;p=pathlib.Path('{context['attempt']['result_path']}');p.write_bytes(base64.b64decode('{encoded}'))"
             command = subprocess.list2cmdline([context["python"], "-c", script])
             yield {"message": {"content": json.dumps({"action": "run_command", "plan": "local fixture", "reason": "write result",
                 "path": "", "content": "", "code": "", "command": command})}}

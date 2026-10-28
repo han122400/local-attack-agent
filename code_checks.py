@@ -3,7 +3,7 @@
 These catch the recurring mistakes observed in real runs BEFORE the browser runs the code, so the
 model gets a precise, actionable error instead of a raw traceback (and a wasted browser round-trip):
 syntax errors, asyncio.run() in a running loop, importing playwright objects that are already provided,
-a wrong async def main() signature, and missing await on page/context/browser calls and the helpers.
+a wrong async def main() signature, missing await on browser helpers, and two observed URL encoding/host errors.
 
 High precision over recall: only flag what is almost certainly wrong, so valid code is never blocked.
 """
@@ -11,6 +11,7 @@ High precision over recall: only flag what is almost certainly wrong, so valid c
 from __future__ import annotations
 
 import ast
+import re
 
 # page/context/browser methods that are coroutines (must be awaited). Kept to the common ones.
 _PAGE_ASYNC = {
@@ -33,12 +34,31 @@ def check_generated_code(code: str) -> list[str]:
         return [f"Syntax error: {exc.msg} (line {exc.lineno})."]
 
     parents: dict[ast.AST, ast.AST] = {}
+    constants: dict[str, str] = {}
     for node in ast.walk(tree):
         for child in ast.iter_child_nodes(node):
             parents[child] = node
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    constants[target.id] = node.value.value
 
     problems: list[str] = []
     for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"quote", "quote_plus"} and node.args):
+            arg = node.args[0]
+            value = arg.value if isinstance(arg, ast.Constant) and isinstance(arg.value, str) else (
+                constants.get(arg.id) if isinstance(arg, ast.Name) else None)
+            if isinstance(value, str) and re.match(r"^[A-Za-z_][A-Za-z0-9_-]*=", value):
+                problems.append("Do not quote a complete query key=value pair; use urlencode({key: value}) so the parameter name remains intact.")
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"HTTPConnection", "HTTPSConnection"} and node.args):
+            arg = node.args[0]
+            value = arg.value if isinstance(arg, ast.Constant) and isinstance(arg.value, str) else (
+                constants.get(arg.id) if isinstance(arg, ast.Name) else None)
+            if isinstance(value, str) and value.startswith(("http://", "https://")):
+                problems.append("HTTPConnection host must omit the URL scheme; pass a hostname and port, or use urllib.request.urlopen(URL).")
         # asyncio.run(...) inside the already-running loop
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "run" and isinstance(node.func.value, ast.Name)

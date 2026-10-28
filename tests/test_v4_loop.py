@@ -27,8 +27,15 @@ class Runtime:
         self.log.append("exec_started", {"exec_id": exec_id, "call_id": call_id, "action": payload["action"]})
         result = ExecutionResult(exec_id=exec_id, action=payload["action"], exit_code=0)
         if payload["action"] == "run_command" and not self.missing:
-            fixture = json.loads(payload["command"])
-            (self.runtime_dir / "work" / "node-results" / (fixture["attempt_id"] + ".json")).write_text(json.dumps(fixture), encoding="utf-8")
+            try:
+                fixture = json.loads(payload["command"])
+            except json.JSONDecodeError:
+                fixture = None  # a probe command can submit the bound result in repair
+            if fixture is not None:
+                result_path = fixture.pop("result_path")
+                output = self.runtime_dir / result_path
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(json.dumps(fixture), encoding="utf-8")
         if payload["action"] == "write_file":
             path = self.runtime_dir / payload["path"]
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -59,7 +66,7 @@ class LoopTests(unittest.TestCase):
     def command(self, context, discovered=(), action="run_command"):
         result = {"schema_version": 1, "node_id": context["node"]["id"], "attempt_id": context["attempt"]["attempt_id"],
                   "discovered": list(discovered), "proposed_verdict": "confirmed", "claim": "model claim",
-                  "evidence_refs": [], "next_observation": ""}
+                  "evidence_refs": [], "next_observation": "", "result_path": context["attempt"]["result_path"]}
         return {"action": action, "plan": "inspect", "reason": "investigate current node", "path": "", "content": "",
                 "code": "", "command": json.dumps(result) if action == "run_command" else ""}
 
@@ -111,6 +118,61 @@ class LoopTests(unittest.TestCase):
         state = TreeStore(self.log).rebuild()
         self.assertTrue(all(item["status"] == "failed" for item in state["attempts"].values()))
 
+    def test_invalid_browser_code_is_corrected_before_spending_tool_attempt(self):
+        responses = 0
+        def callback(context):
+            nonlocal responses
+            responses += 1
+            if responses == 1:
+                return {"action": "run_python", "plan": "inspect input", "reason": "fetch baseline",
+                        "path": "", "content": "", "command": "", "code": "http_get('https://example.test/search')"}
+            return self.command(context)
+        runtime = Runtime(self.log)
+        runner = V4Runner(self.log, runtime, transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        self.assertEqual(runtime.calls, 1)
+        self.assertEqual(responses, 2)
+        self.assertEqual([event["action"] for event in self.log.snapshot_events() if event["kind"] == "exec_started"],
+                         ["run_command"])
+        self.assertTrue(any(event["kind"] == "model_error" and "add await" in event.get("message", "")
+                            for event in self.log.snapshot_events()))
+
+    def test_browser_code_without_result_path_is_corrected_before_execution(self):
+        responses = 0
+        def callback(context):
+            nonlocal responses
+            responses += 1
+            if responses == 1:
+                return {"action": "run_python", "plan": "inspect input", "reason": "fetch baseline",
+                        "path": "", "content": "", "command": "",
+                        "code": "response = await http_get('https://example.test/search'); print(response.status)"}
+            return self.command(context)
+        runtime = Runtime(self.log)
+        runner = V4Runner(self.log, runtime, transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        self.assertEqual(runtime.calls, 1)
+        self.assertEqual(responses, 2)
+        self.assertTrue(any(event["kind"] == "model_error" and "result_path" in event.get("message", "")
+                            for event in self.log.snapshot_events()))
+
+    def test_shell_probe_without_result_path_uses_bound_result_repair(self):
+        responses = 0
+        def callback(context):
+            nonlocal responses
+            responses += 1
+            if responses == 1:
+                return {"action": "run_command", "plan": "probe", "reason": "read status", "path": "",
+                        "content": "", "code": "", "command": "curl -I https://example.test/"}
+            self.assertIn("result JSON", context["instruction"])
+            return {"action": "write_file", "plan": "record probe", "reason": "bind result", "path": context["attempt"]["result_path"],
+                    "content": json.dumps(context["result_template"]), "command": "", "code": ""}
+        runtime = Runtime(self.log)
+        runner = V4Runner(self.log, runtime, transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        self.assertEqual(runtime.calls, 2)
+        self.assertEqual(responses, 2)
+        self.assertEqual(TreeStore(self.log).rebuild()["attempts"]["A0001"]["status"], "imported")
+
     def test_missing_result_can_be_submitted_by_a_separate_bound_write(self):
         visited = []
         def callback(context):
@@ -133,6 +195,47 @@ class LoopTests(unittest.TestCase):
         self.assertIn("v4_result_repair_finished", [event["kind"] for event in self.log.snapshot_events()])
         self.assertIn("v4_result_observations_dropped", [event["kind"] for event in self.log.snapshot_events()])
         self.assertEqual(visited, ["N0001", "N0001", "N0002"])
+
+    def test_invalid_optional_route_template_preserves_discovery_without_model_repair(self):
+        visited = []
+        def callback(context):
+            visited.append(context["node"]["id"])
+            if context["node"]["id"] == "N0001":
+                found = surface("https://example.test/search?q=")
+                found["locator"]["route_template"] = "/search?q="
+                return self.command(context, [found])
+            return self.command(context, action="finish")
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        tree = TreeStore(self.log).rebuild()
+        self.assertEqual(len(tree["nodes"]), 2)
+        self.assertNotIn("route_template", tree["nodes"]["N0002"]["locator"])
+        self.assertEqual(visited, ["N0001", "N0002"])
+        normalized = [event for event in self.log.snapshot_events() if event["kind"] == "v4_result_optional_fields_dropped"]
+        self.assertEqual(len(normalized), 1)
+        original = self.log.run_dir / normalized[0]["original_ref"]["path"]
+        self.assertIn('"route_template": "/search?q="', original.read_text(encoding="utf-8"))
+
+    def test_invalid_discovery_container_still_reaches_bounded_result_repair(self):
+        responses = 0
+        def callback(context):
+            nonlocal responses
+            responses += 1
+            if responses == 1:
+                command = self.command(context)
+                result = json.loads(command["command"])
+                result["discovered"] = None
+                result["observations"] = {"input_control": "invalid"}
+                command["command"] = json.dumps(result)
+                return command
+            self.assertIn("result JSON", context["instruction"])
+            return {"action": "write_file", "plan": "repair result", "reason": "submit valid JSON",
+                    "path": context["attempt"]["result_path"], "content": json.dumps(context["result_template"]),
+                    "command": "", "code": ""}
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        self.assertEqual(responses, 2)
+        self.assertEqual(TreeStore(self.log).rebuild()["attempts"]["A0001"]["status"], "imported")
 
     def test_repair_uses_remaining_node_tool_budget(self):
         self.log.update(v4_settings={"node_tool_calls": 1})

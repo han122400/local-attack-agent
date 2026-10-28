@@ -60,6 +60,29 @@ class ScorerContractTests(unittest.TestCase):
         self.assertEqual(result["score_method"], "probability_weighted")
         self.assertEqual(result["confidence"], 1.0)
 
+    def test_ordinal_label_keeps_unknown_probability_and_confidence(self):
+        import risk_rubric
+        self.assertTrue(hasattr(risk_rubric, "validate_ordinal_answer"))
+        value = risk_rubric.validate_ordinal_answer(3)
+        self.assertEqual(value["score"], 75.0)
+        self.assertEqual(value["score_method"], "ordinal_label")
+        self.assertEqual(value["label"], 3)
+        self.assertIsNone(value["probabilities"])
+        self.assertIsNone(value["confidence"])
+        for bad in (True, 1.5, -1, 5, "3"):
+            with self.subTest(bad=bad), self.assertRaises(risk_rubric.ScoreContractError):
+                risk_rubric.validate_ordinal_answer(bad)
+
+    def test_local_request_contains_only_categorical_projection(self):
+        import risk_rubric
+        self.assertTrue(hasattr(risk_rubric, "build_ordinal_request"))
+        payload = risk_rubric.build_ordinal_request("qwen3.5:9b", node("N0001", kind="root"),
+                                                     [node()], ["N0002"])
+        self.assertEqual(payload["method"], "ordinal_label")
+        self.assertEqual(payload["node_ids"], ["N0002"])
+        self.assertEqual(payload["criteria"], list(CRITERIA))
+        self.assertNotIn("PRIVATE", json.dumps(payload))
+
     def test_independently_rounded_probabilities_need_a_feasible_distribution(self):
         # Live Jev observation: displayed probabilities imply 1.86, displayed
         # score is 1.85. Both can round from the same hidden distribution.

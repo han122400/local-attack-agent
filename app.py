@@ -506,6 +506,29 @@ def ollama_models(provider: str = "ollama") -> JSONResponse:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+@app.get("/api/scorer/models")
+def scorer_models(provider: str = "openrouter", base_url: str = "http://127.0.0.1:11434/") -> JSONResponse:
+    from decision_provider import LocalOllamaScorer, OpenRouterDecisions, ProviderError
+    if provider not in ("openrouter", "local"):
+        raise HTTPException(status_code=400, detail="Unknown scorer provider")
+    if provider == "local":
+        try:
+            config = validate_experiment_config({"experiment_mode": "v4", "scorer_provider": "local",
+                "scorer_model": "catalog-probe:1", "scorer_settings": {"base_url": base_url}})
+            adapter = LocalOllamaScorer(settings=config["scorer_settings"])
+        except (ValueError, ProviderError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        adapter = OpenRouterDecisions()
+    try:
+        models = adapter.list_models()
+    except ProviderError as exc:
+        raise HTTPException(status_code=503, detail=f"Scorer catalog unavailable: {exc.code}") from exc
+    finally:
+        adapter.close()
+    return JSONResponse({"provider": provider, "models": models}, headers={"Cache-Control": "no-store"})
+
+
 @app.get("/api/models/details")
 def ollama_model_details(model: str) -> JSONResponse:
     try:
@@ -761,6 +784,54 @@ def run_score(run_id: str) -> JSONResponse:
     return JSONResponse(scorecard.score_run(state, run_dir), headers={"Cache-Control": "no-store"})
 
 
+def read_v4_tree(run_id: str) -> dict:
+    from v4_tree import replay_tree, _json_result
+    from v4_contracts import ContractError
+    state = existing_run(run_id)
+    if state.get("experiment_mode") != "v4":
+        raise HTTPException(status_code=404, detail="This run has no v4 tree")
+    run_dir = EXPLORER.store.root / validate_run_id(run_id)
+    path = run_dir / "events.jsonl"
+    if (run_dir.is_symlink() or path.is_symlink()
+            or not run_dir.resolve().is_relative_to(EXPLORER.store.root)):
+        raise HTTPException(status_code=403, detail="Invalid run storage boundary")
+    try:
+        if path.stat().st_size > 64 * 1024 * 1024:
+            raise LogFailure("Event log exceeds tree view limit")
+        with path.open("rb") as stream:
+            events = [_json_result(line) for line in stream if line.strip()]
+        return replay_tree(events, run_id)
+    except (OSError, ValueError, TypeError, KeyError, LogFailure, ContractError) as exc:
+        raise HTTPException(status_code=503, detail=f"Stored tree could not be replayed: {exc}") from exc
+
+
+@app.get("/api/runs/{run_id}/tree")
+def run_tree(run_id: str) -> JSONResponse:
+    tree = read_v4_tree(run_id)
+    from scorer_state import usage as scorer_usage
+    return JSONResponse({key: tree[key] for key in ("schema_version", "run_id", "root_id", "current_id",
+                                                    "last_event_seq", "nodes")}
+                        | {"scorer": {"configuration": tree["scorer"]["configuration"],
+                                      "halt": tree["scorer"]["halt"], "usage": scorer_usage(tree["scorer"])}},
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/runs/{run_id}/nodes/{node_id}")
+def run_node(run_id: str, node_id: str) -> JSONResponse:
+    from v4_contracts import validate_id
+    try:
+        validate_id(node_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    tree = read_v4_tree(run_id)
+    if node_id not in tree["nodes"]:
+        raise HTTPException(status_code=404, detail="Node not found")
+    node = tree["nodes"][node_id]
+    return JSONResponse({"run_id": run_id, "last_event_seq": tree["last_event_seq"], "node": node,
+                         "attempts": [tree["attempts"][key] for key in node["attempts"]]},
+                        headers={"Cache-Control": "no-store"})
+
+
 @app.get("/api/runs/{run_id}/events")
 def run_events(run_id: str, after_seq: int = 0, limit: int = 250) -> JSONResponse:
     existing_run(run_id)
@@ -877,7 +948,7 @@ def run_file(run_id: str, source: str, path: str) -> JSONResponse:
 
 @app.get("/api/runs/{run_id}/export")
 def run_export(run_id: str) -> Response:
-    existing_run(run_id)
+    state = existing_run(run_id)
     run_dir = EXPLORER.store.root / run_id
     if run_dir.is_symlink() or not run_dir.resolve().is_relative_to(EXPLORER.store.root):
         raise HTTPException(status_code=403, detail="세션 경계가 올바르지 않습니다.")
@@ -885,8 +956,20 @@ def run_export(run_id: str) -> Response:
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         for name in ("session.json", "events.jsonl"):
             archive.write(run_dir / name, name)
+        if state.get("experiment_mode") == "v4":
+            for name in ("tree.json", "scorer.json", "report.json"):
+                file = run_dir / name
+                if file.is_file() and not file.is_symlink() and file.resolve().is_relative_to(run_dir.resolve()):
+                    archive.write(file, name)
+            node_root = run_dir / "nodes"
+            if (node_root.is_dir() and not node_root.is_symlink()
+                    and node_root.resolve().is_relative_to(run_dir.resolve())):
+                for file in node_root.glob("N*.json"):
+                    if file.is_file() and not file.is_symlink() and file.resolve().is_relative_to(node_root.resolve()):
+                        archive.write(file, file.relative_to(run_dir).as_posix())
         artifact_root = run_dir / "artifacts"
-        if artifact_root.is_dir():
+        if (artifact_root.is_dir() and not artifact_root.is_symlink()
+                and artifact_root.resolve().is_relative_to(run_dir.resolve())):
             for file in artifact_root.rglob("*"):
                 if file.is_symlink():
                     continue

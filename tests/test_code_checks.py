@@ -25,6 +25,16 @@ class CodeCheckTests(unittest.TestCase):
         problems = check_generated_code("print(f'bad {x[0]\\n}')")
         self.assertTrue(problems and "Syntax error" in problems[0])
 
+    def test_query_parameter_key_is_not_percent_encoded(self):
+        code = "import urllib.parse\nquery = \"q=1' OR 1=1\"\nurl = '/search?' + urllib.parse.quote(query)"
+        self.assertTrue(any("urlencode" in item for item in check_generated_code(code)))
+        self.assertEqual(check_generated_code("import urllib.parse\nurl = '/search?' + urllib.parse.urlencode({'q': \"1' OR 1=1\"})"), [])
+
+    def test_httpconnection_host_must_not_include_scheme(self):
+        code = "import http.client\nbase_url = 'http://127.0.0.1:3000'\nconn = http.client.HTTPConnection(base_url)"
+        self.assertTrue(any("HTTPConnection" in item for item in check_generated_code(code)))
+        self.assertEqual(check_generated_code("import http.client\nconn = http.client.HTTPConnection('127.0.0.1', 3000)"), [])
+
     def test_no_false_positives(self):
         # str.title() and builtins must not be flagged as missing-await Playwright calls
         self.assertEqual(check_generated_code("print('abc'.title())"), [])

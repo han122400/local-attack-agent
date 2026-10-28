@@ -5,17 +5,18 @@ from __future__ import annotations
 import copy
 import time
 
-from decision_provider import OpenRouterDecisions, ProviderError, estimated_cost, utc_now
-from risk_rubric import (CONTRACT_VERSION, PROJECTION_VERSION, RUBRIC_VERSION, build_score_request,
-                         canonical_bytes, fingerprint)
-from scorer_state import SETTINGS_VERSION, context, effective_settings, outcomes, usage
+from decision_provider import LocalOllamaScorer, OpenRouterDecisions, ProviderError, estimated_cost, utc_now
+from risk_rubric import CONTRACT_VERSION, PROJECTION_VERSION, RUBRIC_VERSION, fingerprint
+from scorer_state import (ORDINAL_CONTRACT_VERSION, SETTINGS_VERSION, context, effective_settings,
+                          outcomes, score_request, scoring_request_bytes, usage)
 from v4_contracts import ContractError
 
 
 class RiskScorer:
     def __init__(self, tree, *, adapter=None, clock=time.monotonic, admit_request=None):
         self.tree, self.log = tree, tree.log
-        self.adapter = adapter or OpenRouterDecisions()
+        self.adapter = adapter or (LocalOllamaScorer(settings=effective_settings(self.log.metadata))
+                                   if self.log.metadata.get("scorer_provider") == "local" else OpenRouterDecisions())
         self._owns_adapter = adapter is None
         self.clock = clock
         self.admit_request = admit_request
@@ -51,10 +52,12 @@ class RiskScorer:
             raise
         if pin["id"] != self.log.metadata["scorer_model"]:
             raise ContractError("Catalog resolved a different scorer model")
-        configuration = {"provider": "openrouter", "model_pin": pin, "settings": settings,
+        provider = self.log.metadata["scorer_provider"]
+        configuration = {"provider": provider, "model_pin": pin, "settings": settings,
                          "settings_version": SETTINGS_VERSION,
                          "rubric_version": RUBRIC_VERSION, "projection_version": PROJECTION_VERSION,
-                         "contract_version": CONTRACT_VERSION, "catalog_elapsed_seconds": self.clock() - started}
+                         "contract_version": ORDINAL_CONTRACT_VERSION if provider == "local" else CONTRACT_VERSION,
+                         "catalog_elapsed_seconds": self.clock() - started}
         self.tree.record_scoring("scorer_configured", configuration)
         return configuration
 
@@ -150,8 +153,8 @@ class RiskScorer:
                 continue
             ids = missing[:settings["batch_size"]]
             while ids:
-                payload = build_score_request(pin["id"], current["parent"], current["siblings"], ids)
-                if len(canonical_bytes(payload)) <= settings["max_input_bytes"]:
+                payload = score_request(config, current["parent"], current["siblings"], ids)
+                if scoring_request_bytes(config, payload) <= settings["max_input_bytes"]:
                     break
                 ids.pop()
             if not ids:

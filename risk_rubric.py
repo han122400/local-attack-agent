@@ -142,6 +142,19 @@ def build_score_request(model: str, parent: dict, siblings: list[dict], node_ids
                       "parent": project_node(parent), "nodes": nodes}}
 
 
+def build_ordinal_request(model: str, parent: dict, siblings: list[dict], node_ids: list[str]) -> dict:
+    if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,256}", model):
+        raise ScoreContractError("invalid_model_id")
+    projected = [project_node(node) for node in siblings]
+    nodes = {node["id"]: node for node in projected}
+    if (len(nodes) != len(siblings) or not node_ids or len(node_ids) != len(set(node_ids))
+            or not set(node_ids) <= nodes.keys()):
+        raise ScoreContractError("invalid_question_mapping")
+    return {"model": model, "method": "ordinal_label", "criteria": list(CRITERIA),
+            "node_ids": list(node_ids), "state": {"rubric_version": RUBRIC_VERSION,
+            "projection_version": PROJECTION_VERSION, "parent": project_node(parent), "nodes": nodes}}
+
+
 def is_finite_number(value) -> bool:
     if type(value) not in (int, float):
         return False
@@ -194,6 +207,14 @@ def validate_answer(answer: dict) -> dict:
     return {"score": 100 * raw / (count - 1), "raw_score": raw,
             "score_method": "probability_weighted", "probabilities": probabilities,
             "confidence": _number(answer.get("confidence"), 0, 1), "rounding_profile": "decimal-2"}
+
+
+def validate_ordinal_answer(label: int) -> dict:
+    if type(label) is not int or not 0 <= label < len(CRITERIA):
+        raise ScoreContractError("invalid_ordinal_label")
+    return {"score": 100.0 * label / (len(CRITERIA) - 1), "raw_score": label,
+            "score_method": "ordinal_label", "label": label,
+            "probabilities": None, "confidence": None, "rounding_profile": None}
 
 
 def validate_usage(value) -> dict:
