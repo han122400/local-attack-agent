@@ -13,11 +13,12 @@ from v4_contracts import ContractError
 
 
 class RiskScorer:
-    def __init__(self, tree, *, adapter=None, clock=time.monotonic):
+    def __init__(self, tree, *, adapter=None, clock=time.monotonic, admit_request=None):
         self.tree, self.log = tree, tree.log
         self.adapter = adapter or OpenRouterDecisions()
         self._owns_adapter = adapter is None
         self.clock = clock
+        self.admit_request = admit_request
 
     def close(self):
         if self._owns_adapter:
@@ -40,8 +41,10 @@ class RiskScorer:
             return existing
         started = self.clock()
         try:
-            pin = self.adapter.resolve(self.log.metadata["scorer_model"],
-                timeout_seconds=min(settings["timeout_seconds"], settings["time_budget_seconds"]))
+            timeout = min(settings["timeout_seconds"], settings["time_budget_seconds"])
+            if self.admit_request:
+                timeout = self.admit_request("catalog", 0, timeout)
+            pin = self.adapter.resolve(self.log.metadata["scorer_model"], timeout_seconds=timeout)
         except ProviderError as exc:
             self.tree.record_scoring("scorer_halted", {"reason": "scorer_unavailable",
                 "catalog_elapsed_seconds": self.clock() - started, "catalog_error": exc.code})
@@ -160,6 +163,8 @@ class RiskScorer:
             if accounting["accounted_cost_usd"] + estimate > settings["max_cost_usd"]:
                 return self._stop("cost_budget")
             timeout = min(settings["timeout_seconds"], settings["time_budget_seconds"] - accounting["elapsed_seconds"])
+            if self.admit_request:
+                timeout = self.admit_request("scorer", estimate, timeout)
             request_id = f"S{len(state['requests']) + 1:06d}"
             self.tree.record_scoring("scorer_request_started", {"request_id": request_id, "parent_id": parent_id,
                 "context_key": current["key"], "node_ids": ids, "request": payload, "input_hash": fingerprint(payload),

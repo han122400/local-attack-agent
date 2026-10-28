@@ -18,10 +18,12 @@ from v4_contracts import (SCHEMA_VERSION, MAX_RESULT_BYTES, MAX_EVIDENCE_BYTES, 
                           ContractError, dedup_key, normalize_url, validate_discovery, validate_id, validate_result)
 from risk_rubric import observations
 from scorer_state import SCORING_EVENTS, apply_scoring_event, empty_scorer, usage as scorer_usage
+from v4_policy import oracle_verdict
 
 
 _KINDS = {"tree_initialized", "node_discovered", "node_selected", "node_state_changed",
-          "node_attempt_started", "node_result_imported", "node_observations_changed", *SCORING_EVENTS}
+          "node_attempt_started", "node_result_imported", "node_observations_changed", "node_attempt_failed",
+          "node_verification_recorded", "node_investigation_finished", *SCORING_EVENTS}
 
 
 def _empty_state(run_id: str) -> dict:
@@ -39,7 +41,8 @@ def _node(node_id: str, parent_id: str | None, discovery: dict) -> dict:
             "dedup_key": dedup_key(discovery), "discovery_paths": [] if parent_id is None else [
                 {"parent_id": parent_id, "relation": discovery["relation"]}],
             "exploration_state": "discovered", "verification_state": "untested",
-            "observations": observations({}),
+            "investigation_state": "pending",
+            "observations": observations(discovery.get("observations", {})),
             "risk": {"status": "not_applicable" if parent_id is None else "pending", "score": None},
             "attempts": [], "evidence_refs": [], "verification": None}
 
@@ -63,6 +66,10 @@ def _discover(state: dict, parent_id: str, discovery: dict) -> str:
         if existing["dedup_key"] == key:
             if link not in existing["discovery_paths"]:
                 existing["discovery_paths"].append(link)
+            if "observations" in discovery and existing["observations"] != discovery["observations"]:
+                existing["observations"] = discovery["observations"]
+                _invalidate_children(state, existing["parent_id"])
+                _invalidate_children(state, existing["id"])
             return existing["id"]
     node_id = f"N{len(state['nodes']) + 1:04d}"
     state["nodes"][node_id] = _node(node_id, parent_id, discovery)
@@ -156,6 +163,8 @@ def _apply(state: dict, event: dict) -> None:
             raise ContractError("Completed or blocked nodes cannot be selected")
         node["exploration_state"] = "active"
         state["current_id"] = node["id"]
+    elif kind == "node_investigation_finished":
+        state["nodes"][payload["node_id"]]["investigation_state"] = "done"
     elif kind == "node_state_changed":
         node = state["nodes"][payload["node_id"]]
         if payload["state"] not in ("done", "blocked"):
@@ -181,6 +190,40 @@ def _apply(state: dict, event: dict) -> None:
             "call_id": event["call_id"], "exec_id": None, "status": "pending", "started_seq": event["seq"],
             "result_path": f"work/node-results/{attempt_id}.json"}
         node["attempts"].append(attempt_id)
+    elif kind == "node_attempt_failed":
+        attempt = state["attempts"][payload["attempt_id"]]
+        if attempt["status"] != "pending" or payload["reason"] not in (
+                "missing_result", "invalid_result", "execution_failed", "interrupted", "not_executed"):
+            raise ContractError("Invalid attempt failure")
+        exec_id = payload["exec_id"]
+        if exec_id is not None:
+            _execution(state, attempt, exec_id, interrupted=True)
+        elif any(item["call_id"] == attempt["call_id"] for item in state["executions"].values()):
+            raise ContractError("Attempt has execution provenance")
+        ref = _artifact_ref(payload["result_ref"]) if payload["result_ref"] else None
+        attempt.update(status="failed", exec_id=exec_id, reason=payload["reason"], result_ref=ref)
+        node = state["nodes"][attempt["node_id"]]
+        node["verification_state"] = "inconclusive"
+        node["verification"] = {"verdict": "inconclusive", "reason": payload["reason"], "source": "attempt_failure"}
+        if ref:
+            node["evidence_refs"].append(ref)
+    elif kind == "node_verification_recorded":
+        attempt = state["attempts"][payload["attempt_id"]]
+        proof = payload["proof"]
+        node = state["nodes"][attempt["node_id"]]
+        if (attempt["status"] != "imported" or proof["run_id"] != state["run_id"]
+                or proof["node_id"] != node["id"] or proof["attempt_id"] != attempt["attempt_id"]
+                or proof["exec_id"] != attempt["exec_id"]):
+            raise ContractError("Verification belongs to a different imported attempt")
+        refs = [_artifact_ref(ref) for ref in payload["evidence_refs"]]
+        if any(ref.get("source") != "harness_http" for ref in refs) or proof["evidence_count"] != len(refs):
+            raise ContractError("Verification requires harness-collected evidence")
+        verdict = oracle_verdict(proof, node, execution_status=attempt["execution_status"])
+        proof_ref = _artifact_ref(payload["proof_ref"])
+        node["verification_state"] = verdict["verdict"]
+        node["verification"] = {**verdict, "attempt_id": attempt["attempt_id"], "exec_id": attempt["exec_id"],
+                                "proof_ref": proof_ref, "evidence_refs": refs}
+        node["evidence_refs"].extend([proof_ref, *refs])
     elif kind == "node_result_imported":
         attempt = state["attempts"][payload["attempt_id"]]
         digest = _digest({"payload": payload, "call_id": event["call_id"], "exec_id": event["exec_id"]})
@@ -189,6 +232,8 @@ def _apply(state: dict, event: dict) -> None:
                 raise ContractError("Conflicting repeated result import")
             state["last_event_seq"] = event["seq"]
             return
+        if attempt["status"] != "pending":
+            raise ContractError("A closed failed attempt cannot import later files")
         if event["call_id"] != attempt["call_id"]:
             raise ContractError("Imported result call identity mismatch")
         status = _execution(state, attempt, event["exec_id"], interrupted=payload["execution_status"] == "interrupted")
@@ -201,6 +246,10 @@ def _apply(state: dict, event: dict) -> None:
         attempt.update(status="imported", execution_status=status, exec_id=event["exec_id"],
                        result_ref=result_ref, evidence_refs=refs, imported_seq=event["seq"], import_digest=digest)
         node = state["nodes"][attempt["node_id"]]
+        if "observations" in result:
+            node["observations"] = result["observations"]
+            _invalidate_children(state, node["parent_id"])
+            _invalidate_children(state, node["id"])
         node["evidence_refs"].extend([result_ref, *refs])
         node["verification_state"] = "inconclusive"
         node["verification"] = {"proposed_verdict": result["proposed_verdict"], "claim": result["claim"],
@@ -366,6 +415,11 @@ class TreeStore:
             self._sync()
             self._commit("node_selected", {"node_id": validate_id(node_id)})
 
+    def finish_investigation(self, node_id: str) -> None:
+        with self.log.locked_writer():
+            self._sync()
+            self._commit("node_investigation_finished", {"node_id": validate_id(node_id)})
+
     def set_node_state(self, node_id: str, state: str) -> None:
         with self.log.locked_writer():
             self._sync()
@@ -418,15 +472,48 @@ class TreeStore:
                          call_id=attempt["call_id"], exec_id=exec_id)
             return copy.deepcopy(self._state["attempts"][attempt_id])
 
+    def fail_attempt(self, attempt_id: str, *, reason: str, exec_id: str | None = None) -> None:
+        with self.log.locked_writer():
+            self._sync()
+            attempt = self._state["attempts"][validate_id(attempt_id, attempt=True)]
+            if attempt["status"] == "failed":
+                return
+            ref = None
+            try:
+                raw = _read_bounded(self.log.run_dir / "runtime", attempt["result_path"], MAX_EVIDENCE_BYTES)
+            except FileNotFoundError:
+                raw = None
+            except (OSError, ValueError) as exc:
+                # Missing files are expected; unreadable/linked/oversized files
+                # must remain available for recovery instead of being deleted.
+                path = self.log.run_dir / "runtime" / attempt["result_path"]
+                if path.exists() or path.is_symlink():
+                    raise LogFailure("Cannot preserve failed attempt result") from exc
+                raw = None
+            if raw is not None:
+                ref = self.log.preserve_bytes(f"invalid-node-results/{attempt_id}.json", raw)
+            self._commit("node_attempt_failed", {"attempt_id": attempt_id, "exec_id": exec_id,
+                                                 "reason": reason, "result_ref": ref})
+
+    def record_verification(self, attempt_id: str, proof: dict, refs: list[dict]) -> None:
+        with self.log.locked_writer():
+            self._sync()
+            for ref in refs:
+                _artifact_ref(ref)
+                data = _read_bounded(self.log.run_dir, ref["path"], MAX_EVIDENCE_BYTES)
+                if len(data) != ref["bytes"] or hashlib.sha256(data).hexdigest() != ref["sha256"]:
+                    raise ContractError("Verification evidence changed")
+            proof_ref = self.log.preserve_bytes(f"verification/{attempt_id}.json", json.dumps(proof, allow_nan=False).encode("utf-8"))
+            self._commit("node_verification_recorded", {"attempt_id": attempt_id, "proof": proof,
+                                                       "proof_ref": proof_ref, "evidence_refs": refs})
+
     def rebuild(self) -> dict:
         with self.log.locked_writer():
             state = replay_tree(self.log.snapshot_events(), self.log.run_id)
             if state["root_id"] is None:
                 raise LogFailure("Tree initialization event is missing")
-            for attempt in state["attempts"].values():
-                if attempt["status"] != "imported":
-                    continue
-                for ref in [attempt["result_ref"], *attempt["evidence_refs"]]:
+            for node in state["nodes"].values():
+                for ref in node["evidence_refs"]:
                     try:
                         data = _read_bounded(self.log.run_dir, ref["path"], MAX_EVIDENCE_BYTES)
                         if len(data) != ref["bytes"] or hashlib.sha256(data).hexdigest() != ref["sha256"]:

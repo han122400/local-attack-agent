@@ -45,6 +45,11 @@ _ROUTES = {"api", "search", "login", "upload", "admin", "users", "orders", "prod
 _METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE"}
 _AUTH = {"anonymous", "authenticated", "owner", "non_owner", "admin", "unknown"}
 _HYPOTHESES = {"sqli", "idor", "xss", "upload", "ssrf", "path_traversal", "auth", "csrf"}
+OBSERVATIONS_SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
+    **{key: {"enum": sorted(values)} for key, values in _ENUMS.items()},
+    **{key: {"type": ["boolean", "null"]} for key in sorted(_OPTIONAL_BOOLS)},
+    **{key: {"type": "boolean"} for key in sorted(_BOOLS)},
+    "response_status": {"anyOf": [{"type": "integer", "minimum": 100, "maximum": 599}, {"type": "null"}]}}}
 
 
 class ScoreContractError(ValueError):

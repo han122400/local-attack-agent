@@ -29,7 +29,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.concurrency import run_in_threadpool
 
 import scorecard
-from experiment_config import validate_experiment_config, require_execution_ready, V4ExecutionUnavailable
+from experiment_config import validate_experiment_config, require_execution_ready, V4ExecutionUnavailable, compatible_prompt
 
 
 TARGET = "http://127.0.0.1:3000/"
@@ -610,8 +610,11 @@ def check_origin(request: Request) -> None:
 
 
 @app.get("/api/prompts")
-def list_prompts() -> JSONResponse:
-    return JSONResponse({"versions": available_prompt_versions(), "default": SYSTEM_PROMPT_VERSION},
+def list_prompts(experiment_mode: str = "v3") -> JSONResponse:
+    if experiment_mode not in ("v3", "v4"):
+        raise HTTPException(status_code=400, detail="Unknown experiment mode")
+    versions = [version for version in available_prompt_versions() if (version == "v4") == (experiment_mode == "v4")]
+    return JSONResponse({"versions": versions, "default": "v4" if experiment_mode == "v4" else SYSTEM_PROMPT_VERSION},
                         headers={"Cache-Control": "no-store"})
 
 
@@ -624,6 +627,9 @@ async def start(request: Request) -> dict:
             raise ValueError("실험 설정은 JSON 객체여야 합니다.")
         experiment = validate_experiment_config(body)
         require_execution_ready(experiment)
+        prompt_version = compatible_prompt(experiment["experiment_mode"], body.get("prompt_version"))
+        from v4_policy import execution_settings
+        v4_settings = execution_settings(body.get("v4_settings")) if experiment["experiment_mode"] == "v4" else None
         target = safe_target(body.get("target", TARGET))
         model = body.get("model", MODEL)
         goal = body.get("goal", "")
@@ -651,7 +657,7 @@ async def start(request: Request) -> dict:
                 raise ValueError(f"선택한 모델의 출력 한도는 {info['max_completion_tokens']} 토큰입니다.")
         started = EXPLORER.start(target, model, goal=goal, model_settings=settings,
                                  scenario_source=scenario_source, chain_mode=chain_mode,
-                                 budgets=body.get("budgets"), prompt_version=body.get("prompt_version"), **experiment)
+                                 budgets=body.get("budgets"), prompt_version=prompt_version, v4_settings=v4_settings, **experiment)
     except V4ExecutionUnavailable as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
     except ValueError as exc:

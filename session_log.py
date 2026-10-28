@@ -365,10 +365,11 @@ class SessionStore:
                         outstanding.discard(identity)
                     elif event.get("kind") in {"finalize_started", "run_finalized"}:
                         result = event.get("run_result") or result
-                    elif event.get("kind") == "v4_preparation_created":
+                    elif event.get("kind") in {"v4_preparation_created", "v4_execution_created"}:
                         config = event.get("configuration")
                         if (v4_configuration is not None or not isinstance(config, dict)
-                                or config.get("experiment_mode") != "v4" or config.get("v4_stage") != "foundation"):
+                                or config.get("experiment_mode") != "v4" or config.get("v4_stage") != (
+                                    "foundation" if event["kind"] == "v4_preparation_created" else "execution")):
                             raise ValueError("Invalid v4 preparation identity")
                         v4_configuration = config
             except (ValueError, UnicodeDecodeError, TypeError) as exc:
@@ -400,10 +401,13 @@ class SessionStore:
             except ValueError as exc:
                 raise LogFailure("Cannot restore v4 preparation settings") from exc
             keys = ("target", "goal", "model", "model_settings", "budgets", "prompt_version",
-                    "tree_schema_version", "result_schema_version")
+                    "tree_schema_version", "result_schema_version", "v4_settings")
             metadata.update({key: v4_configuration.get(key) for key in keys})
-            metadata.update(selected, v4_stage="foundation", execution_ready=False, scorer_validation="syntax_only",
-                            run_result=None, lab_reset_status="not_applicable", initial_lab_status="not_applicable")
+            stage = v4_configuration["v4_stage"]
+            metadata.update(selected, v4_stage=stage, execution_ready=stage == "execution", scorer_validation="syntax_only",
+                            run_result=(result or "interrupted") if stage == "execution" else None,
+                            lab_reset_status="pending" if stage == "execution" and metadata.get("target") == "http://127.0.0.1:3000/" else "not_applicable",
+                            initial_lab_status="not_applicable")
         temporary = directory / f"session-repair-{uuid.uuid4().hex}.tmp"
         try:
             with temporary.open("w", encoding="utf-8", newline="\n") as stream:

@@ -76,11 +76,11 @@ def start_lab() -> dict:
         return get_status()
 
 
-def _probe_initial_state() -> dict:
+def _probe_initial_state(*, deadline=None) -> dict:
     """Check reset data, not only server reachability or container mounts."""
-    with urlopen(TARGET + "rest/products/search?q=", timeout=5) as response:
+    with urlopen(TARGET + "rest/products/search?q=", timeout=_remaining(deadline, 5)) as response:
         products = json.load(response)
-    with urlopen(TARGET + "api/Challenges/", timeout=5) as response:
+    with urlopen(TARGET + "api/Challenges/", timeout=_remaining(deadline, 5)) as response:
         challenges = json.load(response)
     product_rows = products.get("data") if isinstance(products, dict) else None
     challenge_rows = challenges.get("data") if isinstance(challenges, dict) else None
@@ -95,11 +95,20 @@ def _probe_initial_state() -> dict:
                                                    for item in product_rows if isinstance(item, dict))}
 
 
-def reset_lab(*, wait_seconds: float = 45) -> dict:
+def _remaining(deadline, cap):
+    if deadline is None:
+        return cap
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("Lab reset deadline reached")
+    return min(cap, left)
+
+
+def reset_lab(*, wait_seconds: float = 45, deadline=None) -> dict:
     """Restart the existing fixed container and verify its reseeded data."""
     with _start_lock:
         try:
-            inspected = _docker("inspect", CONTAINER, timeout=10)
+            inspected = _docker("inspect", CONTAINER, timeout=_remaining(deadline, 10))
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise RuntimeError("juice-lab 설정을 확인할 수 없습니다.") from exc
         if inspected.returncode:
@@ -117,22 +126,24 @@ def reset_lab(*, wait_seconds: float = 45) -> dict:
                            for item in published)):
             raise RuntimeError("juice-lab 이미지·마운트·포트가 예상한 실험환경과 다릅니다.")
         try:
-            restarted = _docker("restart", CONTAINER, timeout=30)
+            restarted = _docker("restart", CONTAINER, timeout=_remaining(deadline, 30))
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise RuntimeError("juice-lab 재시작 결과를 확인하지 못했습니다.") from exc
         if restarted.returncode:
             raise RuntimeError("juice-lab 재시작에 실패했습니다.")
-        deadline = time.monotonic() + max(0, wait_seconds)
+        ready_deadline = time.monotonic() + max(0, wait_seconds)
+        if deadline is not None:
+            ready_deadline = min(ready_deadline, deadline)
         last_error = ""
         while True:
             try:
-                probe = _probe_initial_state()
+                probe = _probe_initial_state(deadline=ready_deadline) if deadline is not None else _probe_initial_state()
                 if probe.get("verified"):
                     return {"container": CONTAINER, "image": image, "verified": True,
                             "probe": probe, "checked_at": time.time()}
                 last_error = f"초기 데이터 불일치: {probe}"
             except (OSError, ValueError, RuntimeError) as exc:
                 last_error = str(exc)[:300]
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= ready_deadline:
                 raise RuntimeError(f"juice-lab 초기화 검증 실패: {last_error}")
-            time.sleep(min(0.5, deadline - time.monotonic()))
+            time.sleep(max(0, min(0.5, ready_deadline - time.monotonic())))

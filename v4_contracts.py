@@ -11,6 +11,7 @@ import re
 from urllib.parse import urlsplit, urlunsplit
 
 from session_log import safe_relative_path
+from risk_rubric import observations, OBSERVATIONS_SCHEMA
 
 
 SCHEMA_VERSION = 1
@@ -83,7 +84,7 @@ def validate_locator(value: dict) -> dict:
 
 
 def validate_discovery(value: dict) -> dict:
-    _object(value, ("kind", "relation", "locator", "hypothesis"))
+    _object(value, ("kind", "relation", "locator", "hypothesis"), ("observations",))
     if value["kind"] not in ("surface", "candidate") or value["relation"] not in RELATIONS:
         raise ContractError("Invalid discovered node kind/relation")
     hypothesis = value["hypothesis"]
@@ -95,8 +96,11 @@ def validate_discovery(value: dict) -> dict:
         hypothesis = {"type": category, "statement": _text(hypothesis["statement"], "hypothesis", 4000)}
     elif hypothesis is not None:
         raise ContractError("Surface nodes have no vulnerability hypothesis")
-    return {"kind": value["kind"], "relation": value["relation"],
-            "locator": validate_locator(value["locator"]), "hypothesis": hypothesis}
+    result = {"kind": value["kind"], "relation": value["relation"],
+              "locator": validate_locator(value["locator"]), "hypothesis": hypothesis}
+    if "observations" in value:
+        result["observations"] = observations(value["observations"])
+    return result
 
 
 def dedup_key(discovery: dict) -> str:
@@ -127,7 +131,7 @@ def evidence_path(value: str) -> str:
 def validate_result(value: dict, *, attempt_id: str, node_id: str) -> dict:
     fields = ("schema_version", "attempt_id", "node_id", "discovered", "proposed_verdict",
               "claim", "evidence_refs", "next_observation")
-    _object(value, fields)
+    _object(value, fields, ("observations",))
     if type(value["schema_version"]) is not int or value["schema_version"] != SCHEMA_VERSION:
         raise ContractError("Unsupported result schema version")
     if validate_id(value["attempt_id"], attempt=True) != attempt_id or validate_id(value["node_id"]) != node_id:
@@ -147,6 +151,8 @@ def validate_result(value: dict, *, attempt_id: str, node_id: str) -> dict:
                   "proposed_verdict": value["proposed_verdict"],
                   "claim": _text(value["claim"], "claim", 8000, empty=True), "evidence_refs": refs,
                   "next_observation": _text(value["next_observation"], "next observation", 4000, empty=True)}
+    if "observations" in value:
+        normalized["observations"] = observations(value["observations"])
     if len(json.dumps(normalized, ensure_ascii=False).encode("utf-8")) > MAX_RESULT_BYTES:
         raise ContractError("Result is too large")
     return normalized
@@ -164,7 +170,7 @@ DISCOVERY_SCHEMA = {"type": "object", "additionalProperties": False,
                     "required": ["kind", "relation", "locator", "hypothesis"],
                     "properties": {"kind": {"enum": ["surface", "candidate"]},
                                    "relation": {"enum": list(RELATIONS)}, "locator": _LOCATOR,
-                                   "hypothesis": {"anyOf": [_HYPOTHESIS, {"type": "null"}]}},
+                                   "hypothesis": {"anyOf": [_HYPOTHESIS, {"type": "null"}]}, "observations": OBSERVATIONS_SCHEMA},
                     "oneOf": [{"properties": {"kind": {"const": "surface"}, "hypothesis": {"type": "null"}}},
                               {"properties": {"kind": {"const": "candidate"}, "hypothesis": _HYPOTHESIS}}]}
 RESULT_SCHEMA = {"type": "object", "additionalProperties": False,
@@ -175,7 +181,7 @@ RESULT_SCHEMA = {"type": "object", "additionalProperties": False,
                                 "node_id": {"type": "string", "pattern": "^N[0-9]{4,}$"},
                                 "discovered": {"type": "array", "maxItems": 100, "items": DISCOVERY_SCHEMA},
                                 "proposed_verdict": {"enum": list(VERDICTS)}, "claim": _TEXT,
-                                "next_observation": _TEXT,
+                                "next_observation": _TEXT, "observations": OBSERVATIONS_SCHEMA,
                                 "evidence_refs": {"type": "array", "maxItems": 50, "items": {
                                     "type": "object", "additionalProperties": False, "required": ["path", "description"],
                                     "properties": {"path": _TEXT, "description": _TEXT}}}}}

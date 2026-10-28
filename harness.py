@@ -40,8 +40,9 @@ def decode_first_command(raw: str) -> tuple[object, str]:
     return value, raw.strip()[end:].strip()
 
 
-def _ollama_stream(payload: dict):
-    timeout = httpx.Timeout(connect=5, read=120, write=10, pool=5)
+def _ollama_stream(payload: dict, *, timeout_seconds=None):
+    cap = timeout_seconds if timeout_seconds is not None else 120
+    timeout = httpx.Timeout(connect=min(5, cap), read=min(120, cap), write=min(10, cap), pool=min(5, cap))
     with httpx.Client(timeout=timeout, trust_env=False) as client:
         with client.stream("POST", OLLAMA_URL, json=payload) as response:
             response.raise_for_status()
@@ -55,10 +56,12 @@ class Harness:
                  stop_requested=None, max_decode_attempts: int = 6,
                  max_transport_retries: int = 3, transport_retry_backoff: float = 0.5,
                  system_prompt: str = SYSTEM_PROMPT, system_prompt_version: str = SYSTEM_PROMPT_VERSION,
-                 system_prompt_sha256: str = SYSTEM_PROMPT_SHA256):
+                 system_prompt_sha256: str = SYSTEM_PROMPT_SHA256, before_request=None):
         self.log = log
         self.run_id = log.run_id
         self.transport = transport or _model_stream
+        self._default_transport = transport is None
+        self.before_request = before_request
         self.system_prompt = system_prompt
         self.system_prompt_version = system_prompt_version
         self.system_prompt_sha256 = system_prompt_sha256
@@ -101,8 +104,10 @@ class Harness:
                 raise ModelFailure("cancelled", "Run stopped")
             if deadline is not None and time.monotonic() >= deadline:
                 raise ModelFailure("timed_out", "Run deadline reached")
+            call_id = f"CALL-{self.calls + 1:04d}"
+            if self.before_request:
+                self.before_request(call_id, payload)
             self.calls += 1
-            call_id = f"CALL-{self.calls:04d}"
             started = time.monotonic()
             self.log.append("model_request", {"call_id": call_id, "input": payload,
                                               "settings": selected, "attempt": self.calls,
@@ -113,7 +118,9 @@ class Harness:
             completion: dict = {}
             raw = ""
             try:
-                for chunk in self.transport(payload):
+                stream = (_model_stream(payload, timeout_seconds=max(.001, deadline - time.monotonic()))
+                          if self._default_transport and deadline is not None else self.transport(payload))
+                for chunk in stream:
                     if self.stop_requested():
                         raise ModelFailure("cancelled", "Run stopped", call_id)
                     if deadline is not None and time.monotonic() >= deadline:
@@ -205,7 +212,9 @@ class Harness:
                     {"role": "assistant", "content": previous},
                     {"role": "user", "content": feedback}]}
             except (OpenRouterError, httpx.HTTPError, OSError, TimeoutError, json.JSONDecodeError) as exc:
-                failure = ModelFailure("transport", str(exc)[:300], call_id)
+                kind = ("cancelled" if self.stop_requested() else "timed_out"
+                        if deadline is not None and time.monotonic() >= deadline else "transport")
+                failure = ModelFailure(kind, str(exc)[:300], call_id)
                 self.log.append("model_error", {"call_id": call_id, "error_kind": failure.kind,
                                                 "message": str(failure), "elapsed": round(time.monotonic() - started, 3)})
                 last_error = failure
@@ -225,6 +234,6 @@ class Harness:
         raise last_error
 
 
-def _model_stream(payload: dict):
+def _model_stream(payload: dict, *, timeout_seconds=None):
     transport = openrouter_stream if is_openrouter(payload["model"]) else _ollama_stream
-    yield from transport(payload)
+    yield from (transport(payload, timeout_seconds=timeout_seconds) if timeout_seconds is not None else transport(payload))

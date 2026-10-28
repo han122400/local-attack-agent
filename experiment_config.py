@@ -18,12 +18,20 @@ _LOCAL_INTEGERS = {"num_ctx": (256, 1048576), "num_predict": (1, 131072)}
 
 
 class V4ExecutionUnavailable(RuntimeError):
-    """Scoring is available; the A4 exploration/verification loop is not."""
+    """The selected provider requires the later B adapter stage."""
 
 
 def require_execution_ready(config: dict) -> None:
-    if config["experiment_mode"] == "v4":
-        raise V4ExecutionUnavailable("v4 execution requires A4. Use POST /api/v4/prepare to prepare its configuration and tree.")
+    if config["experiment_mode"] == "v4" and config["scorer_provider"] != "openrouter":
+        raise V4ExecutionUnavailable("Local v4 scoring requires the B adapter stage")
+
+
+def compatible_prompt(mode: str, requested=None) -> str:
+    from planning import SYSTEM_PROMPT_VERSION, available_prompt_versions
+    selected = requested or ("v4" if mode == "v4" else SYSTEM_PROMPT_VERSION)
+    if selected not in available_prompt_versions() or ((selected == "v4") != (mode == "v4")):
+        raise ValueError("Prompt version is incompatible with experiment_mode")
+    return selected
 
 
 def validate_experiment_config(body: dict) -> dict:

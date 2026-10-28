@@ -1,8 +1,8 @@
 # v4 구현 계획 — 노드 트리, 선택형 위험도 평가, 탐욕적 탐색
 
-> 2026-10-27 기준 설계 문서. A1·A2의 계약·설정 준비·트리 저장/재생과 A3의 OpenRouter 판정 연결·형제 배치·캐시·예산·재생을 구현했다. A4 탐색/확인 루프와 B 대시보드는 미구현이며 실제 탐색 실행은 아직 v3다. 이 문서는 기존 `EXPLORATION_DESIGN_REVIEW.md`의 전역 frontier 설계를 지금까지 합의한 방향으로 교체한다.
+> 2026-10-28 기준. A1·A2 저장 계약, A3 점수화와 A4 탐욕 탐색·SQLi 실습 확인·보고서/복구 코드를 연결했다. A4는 관련 단위 검증을 통과하고 최종 코드 검토 중이다. A5 비교 실험과 B 대시보드·로컬 판정 어댑터는 별도다. 이 문서는 기존 `EXPLORATION_DESIGN_REVIEW.md`의 전역 frontier 설계를 합의한 트리 탐색으로 교체한다.
 
-구현된 A1·A2는 [v4 계약 v1](docs/v4-contract-v1.md), A3의 입력·정규화·반올림 호환 계약·설정과 사용법은 [scorer 구현 계약](docs/v4-scorer-v1.md)에 정리했다. 합성 실호출로 `typesafe/jev-1.14` → `typesafe/jev-1.14-20261014`와 Score/usage 계약을 확인했다. 이는 판단 품질 검증은 아니다. `POST /api/v4/prepare`는 계속 설정과 루트만 보존하며 모델·대상·runtime을 실행하지 않는다. v4 `/api/start`는 A4 연결 전까지 501로 거절한다. 준비는 `execution_ready=false`, 목록 확인 전 `syntax_only`, scorer 연결 후 `catalog_verified`로 표시한다.
+구현된 A1·A2는 [저장 계약](docs/v4-contract-v1.md), A3는 [scorer 계약](docs/v4-scorer-v1.md), A4의 확인 정책·예산·API 사용법은 [실행 계약](docs/v4-execution-v1.md)에 정리했다. A3의 합성 실호출은 `typesafe/jev-1.14` → `typesafe/jev-1.14-20261014`와 Score/usage 계약을 확인했으며 판단 품질 검증은 아니다. `/api/v4/prepare`는 계속 설정·루트만 보존한다. `/api/start`의 v4는 호환 프롬프트로 실제 트리 루프를 실행한다. 로컬 판정 제공자는 B 어댑터 전까지 501이다. 준비는 `execution_ready=false`, scorer 목록 확인 전 `syntax_only`, 확인 후 `catalog_verified`로 구분한다.
 
 ## 1. 목표와 결정된 방향
 
@@ -256,6 +256,6 @@ v4 완료 기준은 다음과 같다: 대시보드에서 1단계 실행 LLM(Olla
 - **A1에서 확정 완료:** 첫 발견 부모를 유지하고 관계 유형 `discovered/refines/enabled_by`와 보조 발견 경로를 저장한다. 결과 JSON·증거 참조·이벤트의 구체 필드는 [v4 계약 v1](docs/v4-contract-v1.md)을 따른다.
 - **A3에서 확정 완료:** 5단계 통합 우선순위 문구와 범주형 평가 입력(`risk-priority-v1`, `scoring_fields_v1`), 확률/score 반올림의 동시 일관성을 확인하는 `decisions-score-v2-rounded`. 최초 계약 실패와 변경 근거, 새 실호출 성공 기록은 scorer 구현 계약에 보존했다.
 - **scorer 시작값 확정 / 첫 대상 실행 전 추가 확정:** A3의 배치·입력·전체/부모 한도·재시도·비용/시간 값은 `scorer-settings-v1`로 고정했다. 실행 LLM과 합친 총 예산, 깊은 노드/검증/보고서 예약·해제 규칙은 A4/A5에서 연결한다.
-- **A4 진입 전 확정:** SQLi 실습 챌린지 1종의 식별자·매핑, 원본 관측 수집 스키마와 양성·음성 사례. IDOR·XSS 및 다른 SQLi의 확장은 별도 검증기가 §5의 최소 근거를 충족한 뒤 지원한다.
+- **A4에서 확정/연결:** v20.2.0의 `dbSchemaChallenge`에 `juice-shop-sqli-v1` 정책을 적용한다. 독립 해결 전후 관측·실행 연결·SQL 표현식 대조/재확인과 보존 증거를 모두 요구한다. 양성 및 플래그만 바뀌는 음성 사례를 모의 HTTP+실제 SQLite로 검증했다. 실제 대상 성능 비교는 A5이며 IDOR·XSS와 다른 SQLi는 해당 검증기 전까지 미확정이다.
 - **B단계에서 확정:** 로컬 판정 어댑터의 첫 지원 범위: 구조화 출력을 내는 Ollama 모델, 전용 로컬 Decisions 서버 중 어느 방식을 먼저 연결할지.
 - **B단계에서 확정:** 로컬 모델의 등급형 점수와 확률형 점수의 정규화·비교 기준, 로컬 모델 지원 여부를 판별하는 방법.

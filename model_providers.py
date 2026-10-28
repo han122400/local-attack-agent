@@ -54,14 +54,14 @@ def _http_failure(status: int) -> OpenRouterError:
     return OpenRouterError(f"OpenRouter HTTP {status}: {hint}", retryable=status not in {401, 402, 403})
 
 
-def get_openrouter_models(*, refresh: bool = False) -> list[dict]:
+def get_openrouter_models(*, refresh: bool = False, timeout_seconds=None) -> list[dict]:
     key = _require_key()
     cache_key = (str(ENV_PATH), hashlib.sha256(key.encode()).hexdigest())
     cached = _catalog_cache.get(cache_key)
     if not refresh and cached and time.monotonic() - cached[0] < 60:
         return cached[1]
     try:
-        with httpx.Client(timeout=15, trust_env=False) as client:
+        with httpx.Client(timeout=min(15, timeout_seconds) if timeout_seconds is not None else 15, trust_env=False) as client:
             response = client.get(f"{OPENROUTER_URL}/models", headers={"Authorization": f"Bearer {key}"})
             if not response.is_success:
                 raise _http_failure(response.status_code)
@@ -95,8 +95,8 @@ def get_openrouter_models(*, refresh: bool = False) -> list[dict]:
         raise OpenRouterError("OpenRouter 모델 목록 응답 형식이 올바르지 않습니다.") from None
 
 
-def openrouter_model(model: str) -> dict:
-    for item in get_openrouter_models():
+def openrouter_model(model: str, *, timeout_seconds=None) -> dict:
+    for item in (get_openrouter_models(timeout_seconds=timeout_seconds) if timeout_seconds is not None else get_openrouter_models()):
         if item["name"] == model:
             return item
     raise ValueError("선택한 OpenRouter 모델을 찾지 못했습니다. 모델 목록을 새로고침하세요.")
@@ -193,12 +193,16 @@ def _sse_events(lines):
         yield "\n".join(data)
 
 
-def openrouter_stream(payload: dict):
+def openrouter_stream(payload: dict, *, timeout_seconds=None):
     key = _require_key()
     try:
-        info = openrouter_model(payload["model"])
+        began = time.monotonic()
+        info = (openrouter_model(payload["model"], timeout_seconds=timeout_seconds) if timeout_seconds is not None else openrouter_model(payload["model"]))
         request = _request_payload(payload, info)
-        timeout = httpx.Timeout(connect=10, read=120, write=15, pool=5)
+        if timeout_seconds is not None and time.monotonic() - began >= timeout_seconds:
+            raise OpenRouterError("OpenRouter request deadline reached before inference", retryable=False)
+        cap = max(.001, timeout_seconds - (time.monotonic() - began)) if timeout_seconds is not None else 120
+        timeout = httpx.Timeout(connect=min(10, cap), read=min(120, cap), write=min(15, cap), pool=min(5, cap))
         completion = {}
         finish_reason = None
         with httpx.Client(timeout=timeout, trust_env=False) as client:

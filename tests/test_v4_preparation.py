@@ -68,8 +68,8 @@ class V4PreparationTests(unittest.TestCase):
 
     def test_start_cannot_run_v3_with_a_v4_label(self):
         with patch("app.get_ollama_models", side_effect=AssertionError("Reject before model lookup")):
-            response = self.client.post("/api/start", json=self.body)
-        self.assertEqual(response.status_code, 501, response.text)
+            response = self.client.post("/api/start", json={**self.body, "prompt_version": "v3"})
+        self.assertEqual(response.status_code, 400, response.text)
         self.assertEqual(SessionStore(self.root).list_runs(), [])
 
     def test_invalid_mode_or_scorer_configuration_is_rejected_before_persistence(self):

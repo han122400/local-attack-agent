@@ -640,7 +640,10 @@ class CommandRuntime:
                     self._add_output(exec_id, channel, remaining)
 
     def _run_command(self, command: str, exec_id: str, timeout: float) -> int:
-        shell = ["cmd.exe", "/D", "/S", "/C", command] if os.name == "nt" else ["/bin/sh", "-c", command]
+        # cmd.exe parses /C with its own quote rules. Passing the command as a
+        # list argument applies C-runtime backslash escaping, which corrupts
+        # quoted Python/scripts. /S strips only the outer pair below.
+        shell = 'cmd.exe /D /S /C "' + command + '"' if os.name == "nt" else ["/bin/sh", "-c", command]
         process = subprocess.Popen(shell, cwd=self.runtime_dir, env=self._environment(),
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), bufsize=0)
@@ -847,12 +850,12 @@ class CommandRuntime:
             except subprocess.TimeoutExpired:
                 pass
         errors = []
-        for pid, record in list(self._owned.items()):
+        for pid, process_record in list(self._owned.items()):
             try:
                 if pid in self._jobs:
                     self._close_job(pid, terminate=True)
                 current = psutil.Process(pid)
-                if abs(current.create_time() - record["created_at"]) > 0.01:
+                if abs(current.create_time() - process_record["created_at"]) > 0.01:
                     raise RuntimeError("Owned process PID was reused")
                 descendants = current.children(recursive=True)
                 for item in reversed(descendants):
@@ -871,7 +874,7 @@ class CommandRuntime:
             self._owned.pop(pid, None)
             if record:
                 try:
-                    self.log.append("process_stopped", {"exec_id": record["exec_id"], "process": record})
+                    self.log.append("process_stopped", {"exec_id": process_record["exec_id"], "process": process_record})
                 except Exception as exc:
                     errors.append(exc)
         if record:

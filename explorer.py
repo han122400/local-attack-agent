@@ -10,7 +10,7 @@ import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
-from experiment_config import validate_experiment_config, require_execution_ready
+from experiment_config import validate_experiment_config, require_execution_ready, compatible_prompt
 from v4_contracts import SCHEMA_VERSION
 from v4_tree import TreeStore
 from urllib.parse import urlsplit
@@ -114,7 +114,7 @@ def validate_budgets(raw: dict | None) -> dict:
 
 class ExplorerV3:
     def __init__(self, runs_root: Path = RUNS_ROOT, *, transport=None, browser_enabled: bool = True,
-                 lab_reset=None, allowed_target: str | None = None):
+                 lab_reset=None, allowed_target: str | None = None, scorer_adapter=None, oracle_factory=None):
         self.store = SessionStore(runs_root)
         self.lease = ControllerLease(runs_root)
         self.instance_id = uuid.uuid4().hex
@@ -122,6 +122,7 @@ class ExplorerV3:
         self.browser_enabled = browser_enabled
         self.lab_reset = lab_reset or reset_lab
         self.allowed_target = allowed_target
+        self.scorer_adapter, self.oracle_factory = scorer_adapter, oracle_factory
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
@@ -147,10 +148,12 @@ class ExplorerV3:
               model_settings: dict | None = None, scenario_source: str = "manual", chain_mode: str = "none",
               budgets: dict | None = None, prompt_version: str | None = None, experiment_mode: str = "v3",
               scorer_provider: str | None = None, scorer_model: str | None = None,
-              scorer_settings: dict | None = None) -> str | bool:
+              scorer_settings: dict | None = None, v4_settings: dict | None = None) -> str | bool:
         experiment = validate_experiment_config({"experiment_mode": experiment_mode, "scorer_provider": scorer_provider,
-                                                "scorer_model": scorer_model, "scorer_settings": scorer_settings})
+                                                "scorer_model": scorer_model, "scorer_settings": {} if scorer_settings is None else scorer_settings})
         require_execution_ready(experiment)
+        from v4_policy import execution_settings
+        execution = execution_settings(v4_settings) if experiment_mode == "v4" else None
         if scenario_source != "manual" or chain_mode != "none":
             raise ValueError("Only manual scenario with none chain is implemented")
         if not isinstance(goal, str) or not goal.strip() or len(goal) > 2000:
@@ -158,7 +161,7 @@ class ExplorerV3:
         target = safe_target(target, self.allowed_target)
         if not isinstance(model, str) or not model.strip() or len(model) > 256:
             raise ValueError("Installed model name is required")
-        prompt_version = prompt_version or SYSTEM_PROMPT_VERSION
+        prompt_version = compatible_prompt(experiment_mode, prompt_version)
         if prompt_version not in available_prompt_versions():
             raise ValueError("Unknown system prompt version")
         selected = default_model_settings() if model_settings is None else validate_model_settings(model_settings)
@@ -184,10 +187,19 @@ class ExplorerV3:
                         "prompt_version": prompt_version,
                         "started_at": time.time(), "finished_at": None, "finish_reason": "",
                         "managed_processes": [], **experiment}
+            if experiment_mode == "v4":
+                metadata.update(v4_stage="execution", execution_ready=True, v4_settings=execution,
+                                scorer_validation="syntax_only", tree_schema_version=SCHEMA_VERSION, result_schema_version=SCHEMA_VERSION)
+            log = None
             try:
                 log = self.store.create(run_id, metadata)
                 log.append("run_created", {"owner_instance_id": self.instance_id, "goal": goal.strip()})
+                if experiment_mode == "v4":
+                    log.append("v4_execution_created", {"configuration": metadata})
+                    TreeStore(log).initialize(target)
             except Exception:
+                if log is not None:
+                    log.close()
                 self.lease.release()
                 raise
             self.active_run_id = run_id
@@ -212,7 +224,7 @@ class ExplorerV3:
         if not isinstance(model, str) or not model.strip() or len(model) > 256:
             raise ValueError("Execution model name is required")
         if prompt_version is not None:
-            raise ValueError("v4 compatible execution prompt is not implemented yet; omit prompt_version")
+            raise ValueError("Preparation does not bind an execution prompt; omit prompt_version")
         selected = default_model_settings() if model_settings is None else validate_model_settings(model_settings)
         configuration = {**experiment, "target": target, "goal": goal.strip(), "model": model,
                          "model_settings": selected, "budgets": validate_budgets(budgets), "prompt_version": None,
@@ -297,10 +309,10 @@ class ExplorerV3:
         with self.lock:
             self._runtime = runtime
         try:
-            if uses_juice_lab(log.metadata.get("target", TARGET)) and not any(
+            if uses_juice_lab(log.metadata.get("target", TARGET)) and (log.metadata.get("experiment_mode") == "v4" or not any(
                        uses_juice_lab(item.get("target", TARGET))
                        and item.get("lab_reset_status") == "succeeded" and item.get("phase") == "finished"
-                       for item in self.store.list_runs() if item.get("run_id") != run_id):
+                       for item in self.store.list_runs() if item.get("run_id") != run_id)):
                 log.update(initial_lab_status="running")
                 initial_probe = self.lab_reset()
                 if not isinstance(initial_probe, dict) or not initial_probe.get("verified"):
@@ -309,7 +321,13 @@ class ExplorerV3:
                 log.update(initial_lab_status="succeeded", initial_lab_probe=initial_probe)
             log.update(phase="running")
             runtime.start_session(run_id, target=log.metadata["target"], browser=self.browser_enabled)
-            result, reason = self._loop(run_id, log, runtime)
+            if log.metadata.get("experiment_mode") == "v4":
+                from v4_loop import V4Runner
+                oracle = self.oracle_factory(log) if self.oracle_factory else None
+                result, reason = V4Runner(log, runtime, transport=self.transport, scorer_adapter=self.scorer_adapter,
+                                          oracle=oracle, stop_event=self.stop_event).run()
+            else:
+                result, reason = self._loop(run_id, log, runtime)
         except LogFailure as exc:
             result, reason = "error", f"Log failure: {exc}"
         except ModelFailure as exc:
@@ -443,6 +461,14 @@ class ExplorerV3:
 
     def _finalize(self, run_id: str, log: SessionLog, runtime: CommandRuntime,
                   run_result: str, reason: str) -> None:
+        if log.metadata.get("experiment_mode") == "v4":
+            from v4_reporting import finalize_v4
+            try:
+                finalize_v4(log, runtime, run_result, reason, lab_reset=self.lab_reset)
+            finally:
+                with self.lock:
+                    self._recent_state.update(log.metadata, status=run_result if log.metadata.get("phase") == "finished" else "cleanup_failed")
+            return
         configured = log.metadata.get("budgets")
         configured = configured if isinstance(configured, dict) else {}
         budget = configured.get("finalize_seconds", DEFAULT_BUDGETS["finalize_seconds"])
@@ -584,8 +610,15 @@ class ExplorerV3:
                 try:
                     metadata = self.store.read(run_id)
                 except (KeyError, ValueError, LogFailure):
-                    metadata = self.store.repair_unowned_metadata(run_id)
-                if metadata.get("experiment_mode") == "v4":
+                    try:
+                        metadata = self.store.repair_unowned_metadata(run_id)
+                    except Exception:
+                        if (self.store.root / run_id / "tree.json").exists():
+                            from v4_reporting import SnapshotLog, save_report
+                            save_report(SnapshotLog(self.store.root, {"run_id": run_id}), "interrupted", "metadata_unavailable",
+                                        error="Cannot establish runtime ownership", persist_metadata=False)
+                        raise
+                if metadata.get("experiment_mode") == "v4" and metadata.get("v4_stage") == "foundation":
                     try:
                         return self._recover_v4_preparation(run_id, metadata)
                     finally:
@@ -595,7 +628,16 @@ class ExplorerV3:
                         and metadata.get("lab_reset_status") in {"succeeded", "not_applicable"}):
                     self.lease.release()
                     return False
-                log = SessionLog(self.store.root, run_id, recovery=True)
+                try:
+                    log = SessionLog(self.store.root, run_id, recovery=True)
+                except LogFailure as exc:
+                    if metadata.get("experiment_mode") != "v4":
+                        raise
+                    self.active_run_id = run_id
+                    self.worker = threading.Thread(target=self._recover_broken_v4,
+                        args=(run_id, metadata, str(exc)[:500]), daemon=True)
+                    self.worker.start()
+                    return True
                 result = metadata.get("run_result") or "interrupted"
                 reason = metadata.get("finish_reason") or "App exited during the run"
                 attempts = int(metadata.get("recovery_attempts", 0)) + 1
@@ -618,13 +660,28 @@ class ExplorerV3:
     def _recover_thread(self, run_id: str, log: SessionLog, result: str, reason: str) -> None:
         runtime = CommandRuntime(self.store.root, log)
         try:
-            runtime.restore_owned(run_id, log.metadata.get("managed_processes", []))
+            records = log.metadata.get("managed_processes", [])
+            if log.metadata.get("experiment_mode") == "v4":
+                from v4_reporting import owned_records
+                records = owned_records(log.metadata, log.snapshot_events())
+            runtime.restore_owned(run_id, records)
             with self.lock:
                 self._runtime = runtime
             self._finalize(run_id, log, runtime, result, reason)
         finally:
             with self.lock:
                 self._runtime = None
+                self.active_run_id = None
+            self.lease.release()
+
+    def _recover_broken_v4(self, run_id, metadata, error):
+        from v4_reporting import emergency_recovery
+        try:
+            recovered = emergency_recovery(self.store.root, metadata, error)
+            with self.lock:
+                self._recent_state.update(recovered, status="cleanup_failed")
+        finally:
+            with self.lock:
                 self.active_run_id = None
             self.lease.release()
 
