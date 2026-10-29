@@ -88,9 +88,9 @@
                 <label>전체 판정 호출 한도<input id="scorerMaxCalls" type="number" min="1" max="500" value="20"></label>
                 <label>부모별 판정 호출 한도<input id="scorerParentCalls" type="number" min="1" max="500" value="4"></label>
                 <label>재시도 횟수<input id="scorerRetries" type="number" min="0" max="5" value="1"></label>
-                <label>판정 1회 제한 · 초<input id="scorerTimeout" type="number" min="0.001" max="300" step="0.1" value="20"></label>
-                <label>판정 전체 시간 · 초<input id="scorerTimeBudget" type="number" min="0.001" max="3600" step="1" value="120"></label>
-                <label>외부 판정 최대 비용 · USD<input id="scorerMaxCost" type="number" min="0.000001" max="100" step="0.001" value="0.01"></label>
+                <label>판정 1회 제한 · 초<input id="scorerTimeout" type="number" min="0.001" max="300" step="any" value="20"></label>
+                <label>판정 전체 시간 · 초<input id="scorerTimeBudget" type="number" min="0.001" max="3600" step="any" value="120"></label>
+                <label>외부 판정 최대 비용 · USD<input id="scorerMaxCost" type="number" min="0.000001" max="100" step="any" value="0.01"></label>
               </div>
               <fieldset id="localScorerSettings" class="model-controls" hidden disabled>
                 <h3>로컬 Ollama 설정</h3>
