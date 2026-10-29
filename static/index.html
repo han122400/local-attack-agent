@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Juice Explorer · 로컬 실험</title>
-  <link rel="stylesheet" href="/style.css?v=4-scorer-tree">
+  <link rel="stylesheet" href="/style.css?v=5-separate-model-pickers">
   <script src="/model-settings-config.js?v=1-provider-settings" defer></script>
-  <script src="/app.js?v=5-scorer-tree" defer></script>
+  <script src="/app.js?v=6-separate-model-pickers" defer></script>
 </head>
 <body>
   <button id="menuToggle" class="menu-toggle" type="button" aria-controls="sidebar" aria-expanded="false">☰ 메뉴</button>
@@ -32,18 +32,23 @@
         <div id="startNotice" class="notice" role="status" aria-live="polite">준비 상태를 확인하고 있습니다.</div>
         <a id="activeRunBanner" class="active-banner" href="/" hidden>진행 중인 실험으로 이동</a>
         <form id="startForm" class="panel form-panel">
-          <h2>1단계 · 실행 LLM</h2>
-          <label for="providerSelect">모델 제공자</label>
+          <label for="experimentModeSelect">실험 방식</label>
+          <select id="experimentModeSelect"><option value="v3">v3 · 기존 탐색</option><option value="v4">v4 · 트리 탐색</option></select>
+          <div class="model-setup-grid">
+          <section id="llmSetup" class="model-setup" aria-labelledby="llmSetupTitle">
+          <h2 id="llmSetupTitle">실행 LLM 선택</h2>
+          <p class="field-note">대상을 조사하고 실행할 코드를 생성하는 모델입니다.</p>
+          <label for="providerSelect">LLM 제공자</label>
           <select id="providerSelect"><option value="ollama">로컬 Ollama</option><option value="openrouter">OpenRouter API</option></select>
           <p id="remoteModelNotice" class="field-note" hidden>OpenRouter 선택 시 목표와 관찰 내용이 외부 API로 전송되며, 선택한 모델의 요금이 적용됩니다. 키는 서버의 .env에서 읽습니다.</p>
           <div class="model-picker">
-            <label for="modelSearch">모델 검색</label>
+            <label for="modelSearch">LLM 검색</label>
             <div class="model-searchbar">
               <input id="modelSearch" type="search" placeholder="모델명 또는 제공사 검색 · 예: gemini, openai" autocomplete="off" aria-controls="modelSelect" aria-describedby="modelSearchHelp">
               <button id="clearModelSearchButton" type="button" class="button secondary" disabled>지우기</button>
               <button id="refreshModelsButton" type="button" class="button secondary">새로고침</button>
             </div>
-            <div class="model-results-head"><label for="modelSelect">검색 결과</label><span id="modelSearchCount" role="status" aria-live="polite">모델 확인 중</span></div>
+            <div class="model-results-head"><label for="modelSelect">LLM 선택</label><span id="modelSearchCount" role="status" aria-live="polite">모델 확인 중</span></div>
             <p id="modelPriceUnit" class="field-note" hidden>가격: USD / 100만 토큰 · 입력 / 출력 기본 단가</p>
             <select id="modelSelect" size="5" disabled aria-describedby="modelSearchHelp selectedModelId"><option>모델 확인 중</option></select>
             <p id="modelSearchEmpty" class="model-empty" hidden>일치하는 모델이 없습니다. 다른 이름이나 제공사로 검색해 보세요.</p>
@@ -58,20 +63,24 @@
             </div>
           </div>
           <p id="modelStatus" class="field-note">설치된 모델을 읽고 있습니다.</p>
-          <section id="scorerSetup" class="scorer-setup" hidden>
-            <h2>2단계 · 위험도 판정 모델</h2>
+          </section>
+          <section id="scorerSetup" class="model-setup" aria-labelledby="scorerSetupTitle">
+            <h2 id="scorerSetupTitle">의사결정 모델 선택</h2>
             <p class="field-note">형제 노드를 선택할 때 위험도 우선순위를 평가합니다. 점수는 취약점 확인 결과가 아닙니다.</p>
-            <label for="scorerProviderSelect">판정 모델 제공자</label>
+            <p id="scorerModeNotice" class="field-note">의사결정 모델은 v4 실험에서 사용합니다. 위에서 v4를 선택하면 설정할 수 있습니다.</p>
+            <fieldset id="scorerControls" class="model-controls" disabled>
+            <label for="scorerProviderSelect">의사결정 모델 제공자</label>
             <select id="scorerProviderSelect"><option value="openrouter">OpenRouter Decisions</option><option value="local">로컬 Ollama</option></select>
             <p id="scorerRemoteNotice" class="field-note">OpenRouter 판정 시 노드의 분류된 관찰 정보가 외부 API로 전송되며 사용량에 따른 요금이 적용됩니다. 비밀값과 원본 응답 본문은 보내지 않습니다.</p>
             <div class="model-picker">
-              <label for="scorerModelSearch">판정 모델 검색</label>
-              <div class="model-searchbar"><input id="scorerModelSearch" type="search" placeholder="판정 모델 검색" autocomplete="off"><button id="scorerRefreshButton" type="button" class="button secondary">새로고침</button></div>
-              <select id="scorerModelSelect" size="4" disabled aria-label="판정 모델 선택"></select>
+              <label for="scorerModelSearch">의사결정 모델 검색</label>
+              <div class="model-searchbar"><input id="scorerModelSearch" type="search" placeholder="의사결정 모델 검색" autocomplete="off"><button id="scorerRefreshButton" type="button" class="button secondary">새로고침</button></div>
+              <label for="scorerModelSelect">의사결정 모델 선택</label>
+              <select id="scorerModelSelect" size="5" disabled></select>
               <p id="scorerStatus" class="field-note" role="status">판정 모델 목록 대기 중</p>
               <p class="field-note">선택: <strong id="scorerSelected">없음</strong></p>
             </div>
-            <details class="advanced"><summary>판정 모델 세부 설정</summary>
+            <details class="advanced"><summary>의사결정 모델 세부 설정</summary>
               <p class="field-note">위험도 기준 risk-priority-v1 · 평가 필드 변경 시 재평가 scoring_fields_v1</p>
               <div class="form-grid">
                 <label>한 번에 평가할 노드 수<input id="scorerBatchSize" type="number" min="1" max="100" value="8"></label>
@@ -83,7 +92,7 @@
                 <label>판정 전체 시간 · 초<input id="scorerTimeBudget" type="number" min="0.001" max="3600" step="1" value="120"></label>
                 <label>외부 판정 최대 비용 · USD<input id="scorerMaxCost" type="number" min="0.000001" max="100" step="0.001" value="0.01"></label>
               </div>
-              <div id="localScorerSettings" hidden>
+              <fieldset id="localScorerSettings" class="model-controls" hidden disabled>
                 <h3>로컬 Ollama 설정</h3>
                 <div class="form-grid">
                   <label>Ollama API 주소<input id="scorerBaseUrl" type="url" value="http://127.0.0.1:11434/"></label>
@@ -92,12 +101,13 @@
                   <label>Temperature<input id="scorerTemperature" type="number" min="0" max="2" step="0.05" value="0"></label>
                 </div>
                 <p class="field-note">로컬 판정은 순서형 등급(0~4)을 사용합니다. 확률과 신뢰도는 생성하지 않습니다.</p>
-              </div>
+              </fieldset>
             </details>
+            </fieldset>
           </section>
+          </div>
           <h2>실험 설정</h2>
           <div class="form-grid">
-            <label>실험 방식<select id="experimentModeSelect"><option value="v3">v3 · 기존 탐색</option><option value="v4">v4 · 트리 탐색</option></select></label>
             <label>대상 URL<input id="targetInput" type="url" value="http://127.0.0.1:3000/" maxlength="2048" required aria-describedby="targetHelp"></label>
             <label>시나리오 소스<select id="scenarioSelect"><option value="manual">수동 목표</option><option value="auto" disabled>자동 생성 · 준비 중</option></select></label>
             <label>세션 체인<select id="chainSelect"><option value="none">단일 세션</option><option value="campaign" disabled>캠페인 · 준비 중</option></select></label>

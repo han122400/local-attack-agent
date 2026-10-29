@@ -289,9 +289,11 @@ function restoreScorerSettings(values){
 
 function updateScorerVisibility(){
   const v4=$('experimentModeSelect').value==='v4';
-  $('scorerSetup').hidden=!v4;
+  $('scorerControls').disabled=!v4;
+  $('scorerModeNotice').hidden=v4;
   const local=$('scorerProviderSelect').value==='local';
   $('localScorerSettings').hidden=!local;
+  $('localScorerSettings').disabled=!local;
   $('scorerRemoteNotice').hidden=local;
   updateStartControls();
 }
