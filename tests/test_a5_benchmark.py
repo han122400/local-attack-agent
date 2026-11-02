@@ -1,7 +1,9 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import a5_benchmark
 from a5_benchmark import (CONFIG_PATH, config_digest, final_observation,
@@ -19,6 +21,18 @@ class A5BenchmarkTests(unittest.TestCase):
         changed = {**self.config, "execution_model": "openrouter:example/model"}
         with self.assertRaisesRegex(ValueError, "local Ollama"):
             validate_config(changed)
+
+    def test_comparison_pins_the_lab_instance_without_a_verdict(self):
+        info = {"Config": {"Image": "bkimminich/juice-shop:v20.2.0"}, "Mounts": [],
+                "State": {"Running": True, "StartedAt": "epoch"},
+                "NetworkSettings": {"Ports": {"3000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "3000"}]}},
+                "Id": "container", "Image": "sha256:image"}
+        with patch("a5_benchmark._docker", return_value=subprocess.CompletedProcess([], 0, json.dumps([info]), "")):
+            self.assertEqual(a5_benchmark.lab_identity()["container_id"], "container")
+        info["Config"]["Image"] = "other"
+        with patch("a5_benchmark._docker", return_value=subprocess.CompletedProcess([], 0, json.dumps([info]), "")):
+            with self.assertRaisesRegex(RuntimeError, "identity unavailable"):
+                a5_benchmark.lab_identity()
 
     def test_final_observation_uses_post_initial_reset_identity(self):
         entry = {"baseline_identity": {"started_at": "manual-reset"},
@@ -43,7 +57,7 @@ class A5BenchmarkTests(unittest.TestCase):
             observation = {"challenge": {"solved": False}, "identity": {"container_id": "one"},
                            "baseline_identity": {"container_id": "one"}}
             result = summarize_run(root, "v3", observation)
-            self.assertIsNone(result["confirmed_by_harness"])
+            self.assertNotIn("confirmed_by_harness", result)
             self.assertEqual(2, result["reported_evidence_observations"])
             self.assertEqual(1, result["repeated_observation_digests"])
             self.assertEqual(1, result["model_calls"])
@@ -77,7 +91,7 @@ class A5BenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "prompt changed"):
             check_prompt_pins({"prompt_pins": pins, "runs": {}}, {**pins, "v4": "c" * 64})
 
-    def test_v4_confirmation_is_checked_against_pre_cleanup_lab_truth(self):
+    def test_v4_summary_keeps_the_single_challenge_outcome_separate_from_legacy_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "session.json").write_text(json.dumps({"run_id": "b" * 32, "experiment_mode": "v4",
@@ -96,9 +110,10 @@ class A5BenchmarkTests(unittest.TestCase):
             observation = {"challenge": {"solved": False}, "identity": {"container_id": "one"},
                            "baseline_identity": {"container_id": "one"}}
             result = summarize_run(root, "v4", observation)
-            self.assertEqual(1, result["confirmed_by_harness"])
-            self.assertTrue(result["known_case_false_positive"])
-            self.assertFalse(result["known_case_unconfirmed_solve"])
+            self.assertNotIn("confirmed_by_harness", result)
+            self.assertNotIn("known_case_false_positive", result)
+            self.assertNotIn("known_case_unconfirmed_solve", result)
+            self.assertFalse(result["challenge_solved_before_cleanup"])
             self.assertEqual(1, result["repeated_discoveries"])
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
 import threading
 import time
 import uuid
@@ -27,13 +28,15 @@ from model_settings import validate_model_settings
 from planning import load_prompt
 from scorer_state import effective_settings
 from session_log import atomic_write_json
-from v4_oracle import lab_identity
-from v4_policy import CHALLENGE_KEY, LAB_TARGET, execution_settings
+from lab import CONTAINER, TARGET as LAB_TARGET, _docker
+from v4_policy import execution_settings
 
 
-PROTOCOL = "a5-paired-v1"
-CONFIG_PATH = Path(__file__).resolve().parent / "benchmarks" / "a5-pair-v1.json"
+PROTOCOL = "a5-paired-v2"
+CONFIG_PATH = Path(__file__).resolve().parent / "benchmarks" / "a5-pair-v2.json"
 PAIRS_DIR = RUNS_ROOT / "a5_pairs"
+CHALLENGE_KEY = "dbSchemaChallenge"
+LAB_IMAGE = "bkimminich/juice-shop:v20.2.0"
 
 
 def validate_config(raw: dict) -> dict:
@@ -44,7 +47,7 @@ def validate_config(raw: dict) -> dict:
         raise ValueError("Unknown A5 ground-truth challenge")
     model = raw.get("execution_model")
     if not isinstance(model, str) or not model or model.startswith("openrouter:"):
-        raise ValueError("A5 v1 requires the same local Ollama execution model in both modes")
+        raise ValueError("A5 v2 requires the same local Ollama execution model in both modes")
     if not isinstance(raw.get("goal"), str) or not raw["goal"].strip():
         raise ValueError("A5 goal is required")
     validate_model_settings(raw.get("model_settings"))
@@ -52,12 +55,26 @@ def validate_config(raw: dict) -> dict:
     selected = validate_experiment_config({"experiment_mode": "v4", "scorer_provider": raw.get("scorer_provider"),
         "scorer_model": raw.get("scorer_model"), "scorer_settings": raw.get("scorer_settings")})
     if selected["scorer_provider"] != "openrouter":
-        raise ValueError("A5 v1 requires the pinned OpenRouter scorer")
+        raise ValueError("A5 v2 requires the pinned OpenRouter scorer")
     effective_settings(selected)
-    execution = execution_settings(raw.get("v4_settings"))
-    if execution["exclusive_lab"] is not True:
-        raise ValueError("A5 v1 confirmation requires an isolated lab assertion")
+    execution_settings(raw.get("v4_settings"))
     return raw
+
+
+def lab_identity(*, timeout_seconds=5):
+    """Pin the isolated lab instance used by an explicit A5 comparison."""
+    try:
+        result = _docker("inspect", CONTAINER, timeout=timeout_seconds)
+        info = json.loads(result.stdout)[0]
+        ports = info["NetworkSettings"]["Ports"]["3000/tcp"]
+        if (result.returncode or info["Config"]["Image"] != LAB_IMAGE or info["Mounts"] != []
+                or info["State"]["Running"] is not True or not ports
+                or any(item["HostIp"] != "127.0.0.1" or item["HostPort"] != "3000" for item in ports)):
+            raise ValueError("Lab identity changed")
+        return {"image": LAB_IMAGE, "container_id": info["Id"], "image_id": info["Image"],
+                "started_at": info["State"]["StartedAt"]}
+    except (ValueError, KeyError, TypeError, IndexError, OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("A5 lab identity unavailable") from exc
 
 
 def config_digest(config: dict) -> str:
@@ -145,7 +162,7 @@ def summarize_run(run_dir: Path, mode: str, final_observation: dict | None,
         findings = meta.get("findings") or []
         started = requests[0].get("at") if requests else None
         finalized = next((event.get("at") for event in events if event["kind"] == "finalize_started"), None)
-        result.update(confirmed_by_harness=None, model_report_present=bool(meta.get("report")),
+        result.update(model_report_present=bool(meta.get("report")),
                       reported_evidence_observations=sum(bool(item.get("evidence")) for item in findings),
                       repeated_observation_digests=sum(item.get("repeat_of") is not None for item in findings),
                       total_model_calls=len(requests), scorer_calls=0,
@@ -161,7 +178,7 @@ def summarize_run(run_dir: Path, mode: str, final_observation: dict | None,
         discovery_submissions = sum(event["kind"] == "node_discovered" for event in events)
         discovery_submissions += sum(len((event.get("payload") or {}).get("result", {}).get("discovered", []))
                                      for event in events if event["kind"] == "node_result_imported")
-        result.update(report_status=report.get("status"), confirmed_by_harness=stats.get("confirmed"),
+        result.update(report_status=report.get("status"),
                       candidates=stats.get("candidates"), tested_candidates=stats.get("tested_candidates"),
                       inconclusive=stats.get("inconclusive"), unscored=stats.get("unscored"),
                       scorer_calls=usage.get("scoring_calls"), scorer_input_tokens=usage.get("scoring_input_tokens"),
@@ -169,11 +186,7 @@ def summarize_run(run_dir: Path, mode: str, final_observation: dict | None,
                       total_model_calls=usage.get("model_calls"),
                       exploration_elapsed_seconds=usage.get("elapsed_seconds"),
                       total_api_cost_usd=usage.get("cost_usd"), unknown_cost_requests=usage.get("unknown_cost_requests"),
-                      repeated_discoveries=discovery_submissions - max(0, len(node_ids) - 1),
-                      known_case_false_positive=(stats.get("confirmed", 0) > 0 and challenge.get("solved") is False)
-                          if stats.get("confirmed") is not None and challenge.get("solved") is not None else None,
-                      known_case_unconfirmed_solve=(stats.get("confirmed") == 0 and challenge.get("solved") is True)
-                          if stats.get("confirmed") is not None and challenge.get("solved") is not None else None)
+                      repeated_discoveries=discovery_submissions - max(0, len(node_ids) - 1))
     return result
 
 

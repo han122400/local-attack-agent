@@ -63,12 +63,211 @@ class LoopTests(unittest.TestCase):
             yield {"done": True, "done_reason": "stop"}
         return reply
 
-    def command(self, context, discovered=(), action="run_command"):
+    def command(self, context, discovered=(), action="run_command", *, next_observation="", evidence_refs=()):
         result = {"schema_version": 1, "node_id": context["node"]["id"], "attempt_id": context["attempt"]["attempt_id"],
                   "discovered": list(discovered), "proposed_verdict": "confirmed", "claim": "model claim",
-                  "evidence_refs": [], "next_observation": "", "result_path": context["attempt"]["result_path"]}
+                  "evidence_refs": list(evidence_refs), "next_observation": next_observation,
+                  "result_path": context["attempt"]["result_path"]}
         return {"action": action, "plan": "inspect", "reason": "investigate current node", "path": "", "content": "",
                 "code": "", "command": json.dumps(result) if action == "run_command" else ""}
+
+    def test_followup_observation_continues_before_traversing_discoveries(self):
+        runtime = Runtime(self.log)
+        evidence = runtime.runtime_dir / "work" / "home.txt"
+        evidence.write_text('<form action="/search"><input name="q"></form>', encoding="utf-8")
+        visited = []
+        def callback(context):
+            node_id = context["node"]["id"]
+            visited.append(node_id)
+            if len(visited) == 1:
+                return self.command(context, next_observation="Inspect the saved form and identify its input",
+                    evidence_refs=[{"path": "work/home.txt", "description": "home response"}])
+            if node_id == "N0001":
+                previous = context["previous_result"]
+                self.assertEqual(previous["attempt_id"], "A0001")
+                self.assertEqual(previous["next_observation"], "Inspect the saved form and identify its input")
+                self.assertEqual(previous["evidence_refs"], [{"path": "work/home.txt", "description": "home response"}])
+                self.assertEqual(context["attempt"]["attempt_id"], "A0002")
+                self.assertEqual(context["remaining"]["node_attempts"], 2)
+                return self.command(context, [surface("https://example.test/search?q=")])
+            return self.command(context)
+        runner = V4Runner(self.log, runtime, transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        self.assertEqual(visited, ["N0001", "N0001", "N0002"])
+        state = TreeStore(self.log).rebuild()
+        self.assertEqual(len(state["nodes"]["N0001"]["attempts"]), 2)
+        self.assertEqual(state["nodes"]["N0002"]["investigation_state"], "done")
+
+    def test_new_evidence_keeps_followups_running_beyond_the_node_retry_and_tool_windows(self):
+        self.log.update(v4_settings={"node_attempts": 1, "node_tool_calls": 1})
+        runtime = Runtime(self.log)
+        root_steps = []
+        def callback(context):
+            if context["node"]["id"] != "N0001":
+                return self.command(context)
+            step = len(root_steps) + 1
+            root_steps.append(step)
+            path = f"work/observation-{step}.txt"
+            (runtime.runtime_dir / path).write_text(f"new observation {step}", encoding="utf-8")
+            return self.command(context, [surface("https://example.test/search")] if step == 8 else [],
+                next_observation="" if step == 8 else "Analyze the next observation",
+                evidence_refs=[{"path": path, "description": "observed response"}])
+        runner = V4Runner(self.log, runtime, transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        state = TreeStore(self.log).rebuild()
+        self.assertEqual(len(state["nodes"]["N0001"]["attempts"]), 8)
+        self.assertEqual(state["nodes"]["N0002"]["investigation_state"], "done")
+
+    def test_identical_evidence_in_new_files_does_not_extend_a_stalled_investigation(self):
+        runtime = Runtime(self.log)
+        calls = []
+        def callback(context):
+            calls.append(context)
+            path = f"work/repeat-{len(calls)}.txt"
+            (runtime.runtime_dir / path).write_text("same response", encoding="utf-8")
+            return self.command(context, next_observation=f"Try another analysis {len(calls)}",
+                evidence_refs=[{"path": path, "description": "repeated response"}])
+        runner = V4Runner(self.log, runtime, transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("incomplete", "investigation_incomplete"))
+        root = TreeStore(self.log).rebuild()["nodes"]["N0001"]
+        self.assertEqual(len(root["attempts"]), 3)
+        self.assertEqual(root["investigation_reason"], "no_progress_limit")
+
+    def test_new_evidence_resets_an_existing_stall_allowance(self):
+        runtime = Runtime(self.log)
+        calls = []
+        def callback(context):
+            calls.append(context)
+            refs = []
+            if len(calls) > 1:
+                (runtime.runtime_dir / "work" / "response.txt").write_text("new evidence", encoding="utf-8")
+                refs = [{"path": "work/response.txt", "description": "observation"}]
+            return self.command(context, next_observation="Continue observing", evidence_refs=refs)
+        runner = V4Runner(self.log, runtime, transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("incomplete", "investigation_incomplete"))
+        root = TreeStore(self.log).rebuild()["nodes"]["N0001"]
+        self.assertEqual(len(root["attempts"]), 4)
+        self.assertEqual(root["investigation_reason"], "no_progress_limit")
+
+    def test_revisited_categorical_observations_do_not_refresh_the_stall_allowance(self):
+        statuses = iter([200, 500, 200, 500])
+        def callback(context):
+            command = self.command(context, next_observation="Compare observed statuses")
+            result = json.loads(command["command"])
+            result["observations"] = {"response_status": next(statuses)}
+            return {**command, "command": json.dumps(result)}
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("incomplete", "investigation_incomplete"))
+        root = TreeStore(self.log).rebuild()["nodes"]["N0001"]
+        self.assertEqual(len(root["attempts"]), 4)
+        self.assertEqual(root["investigation_reason"], "no_progress_limit")
+
+    def test_root_without_discoveries_can_use_the_total_budget_while_observations_progress(self):
+        self.log.update(budgets={**self.log.metadata["budgets"], "model_calls": 4})
+        runtime = Runtime(self.log)
+        def callback(context):
+            path = f"work/{context['attempt']['attempt_id']}.txt"
+            (runtime.runtime_dir / path).write_text(path, encoding="utf-8")
+            return self.command(context, next_observation="Continue analyzing fresh evidence",
+                evidence_refs=[{"path": path, "description": "new observation"}])
+        runner = V4Runner(self.log, runtime, transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("budget_exhausted", "call_budget"))
+        self.assertEqual(self.log.metadata["v4_usage"]["model_calls"], 4)
+        self.assertEqual(runtime.calls, 4)
+
+    def test_followup_without_new_observations_is_bounded_and_incomplete(self):
+        runner = V4Runner(self.log, Runtime(self.log),
+            transport=self.transport(lambda ctx: self.command(ctx, next_observation="Analyze the response")),
+            scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("incomplete", "investigation_incomplete"))
+        root = TreeStore(self.log).rebuild()["nodes"]["N0001"]
+        self.assertEqual(len(root["attempts"]), 2)
+        self.assertEqual(root["investigation_state"], "incomplete")
+        self.assertEqual(root["investigation_reason"], "no_progress_limit")
+        self.assertEqual(root["verification"]["next_observation"], "Analyze the response")
+
+    def test_pending_followup_at_tool_limit_is_incomplete(self):
+        self.log.update(v4_settings={"node_tool_calls": 1})
+        runner = V4Runner(self.log, Runtime(self.log),
+            transport=self.transport(lambda ctx: self.command(ctx, next_observation="Inspect the saved evidence")),
+            scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("incomplete", "investigation_incomplete"))
+        root = TreeStore(self.log).rebuild()["nodes"]["N0001"]
+        self.assertEqual(len(root["attempts"]), 1)
+        self.assertEqual(root["investigation_reason"], "node_tool_limit")
+
+    def test_long_previous_result_still_allows_followup_within_context_budget(self):
+        runtime = Runtime(self.log)
+        refs = []
+        for index in range(20):
+            path = f"work/response-{index}.txt"
+            (runtime.runtime_dir / path).write_text("observation", encoding="utf-8")
+            refs.append({"path": path, "description": "evidence " + "x" * 1900})
+        visited = []
+        def callback(context):
+            node_id = context["node"]["id"]
+            visited.append(node_id)
+            if len(visited) == 1:
+                command = self.command(context, next_observation="Inspect the saved responses", evidence_refs=refs)
+                result = json.loads(command["command"])
+                result["claim"] = "x" * 7900
+                return {**command, "command": json.dumps(result)}
+            if node_id == "N0001":
+                self.assertEqual(context["previous_result"]["next_observation"], "Inspect the saved responses")
+                self.assertEqual(context["previous_result"]["result_path"], "work/node-results/A0001.json")
+                self.assertLessEqual(len(json.dumps(context, ensure_ascii=False)), runner.context_budget)
+                return self.command(context, [surface("https://example.test/search")])
+            return self.command(context)
+        runner = V4Runner(self.log, runtime, transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        self.assertEqual(visited, ["N0001", "N0001", "N0002"])
+
+    def test_incomplete_child_does_not_prevent_other_siblings_from_being_investigated(self):
+        visited = []
+        def callback(context):
+            node_id = context["node"]["id"]
+            visited.append(node_id)
+            if node_id == "N0001":
+                return self.command(context, [surface("https://example.test/a"), surface("https://example.test/b")])
+            return self.command(context, next_observation="Need another observation" if node_id == "N0002" else "")
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("incomplete", "investigation_incomplete"))
+        self.assertEqual(visited, ["N0001", "N0002", "N0002", "N0003"])
+        state = TreeStore(self.log).rebuild()
+        self.assertEqual(state["nodes"]["N0002"]["investigation_state"], "incomplete")
+        self.assertEqual(state["nodes"]["N0003"]["investigation_state"], "done")
+
+    def test_finish_cannot_discard_a_pending_followup(self):
+        root_calls = 0
+        def callback(context):
+            nonlocal root_calls
+            if context["node"]["id"] != "N0001":
+                return self.command(context)
+            root_calls += 1
+            if root_calls == 1:
+                return self.command(context, next_observation="Inspect the saved response")
+            if root_calls == 2:
+                return self.command(context, action="finish")
+            return self.command(context, [surface("https://example.test/search")])
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        state = TreeStore(self.log).rebuild()
+        self.assertEqual(len(state["nodes"]), 2)
+        self.assertEqual(len(state["nodes"]["N0001"]["attempts"]), 2)
+
+    def test_root_without_actionable_surfaces_is_incomplete_even_with_an_empty_followup(self):
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(lambda ctx: self.command(ctx)),
+                          scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("incomplete", "investigation_incomplete"))
+        root = TreeStore(self.log).rebuild()["nodes"]["N0001"]
+        self.assertEqual(root["investigation_reason"], "no_actionable_surfaces")
+
+    def test_finish_without_observations_is_incomplete(self):
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(lambda ctx: self.command(ctx, action="finish")),
+                          scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("incomplete", "investigation_incomplete"))
+        root = TreeStore(self.log).rebuild()["nodes"]["N0001"]
+        self.assertEqual(root["investigation_reason"], "no_successful_observation")
 
     def test_greedy_descends_current_siblings_then_backtracks_and_exhausts(self):
         visited = []
@@ -107,13 +306,13 @@ class LoopTests(unittest.TestCase):
             visited.append(context["node"]["id"])
             return self.command(context, [surface("https://example.test/a"), surface("https://example.test/b")]) if len(visited) == 1 else self.command(context, action="finish")
         result = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter()).run()
-        self.assertEqual(result, ("completed", "tree_exhausted"))
+        self.assertEqual(result, ("incomplete", "investigation_incomplete"))
         self.assertEqual(visited, ["N0001", "N0002", "N0003"])
 
     def test_missing_result_is_closed_after_bounded_node_attempts(self):
         runtime = Runtime(self.log, missing=True)
         result = V4Runner(self.log, runtime, transport=self.transport(lambda ctx: self.command(ctx)), scorer_adapter=FakeAdapter()).run()
-        self.assertEqual(result, ("completed", "tree_exhausted"))
+        self.assertEqual(result, ("incomplete", "investigation_incomplete"))
         self.assertEqual(runtime.calls, 2)
         state = TreeStore(self.log).rebuild()
         self.assertTrue(all(item["status"] == "failed" for item in state["attempts"].values()))
@@ -129,7 +328,7 @@ class LoopTests(unittest.TestCase):
             return self.command(context)
         runtime = Runtime(self.log)
         runner = V4Runner(self.log, runtime, transport=self.transport(callback), scorer_adapter=FakeAdapter())
-        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        self.assertEqual(runner.run(), ("incomplete", "investigation_incomplete"))
         self.assertEqual(runtime.calls, 1)
         self.assertEqual(responses, 2)
         self.assertEqual([event["action"] for event in self.log.snapshot_events() if event["kind"] == "exec_started"],
@@ -149,7 +348,7 @@ class LoopTests(unittest.TestCase):
             return self.command(context)
         runtime = Runtime(self.log)
         runner = V4Runner(self.log, runtime, transport=self.transport(callback), scorer_adapter=FakeAdapter())
-        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        self.assertEqual(runner.run(), ("incomplete", "investigation_incomplete"))
         self.assertEqual(runtime.calls, 1)
         self.assertEqual(responses, 2)
         self.assertTrue(any(event["kind"] == "model_error" and "result_path" in event.get("message", "")
@@ -168,7 +367,7 @@ class LoopTests(unittest.TestCase):
                     "content": json.dumps(context["result_template"]), "command": "", "code": ""}
         runtime = Runtime(self.log)
         runner = V4Runner(self.log, runtime, transport=self.transport(callback), scorer_adapter=FakeAdapter())
-        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        self.assertEqual(runner.run(), ("incomplete", "investigation_incomplete"))
         self.assertEqual(runtime.calls, 2)
         self.assertEqual(responses, 2)
         self.assertEqual(TreeStore(self.log).rebuild()["attempts"]["A0001"]["status"], "imported")
@@ -188,7 +387,7 @@ class LoopTests(unittest.TestCase):
             return self.command(context)
         runner = V4Runner(self.log, Runtime(self.log, missing=True),
                           transport=self.transport(callback), scorer_adapter=FakeAdapter())
-        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        self.assertEqual(runner.run(), ("incomplete", "investigation_incomplete"))
         state = TreeStore(self.log).rebuild()
         self.assertEqual(len(state["nodes"]), 2)
         self.assertEqual(state["attempts"]["A0001"]["status"], "imported")
@@ -206,7 +405,7 @@ class LoopTests(unittest.TestCase):
                 return self.command(context, [found])
             return self.command(context, action="finish")
         runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
-        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        self.assertEqual(runner.run(), ("incomplete", "investigation_incomplete"))
         tree = TreeStore(self.log).rebuild()
         self.assertEqual(len(tree["nodes"]), 2)
         self.assertNotIn("route_template", tree["nodes"]["N0002"]["locator"])
@@ -233,7 +432,7 @@ class LoopTests(unittest.TestCase):
                     "path": context["attempt"]["result_path"], "content": json.dumps(context["result_template"]),
                     "command": "", "code": ""}
         runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
-        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        self.assertEqual(runner.run(), ("incomplete", "investigation_incomplete"))
         self.assertEqual(responses, 2)
         self.assertEqual(TreeStore(self.log).rebuild()["attempts"]["A0001"]["status"], "imported")
 
@@ -245,7 +444,7 @@ class LoopTests(unittest.TestCase):
             return self.command(context)
         runner = V4Runner(self.log, Runtime(self.log, missing=True),
                           transport=self.transport(callback), scorer_adapter=FakeAdapter())
-        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        self.assertEqual(runner.run(), ("incomplete", "investigation_incomplete"))
         self.assertEqual(len(called), 1)
         self.assertEqual(TreeStore(self.log).rebuild()["attempts"]["A0001"]["status"], "failed")
 
@@ -283,14 +482,16 @@ class LoopTests(unittest.TestCase):
             visited.append(context["node"]["id"])
             return self.command(context, [surface("https://outside.test/q")])
         result = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter()).run()
-        self.assertEqual(result, ("completed", "tree_exhausted"))
+        self.assertEqual(result, ("incomplete", "investigation_incomplete"))
         self.assertEqual(visited, ["N0001"])
         state = TreeStore(self.log).rebuild()
         self.assertEqual(state["nodes"]["N0002"]["exploration_state"], "blocked")
 
     def test_root_leaves_a_recorded_model_reserve_for_deeper_nodes(self):
         self.log.update(budgets={**self.log.metadata["budgets"], "model_calls": 4})
-        TreeStore(self.log).initialize(self.log.metadata["target"])
+        tree = TreeStore(self.log)
+        tree.initialize(self.log.metadata["target"])
+        tree.discover("N0001", surface("https://example.test/search"))
         gate = BudgetGate(self.log, stop_event=threading.Event())
         payload = {"model": "mock:model", "messages": [{}, {"content": json.dumps({"node": {"id": "N0001"}})}]}
         for index in range(3):
@@ -325,30 +526,23 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(result[1], "call_budget")
         self.assertEqual(len(calls), 1)
 
-    def test_lab_oracle_is_wired_to_attempt_and_can_confirm_a_known_positive(self):
-        from test_v4_oracle import OracleTests
-        fixture = OracleTests()
-        fixture.setUp()
-        self.addCleanup(fixture.doCleanups)
-        fixture.log.update(**{key: value for key, value in self.log.metadata.items() if key not in (
-            "run_id", "created_at", "target", "initial_lab_status", "initial_lab_probe", "v4_settings")}, v4_settings={"exclusive_lab": True})
-        runtime = Runtime(fixture.log)
-        original = runtime.run
-        def execute(*args, **kwargs):
-            output = original(*args, **kwargs)
-            if runtime.calls == 2:
-                fixture.solved = True
-            return output
-        runtime.run = execute
+    def test_candidate_is_investigated_without_a_lab_verifier(self):
+        visited = []
         def callback(context):
-            self.assertNotIn("dbSchemaChallenge", json.dumps(context))
-            discoveries = [surface("http://127.0.0.1:3000/rest/products/search", "candidate")] if context["node"]["id"] == "N0001" else []
+            node_id = context["node"]["id"]
+            visited.append(node_id)
+            discoveries = [surface("https://example.test/search", "candidate")] if node_id == "N0001" else []
             return self.command(context, discoveries)
-        result = V4Runner(fixture.log, runtime, transport=self.transport(callback), oracle=fixture.oracle, scorer_adapter=FakeAdapter()).run()
+        result = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback),
+                          scorer_adapter=FakeAdapter()).run()
         self.assertEqual(result, ("completed", "tree_exhausted"))
-        state = TreeStore(fixture.log).rebuild()
-        self.assertEqual(state["nodes"]["N0002"]["verification_state"], "confirmed")
-        self.assertEqual(fixture.log.metadata["v4_usage"]["oracle_calls"], 5)
+        self.assertEqual(visited, ["N0001", "N0002"])
+        node = TreeStore(self.log).rebuild()["nodes"]["N0002"]
+        self.assertEqual(len(node["attempts"]), 1)
+        self.assertEqual(node["verification"]["proposed_verdict"], "confirmed")
+        self.assertEqual(node["verification_state"], "inconclusive")
+        self.assertFalse(any(event["kind"].startswith("oracle_") for event in self.log.snapshot_events()))
+        self.assertNotIn("oracle_calls", self.log.metadata["v4_usage"])
 
 
 if __name__ == "__main__":

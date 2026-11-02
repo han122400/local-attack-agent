@@ -24,11 +24,20 @@ class ReportingTests(unittest.TestCase):
     def test_report_counts_claims_separately_from_verified_candidates(self):
         self.tree.discover("N0001", surface("https://example.test/q", "candidate"))
         report = save_report(self.log, "budget_exhausted", "call_budget", state=self.tree.state)
-        self.assertEqual(report["stats"]["confirmed"], 0)
+        self.assertIsNone(report["stats"]["confirmed"])
+        self.assertIn("자동 취약점 판정 없음", report["summary"])
         self.assertEqual(report["stats"]["candidates"], 1)
         self.assertEqual(report["stats"]["unexplored"], 2)
         self.assertEqual(report["stop_reason"], "call_budget")
         self.assertTrue((self.log.run_dir / "report.json").is_file())
+
+    def test_report_does_not_call_an_uninvestigated_tree_completed(self):
+        report = save_report(self.log, "completed", "tree_exhausted", state=self.tree.state)
+        self.assertEqual(report["run_result"], "incomplete")
+        self.assertEqual(report["stop_reason"], "investigation_incomplete")
+        self.assertEqual(report["stats"]["incomplete_nodes"], 1)
+        self.assertEqual(report["incomplete_nodes"][0]["node_id"], "N0001")
+        self.assertEqual(self.log.metadata["run_result"], "incomplete")
 
     def test_degraded_report_stops_at_corrupt_prefix_and_unknown_totals_stay_null(self):
         self.log.events_path.write_text(self.log.events_path.read_text(encoding="utf-8") + "{broken\n" +
@@ -55,6 +64,11 @@ class ReportingTests(unittest.TestCase):
             finalize_v4(self.log, runtime, "completed", "tree_exhausted", lab_reset=lambda: self.fail("No remote-target reset"))
         self.assertEqual(order, ["export", "destroy"])
         self.assertEqual(self.log.metadata["phase"], "finished")
+        self.assertEqual(self.log.metadata["run_result"], "incomplete")
+        report = json.loads((self.log.run_dir / "report.json").read_text(encoding="utf-8"))
+        final = next(event for event in self.log.snapshot_events() if event["kind"] == "run_finalized")
+        self.assertEqual(final["run_result"], report["run_result"])
+        self.assertEqual(final["reason"], report["stop_reason"])
         self.assertFalse(runtime.runtime_dir.exists())
 
     def test_report_failure_retains_runtime_and_requires_recovery(self):

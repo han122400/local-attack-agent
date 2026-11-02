@@ -32,7 +32,7 @@ class ExecutionApiTests(unittest.TestCase):
         self.body = {"target": "https://example.test/", "goal": "inspect", "model": "mock:model", "experiment_mode": "v4",
                      "scorer_provider": "openrouter", "scorer_model": "typesafe/jev-1.14", "scorer_settings": {}}
 
-    def test_api_runs_v4_loop_and_persists_report_and_compatible_prompt(self):
+    def test_api_persists_incomplete_result_when_model_finishes_without_observations(self):
         with patch("app.get_ollama_models", return_value=[{"name": "mock:model"}]):
             response = self.client.post("/api/start", json=self.body)
         self.assertEqual(response.status_code, 200, response.text)
@@ -40,13 +40,17 @@ class ExecutionApiTests(unittest.TestCase):
         self.explorer.worker.join(10)
         self.assertFalse(self.explorer.worker.is_alive())
         meta = SessionStore(self.root).read(run_id)
-        self.assertEqual(meta["finish_reason"], "tree_exhausted")
+        self.assertEqual(meta["run_result"], "incomplete")
+        self.assertEqual(meta["finish_reason"], "investigation_incomplete")
         self.assertEqual(meta["prompt_version"], "v4")
         self.assertEqual(meta["v4_stage"], "execution")
         self.assertEqual(meta["report_status"], "complete")
         self.assertEqual(meta["phase"], "finished")
         self.assertFalse((self.root / run_id / "runtime").exists())
         self.assertTrue((self.root / run_id / "report.json").is_file())
+        report = json.loads((self.root / run_id / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["run_result"], meta["run_result"])
+        self.assertEqual(report["incomplete_nodes"][0]["reason"], "no_successful_observation")
 
     def test_api_accepts_local_ollama_scorer_settings(self):
         body = {**self.body, "scorer_provider": "local", "scorer_model": "qwen3.5:9b",
@@ -87,6 +91,7 @@ class ExecutionApiTests(unittest.TestCase):
         self.explorer.worker.join(10)
         meta = SessionStore(self.root).read(run_id)
         self.assertEqual(meta["phase"], "finished", meta.get("cleanup_error"))
+        self.assertEqual(meta["run_result"], "incomplete")
         events = [json.loads(line) for line in (self.root / run_id / "events.jsonl").read_text(encoding="utf-8").splitlines()]
         imported = [event for event in events if event["kind"] == "node_result_imported"]
         diagnostics = [{key: event.get(key) for key in ("kind", "stderr", "exception", "exit_code", "error_kind")}

@@ -4,10 +4,9 @@ import unittest
 from pathlib import Path
 
 from session_log import SessionLog
-from v4_contracts import validate_result
+from v4_contracts import SCHEMA_VERSION, validate_result
 from v4_tree import TreeStore
 from test_v4_tree import surface
-from test_v4_policy import proof
 
 
 class AttemptTests(unittest.TestCase):
@@ -51,14 +50,26 @@ class AttemptTests(unittest.TestCase):
         self.assertEqual(self.tree.state["attempts"][self.attempt["attempt_id"]]["status"], "failed")
         self.assertEqual(self.tree.state["nodes"][self.node_id]["verification_state"], "inconclusive")
 
-    def test_only_bound_harness_policy_evidence_confirms_and_survives_replay(self):
+    def test_legacy_lab_event_preserves_evidence_without_claiming_confirmation(self):
         self.write_result(self.result())
         self.tree.import_result(self.attempt["attempt_id"], exec_id="EXEC-0001")
         refs = [{**self.log.preserve_bytes(f"oracle/{i}.json", b"{}"), "source": "harness_http"} for i in range(5)]
-        self.tree.record_verification(self.attempt["attempt_id"], proof(), refs)
-        self.assertEqual(self.tree.state["nodes"][self.node_id]["verification_state"], "confirmed")
-        self.tree.rebuild()
-        self.assertEqual(self.tree.state["nodes"][self.node_id]["verification"]["source"], "lab_oracle")
+        proof = {"policy_version": "juice-shop-sqli-v1", "source": "harness_http", "run_id": self.log.run_id,
+                 "node_id": self.node_id, "attempt_id": self.attempt["attempt_id"], "exec_id": "EXEC-0001",
+                 "target": "http://127.0.0.1:3000/", "exclusive_lab": True, "fresh_reset": True,
+                 "before": {"key": "dbSchemaChallenge", "name": "Database Schema", "category": "Injection", "id": 20, "solved": False},
+                 "after": {"key": "dbSchemaChallenge", "name": "Database Schema", "category": "Injection", "id": 20, "solved": True},
+                 "identity_before": {"image": "bkimminich/juice-shop:v20.2.0", "container_id": "fixed", "image_id": "sha256:fixed", "started_at": "epoch"},
+                 "identity_after": {"image": "bkimminich/juice-shop:v20.2.0", "container_id": "fixed", "image_id": "sha256:fixed", "started_at": "epoch"},
+                 "canary": {"control_absent": True, "test_present": True, "repeat_present": True}, "evidence_count": len(refs)}
+        proof_ref = self.log.preserve_bytes("verification/A0001.json", json.dumps(proof).encode("utf-8"))
+        self.log.append("node_verification_recorded", {"tree_schema": SCHEMA_VERSION,
+            "payload": {"attempt_id": self.attempt["attempt_id"], "proof": proof,
+                        "proof_ref": proof_ref, "evidence_refs": refs}})
+        state = self.tree.rebuild()
+        self.assertEqual(state["nodes"][self.node_id]["verification_state"], "inconclusive")
+        self.assertIn(proof_ref, state["nodes"][self.node_id]["evidence_refs"])
+        self.assertTrue(all(ref in state["nodes"][self.node_id]["evidence_refs"] for ref in refs))
 
 
 if __name__ == "__main__":

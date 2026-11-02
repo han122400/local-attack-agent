@@ -114,7 +114,7 @@ def validate_budgets(raw: dict | None) -> dict:
 
 class ExplorerV3:
     def __init__(self, runs_root: Path = RUNS_ROOT, *, transport=None, browser_enabled: bool = True,
-                 lab_reset=None, allowed_target: str | None = None, scorer_adapter=None, oracle_factory=None):
+                 lab_reset=None, allowed_target: str | None = None, scorer_adapter=None):
         self.store = SessionStore(runs_root)
         self.lease = ControllerLease(runs_root)
         self.instance_id = uuid.uuid4().hex
@@ -122,7 +122,7 @@ class ExplorerV3:
         self.browser_enabled = browser_enabled
         self.lab_reset = lab_reset or reset_lab
         self.allowed_target = allowed_target
-        self.scorer_adapter, self.oracle_factory = scorer_adapter, oracle_factory
+        self.scorer_adapter = scorer_adapter
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
@@ -323,9 +323,8 @@ class ExplorerV3:
             runtime.start_session(run_id, target=log.metadata["target"], browser=self.browser_enabled)
             if log.metadata.get("experiment_mode") == "v4":
                 from v4_loop import V4Runner
-                oracle = self.oracle_factory(log) if self.oracle_factory else None
                 result, reason = V4Runner(log, runtime, transport=self.transport, scorer_adapter=self.scorer_adapter,
-                                          oracle=oracle, stop_event=self.stop_event).run()
+                                           stop_event=self.stop_event).run()
             else:
                 result, reason = self._loop(run_id, log, runtime)
         except LogFailure as exc:

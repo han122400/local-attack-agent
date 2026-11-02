@@ -5,8 +5,8 @@ import time
 from pathlib import Path
 
 from session_log import LogFailure, atomic_write_json
-from v4_policy import LAB_TARGET
-from v4_tree import TreeStore
+from lab import TARGET as LAB_TARGET
+from v4_tree import TreeStore, investigation_gaps
 from v4_usage import summarize_usage
 
 
@@ -54,22 +54,26 @@ def save_report(log, run_result, reason, *, state=None, error=None, persist_meta
             usage = summarize_usage(events, state)
         except (ValueError, KeyError, TypeError):
             degraded, error = True, error or "Invalid usage events"
+    gaps = investigation_gaps(state) if not degraded else None
+    if run_result == "completed" and (degraded or gaps):
+        run_result = "incomplete"
+        reason = "investigation_unavailable" if degraded else "investigation_incomplete"
     stats = {key: None for key in ("surfaces", "candidates", "tested_candidates", "confirmed", "rejected",
-                                  "inconclusive", "unexplored", "unscored", "fallback_selections")}
+                                  "inconclusive", "unexplored", "unscored", "fallback_selections", "incomplete_nodes")}
     high, evidence = [], []
     if not degraded:
         nodes = list(state["nodes"].values())
         candidates = [node for node in nodes if node["kind"] == "candidate"]
         stats.update(surfaces=sum(node["kind"] == "surface" for node in nodes), candidates=len(candidates),
             tested_candidates=sum(bool(node["attempts"]) for node in candidates),
-            confirmed=sum(node["verification_state"] == "confirmed" for node in candidates),
-            rejected=sum(node["verification_state"] == "rejected" for node in candidates),
-            inconclusive=sum(node["verification_state"] not in ("confirmed", "rejected") for node in candidates),
+            inconclusive=len(candidates),
+            incomplete_nodes=len(gaps),
             unexplored=sum(node["investigation_state"] == "pending" and node["exploration_state"] != "blocked" for node in nodes),
             unscored=sum(node["kind"] != "root" and node["risk"].get("score") is None for node in nodes),
             fallback_selections=sum(event["kind"] == "v4_node_selection" and event.get("degraded_mode") is True for event in events))
         high = [{"node_id": node["id"], "score": node["risk"]["score"]} for node in nodes
-                if node["investigation_state"] == "pending" and (node["risk"].get("score") or 0) >= 75]
+                if node["investigation_state"] != "done" and node["exploration_state"] != "blocked"
+                and (node["risk"].get("score") or 0) >= 75]
         evidence = [ref for node in nodes for ref in node["evidence_refs"]]
     else:
         # These are prefix references, never final verification statistics.
@@ -81,17 +85,21 @@ def save_report(log, run_result, reason, *, state=None, error=None, persist_meta
                     evidence.extend(ref for ref in refs if isinstance(ref, dict) and "path" in ref)
     status = "degraded" if degraded else "complete"
     counts = "집계 확인 불가: 이벤트/트리 복구가 불완전합니다." if degraded else (
-        f"공격 표면 {stats['surfaces']} · 후보 {stats['candidates']} · 검증 시도 후보 {stats['tested_candidates']}\n"
-        f"확인 {stats['confirmed']} · 기각 {stats['rejected']} · 미확정(미검증 포함) {stats['inconclusive']}\n"
-        f"미탐색 {stats['unexplored']} · 미점수 {stats['unscored']} · 후순위 선택 {stats['fallback_selections']}")
+        f"공격 표면 {stats['surfaces']} · 후보 {stats['candidates']} · 테스트 시도 후보 {stats['tested_candidates']}\n"
+        f"자동 취약점 판정 없음 · 미확정(미검증 포함) {stats['inconclusive']}\n"
+        f"미탐색 {stats['unexplored']} · 조사 미완료 {stats['incomplete_nodes']} · 미점수 {stats['unscored']} · 후순위 선택 {stats['fallback_selections']}")
     summary = f"결과: {run_result} · 종료 사유: {reason}\n{counts}\n발견한 노드 범위의 결과이며 사이트 전체의 취약점 부재를 뜻하지 않습니다."
+    if gaps:
+        summary += "\n조사 미완료: " + "; ".join(f"{item['node_id']} ({item['reason']})" for item in gaps[:10])
     report = {"schema_version": 1, "run_id": log.run_id, "status": status, "run_result": run_result,
               "stop_reason": reason, "summary": summary, "stats": stats, "unexplored_high_risk": high,
+              "incomplete_nodes": gaps,
               "evidence_refs": evidence, "usage": usage, "last_snapshot_usage": log.metadata.get("v4_usage") if degraded else None,
               "last_readable_seq": events[-1]["seq"] if events else 0, "corruption": corruption, "error": error}
     atomic_write_json(log.run_dir / "report.json", report)
     if persist_metadata:
-        _metadata(log, report=summary, report_status=status, report_stats=stats, v4_usage=usage)
+        _metadata(log, report=summary, report_status=status, report_stats=stats, v4_usage=usage,
+                  run_result=run_result, finish_reason=reason)
     return report
 
 
@@ -192,7 +200,8 @@ def finalize_v4(log, runtime, run_result, reason, *, lab_reset):
     try:
         # Always attempt a reducer-independent report, even after stop/replay
         # failure. Runtime evidence cannot be read/deleted until stop succeeds.
-        save_report(log, run_result, reason, state=state, error=error)
+        report = save_report(log, run_result, reason, state=state, error=error)
+        run_result, reason = report["run_result"], report["stop_reason"]
         if error or not stopped:
             raise RuntimeError(error or "Runtime writers did not stop")
         remaining(120)
