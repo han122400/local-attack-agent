@@ -58,6 +58,19 @@ class ResultContractTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ContractError):
                 validate_discovery(value)
 
+    def test_static_script_assets_cannot_be_submitted_as_input_surfaces(self):
+        def surface(url, input_name):
+            return discovery(kind="surface", hypothesis=None,
+                locator={"url": url, "method": "GET", "input": input_name, "auth_context": "anonymous"})
+
+        for url, input_name in (("https://example.test/", "main.js"),
+                                ("https://example.test/assets/main.js", ""),
+                                ("https://example.test/assets/chunk.mjs", "chunk.mjs")):
+            with self.subTest(url=url, input=input_name), self.assertRaises(ContractError):
+                validate_discovery(surface(url, input_name))
+        self.assertEqual(validate_discovery(surface("https://example.test/image.png?size=", "size"))
+                         ["locator"]["input"], "size")
+
     def test_dedup_preserves_method_input_auth_and_hypothesis_boundaries(self):
         baseline = validate_discovery(discovery())
         duplicate = discovery(hypothesis={"type": "SQLI", "statement": "Different wording"})

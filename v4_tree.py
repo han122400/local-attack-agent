@@ -83,6 +83,13 @@ def _invalidate_children(state: dict, parent_id: str | None) -> None:
                 node["risk"] = {"status": "pending", "score": None}
 
 
+def _omit_redundant_route_template(discovery: dict) -> None:
+    """Canonicalize new events without changing replay of persisted discoveries."""
+    locator = discovery["locator"]
+    if locator.get("route_template") == urlsplit(locator["url"]).path:
+        locator.pop("route_template")
+
+
 def _discover(state: dict, parent_id: str, discovery: dict) -> str:
     parent = state["nodes"][parent_id]
     if parent["exploration_state"] in ("done", "blocked"):
@@ -438,6 +445,7 @@ class TreeStore:
         with self.log.locked_writer():
             self._sync()
             discovery = validate_discovery(discovery)
+            _omit_redundant_route_template(discovery)
             self._commit("node_discovered", {"parent_id": validate_id(parent_id), "discovery": discovery})
             return next(node["id"] for node in self._state["nodes"].values() if node["dedup_key"] == dedup_key(discovery))
 
@@ -494,6 +502,7 @@ class TreeStore:
                     names = sorted({name for name, _ in parse_qsl(parts.query, keep_blank_values=True)})
                     locator["url"] = urlunsplit((parts.scheme, parts.netloc, parts.path,
                                                   urlencode([(name, "") for name in names]), ""))
+                _omit_redundant_route_template(discovery)
             captured = []
             total = 0
             for ref in result["evidence_refs"]:

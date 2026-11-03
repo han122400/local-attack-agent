@@ -66,6 +66,43 @@ class TreeStoreTests(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in (self.log.run_dir / "nodes").glob("*.json")),
                          ["N0001.json", "N0002.json", "N0003.json"])
 
+    def test_new_discovery_omits_redundant_route_template_without_merging_distinct_inputs(self):
+        plain = surface("https://example.test/search?q=")
+        templated = copy.deepcopy(plain)
+        templated["locator"]["route_template"] = "/search"
+        first = self.tree.discover(self.root_id, templated)
+        self.assertEqual(first, "N0002")
+        self.assertNotIn("route_template", self.tree.state["nodes"][first]["locator"])
+        self.assertEqual(self.tree.discover(self.root_id, plain), first)
+
+        for change in ({"url": "https://example.test/other?q=", "route_template": "/other"},
+                       {"method": "POST"}, {"input": "other"}, {"auth_context": "owner"},
+                       {"url": "https://example.test/search?q=&mode=private"}):
+            with self.subTest(change=change):
+                distinct = copy.deepcopy(templated)
+                distinct["locator"].update(change)
+                self.assertNotEqual(self.tree.discover(self.root_id, distinct), first)
+
+        parameterized = surface("https://example.test/items/1")
+        parameterized["locator"]["route_template"] = "/items/{id}"
+        second = self.tree.discover(self.root_id, parameterized)
+        parameterized["locator"]["url"] = "https://example.test/items/2"
+        self.assertEqual(self.tree.discover(self.root_id, parameterized), second)
+        self.assertEqual(self.tree.state["nodes"][second]["locator"]["route_template"], "/items/{id}")
+
+    def test_replay_preserves_legacy_discoveries_with_both_route_template_forms(self):
+        plain = surface("https://example.test/search?q=")
+        templated = copy.deepcopy(plain)
+        templated["locator"]["route_template"] = "/search"
+        for discovery in (templated, plain):
+            self.log.append("node_discovered", {"tree_schema": 1,
+                "payload": {"parent_id": self.root_id, "discovery": discovery}})
+        self.log.append("node_selected", {"tree_schema": 1, "payload": {"node_id": "N0003"}})
+        state = self.tree.refresh()
+        self.assertEqual(list(state["nodes"]), ["N0001", "N0002", "N0003"])
+        self.assertEqual(state["current_id"], "N0003")
+        self.assertNotEqual(state["nodes"]["N0002"]["dedup_key"], state["nodes"]["N0003"]["dedup_key"])
+
     def test_import_treats_query_payload_as_same_input_surface(self):
         surface_id = self.tree.discover(self.root_id, surface("https://example.test/search?q="))
         attempt = self.tree.begin_attempt(surface_id, call_id="CALL-0001")
@@ -84,6 +121,27 @@ class TreeStoreTests(unittest.TestCase):
         self.assertEqual(imported["payload"]["result"]["discovered"][0]["locator"]["url"],
                          "https://example.test/search?q=")
         self.assertEqual(len(replay_tree(self.log.read_events(), RUN_ID)["nodes"]), 2)
+
+    def test_import_omits_redundant_route_template_before_recording_result(self):
+        surface_id = self.tree.discover(self.root_id, surface("https://example.test/search?q="))
+        attempt = self.tree.begin_attempt(surface_id, call_id="CALL-0001")
+        self.log.append("exec_started", {"exec_id": "EXEC-0001", "call_id": "CALL-0001", "action": "run_command"})
+        found = surface("https://example.test/search?q=apple")
+        found["locator"]["route_template"] = "/search"
+        path = self.log.run_dir / "runtime" / attempt["result_path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"schema_version": 1, "attempt_id": attempt["attempt_id"],
+            "node_id": surface_id, "discovered": [found], "proposed_verdict": "inconclusive",
+            "claim": "", "next_observation": "", "evidence_refs": []}), encoding="utf-8")
+        self.log.append("exec_finished", {"exec_id": "EXEC-0001", "call_id": "CALL-0001",
+                       "action": "run_command", "exit_code": 0, "timed_out": False, "cancelled": False,
+                       "failure_source": None})
+        self.tree.import_result(attempt["attempt_id"], exec_id="EXEC-0001")
+        self.assertEqual(len(self.tree.state["nodes"]), 2)
+        imported = next(event for event in self.log.read_events() if event["kind"] == "node_result_imported")
+        locator = imported["payload"]["result"]["discovered"][0]["locator"]
+        self.assertEqual(locator["url"], "https://example.test/search?q=")
+        self.assertNotIn("route_template", locator)
 
     def test_selection_and_state_survive_replay_without_reexecuting_commands(self):
         node_id = self.tree.discover(self.root_id, surface())

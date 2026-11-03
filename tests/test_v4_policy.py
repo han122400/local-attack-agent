@@ -7,6 +7,7 @@ class PolicyTests(unittest.TestCase):
     def test_settings_are_versioned_and_reject_unknown_or_bad_values(self):
         settings = execution_settings({})
         self.assertEqual(settings["version"], "v4-execution-v2")
+        self.assertEqual(settings["node_attempts"], 3)
         for value in ({"node_attempts": 0}, {"max_cost_usd": float("nan")}, {"api_key": "secret"}):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 execution_settings(value)

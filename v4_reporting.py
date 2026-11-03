@@ -3,10 +3,12 @@
 import json
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from session_log import LogFailure, atomic_write_json
 from lab import TARGET as LAB_TARGET
-from v4_tree import TreeStore, investigation_gaps
+from v4_contracts import dedup_key
+from v4_tree import TreeStore, investigation_gaps, latest_observation
 from v4_usage import summarize_usage
 
 
@@ -45,6 +47,46 @@ def _metadata(log, **fields):
         atomic_write_json(log.run_dir / "session.json", log.metadata)
 
 
+def _candidate_leads(state):
+    """Expose model-authored hypotheses and preserved provenance without issuing a verdict."""
+    discovery_evidence = {}
+    discovery_claims = {}
+    for attempt in state["attempts"].values():
+        if attempt["status"] != "imported" or attempt["execution_status"] != "succeeded":
+            continue
+        refs = [ref for ref in attempt["evidence_refs"] if ref.get("source") == "model_file"]
+        candidates = [item for item in attempt["result"]["discovered"] if item["kind"] == "candidate"]
+        for discovery in candidates:
+            discovery_evidence.setdefault(dedup_key(discovery), []).extend(refs)
+        claim = attempt["result"]["claim"].strip()
+        if len(candidates) == 1 and claim:
+            discovery_claims[dedup_key(candidates[0])] = claim
+
+    leads = []
+    for node in state["nodes"].values():
+        if node["kind"] != "candidate":
+            continue
+        previous = latest_observation(state, node["id"])
+        sources = []
+        seen = set()
+        for ref in discovery_evidence.get(node["dedup_key"], []):
+            if ref["path"] not in seen:
+                sources.append(ref)
+                seen.add(ref["path"])
+        leads.append({"node_id": node["id"], "locator": node["locator"],
+                      "hypothesis": node["hypothesis"], "investigation_state": node["investigation_state"],
+                      "investigation_reason": node["investigation_reason"],
+                      "test_attempted": bool(node["attempts"]),
+                      "candidate_proposed_verdict": previous["proposed_verdict"] if previous else None,
+                      "candidate_claim": previous["claim"] if previous else "",
+                      "discovery_claim": discovery_claims.get(node["dedup_key"], ""),
+                      "discovery_evidence_refs": sources[:8],
+                      "discovery_evidence_count": len(sources),
+                      "candidate_evidence_refs": [ref for ref in node["evidence_refs"]
+                                                  if ref.get("source") == "model_file"][:8]})
+    return leads
+
+
 def save_report(log, run_result, reason, *, state=None, error=None, persist_metadata=True):
     events, corruption = readable_prefix(log)
     degraded = state is None or corruption is not None
@@ -60,7 +102,7 @@ def save_report(log, run_result, reason, *, state=None, error=None, persist_meta
         reason = "investigation_unavailable" if degraded else "investigation_incomplete"
     stats = {key: None for key in ("surfaces", "candidates", "tested_candidates", "confirmed", "rejected",
                                   "inconclusive", "unexplored", "unscored", "fallback_selections", "incomplete_nodes")}
-    high, evidence = [], []
+    high, evidence, candidate_leads = [], [], None
     if not degraded:
         nodes = list(state["nodes"].values())
         candidates = [node for node in nodes if node["kind"] == "candidate"]
@@ -75,6 +117,7 @@ def save_report(log, run_result, reason, *, state=None, error=None, persist_meta
                 if node["investigation_state"] != "done" and node["exploration_state"] != "blocked"
                 and (node["risk"].get("score") or 0) >= 75]
         evidence = [ref for node in nodes for ref in node["evidence_refs"]]
+        candidate_leads = _candidate_leads(state)
     else:
         # These are prefix references, never final verification statistics.
         for event in events:
@@ -89,11 +132,24 @@ def save_report(log, run_result, reason, *, state=None, error=None, persist_meta
         f"자동 취약점 판정 없음 · 미확정(미검증 포함) {stats['inconclusive']}\n"
         f"미탐색 {stats['unexplored']} · 조사 미완료 {stats['incomplete_nodes']} · 미점수 {stats['unscored']} · 후순위 선택 {stats['fallback_selections']}")
     summary = f"결과: {run_result} · 종료 사유: {reason}\n{counts}\n발견한 노드 범위의 결과이며 사이트 전체의 취약점 부재를 뜻하지 않습니다."
+    if candidate_leads:
+        summary += "\n후보 단서: " + "; ".join(
+            f"{lead['node_id']} {lead['hypothesis']['type']} {lead['locator']['method']} "
+            f"{urlsplit(lead['locator']['url']).path} [{lead['locator']['input']}] "
+            f"({'테스트 시도' if lead['test_attempted'] else '테스트 미시도'}, "
+            f"발견 시도 자료 {lead['discovery_evidence_count']}개)"
+            for lead in candidate_leads[:5])
+        if len(candidate_leads) > 5:
+            summary += f" 외 {len(candidate_leads) - 5}개"
+        for lead in candidate_leads[:5]:
+            claim = lead["candidate_claim"] or lead["discovery_claim"]
+            if claim:
+                summary += f"\n모델 기록(미확인, {lead['node_id']}): {claim[:220]}"
     if gaps:
         summary += "\n조사 미완료: " + "; ".join(f"{item['node_id']} ({item['reason']})" for item in gaps[:10])
     report = {"schema_version": 1, "run_id": log.run_id, "status": status, "run_result": run_result,
               "stop_reason": reason, "summary": summary, "stats": stats, "unexplored_high_risk": high,
-              "incomplete_nodes": gaps,
+              "incomplete_nodes": gaps, "candidate_leads": candidate_leads,
               "evidence_refs": evidence, "usage": usage, "last_snapshot_usage": log.metadata.get("v4_usage") if degraded else None,
               "last_readable_seq": events[-1]["seq"] if events else 0, "corruption": corruption, "error": error}
     atomic_write_json(log.run_dir / "report.json", report)

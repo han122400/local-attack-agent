@@ -31,6 +31,38 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(report["stop_reason"], "call_budget")
         self.assertTrue((self.log.run_dir / "report.json").is_file())
 
+    def test_report_exposes_unverified_candidate_and_its_discovery_evidence(self):
+        attempt = self.tree.begin_attempt("N0001", call_id="CALL-0001")
+        self.log.append("exec_started", {"exec_id": "EXEC-0001", "call_id": "CALL-0001", "action": "run_command"})
+        work = self.log.run_dir / "runtime" / "work"
+        work.mkdir(parents=True)
+        (work / "search.txt").write_text("Status: 500\nSQLITE_ERROR", encoding="utf-8")
+        result_path = self.log.run_dir / "runtime" / attempt["result_path"]
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(json.dumps({"schema_version": 1, "attempt_id": attempt["attempt_id"],
+            "node_id": "N0001", "discovered": [surface("https://example.test/search?q=", "candidate")],
+            "proposed_verdict": "confirmed", "claim": "SQL error proves injection", "next_observation": "",
+            "evidence_refs": [{"path": "work/search.txt", "description": "Original search response"}]}), encoding="utf-8")
+        self.log.append("exec_finished", {"exec_id": "EXEC-0001", "call_id": "CALL-0001", "action": "run_command",
+                         "exit_code": 0, "timed_out": False, "cancelled": False})
+        self.tree.import_result(attempt["attempt_id"], exec_id="EXEC-0001")
+
+        report = save_report(self.log, "budget_exhausted", "call_budget", state=self.tree.state)
+
+        self.assertEqual(len(report["candidate_leads"]), 1)
+        lead = report["candidate_leads"][0]
+        self.assertEqual(lead["node_id"], "N0002")
+        self.assertEqual(lead["hypothesis"]["type"], "sqli")
+        self.assertEqual(lead["locator"]["input"], "q")
+        self.assertFalse(lead["test_attempted"])
+        self.assertIsNone(lead["candidate_proposed_verdict"])
+        self.assertEqual(lead["discovery_claim"], "SQL error proves injection")
+        self.assertEqual(len(lead["discovery_evidence_refs"]), 1)
+        self.assertEqual(lead["discovery_evidence_refs"][0]["description"], "Original search response")
+        self.assertIn("후보 단서: N0002 sqli", report["summary"])
+        self.assertIn("모델 기록(미확인, N0002): SQL error proves injection", report["summary"])
+        self.assertIsNone(report["stats"]["confirmed"])
+
     def test_report_does_not_call_an_uninvestigated_tree_completed(self):
         report = save_report(self.log, "completed", "tree_exhausted", state=self.tree.state)
         self.assertEqual(report["run_result"], "incomplete")

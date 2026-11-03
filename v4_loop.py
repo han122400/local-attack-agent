@@ -1,6 +1,8 @@
 """Greedy depth-first orchestration, separate from v3 and deterministic replay."""
 
+import hashlib
 import json
+import re
 import threading
 import time
 from dataclasses import replace
@@ -13,7 +15,8 @@ from planning import load_prompt
 from session_log import atomic_write_json
 from scorer_session import RiskScorer
 from v4_usage import summarize_usage
-from v4_contracts import ContractError, MAX_RESULT_BYTES, RESULT_SCHEMA, validate_result
+from v4_contracts import (ContractError, MAX_RESULT_BYTES, RESULT_SCHEMA, dedup_key, evidence_path,
+                          normalize_url, validate_result)
 from v4_policy import V4BudgetStop, execution_settings
 from v4_tree import (TreeStore, MAX_EVIDENCE_BYTES, _json_result, _read_bounded, _safe_path,
                      latest_observation, investigation_gaps)
@@ -82,6 +85,7 @@ class V4Runner:
             system_prompt=prompt, system_prompt_version="v4", system_prompt_sha256=digest, before_request=self.gate.before_model)
         self.scorer = RiskScorer(self.tree, adapter=scorer_adapter, admit_request=self.gate.admit)
         self.history = []
+        self._discovery_cache = {}
         from explorer import context_char_budget
         self.context_budget = context_char_budget(log.metadata["model_settings"]["options"].get("num_ctx", 8192), prompt)
 
@@ -113,8 +117,10 @@ class V4Runner:
                 "attempt": {"attempt_id": attempt_id, "node_id": node_id, "result_path": f"work/node-results/{attempt_id}.json"},
                 "result_template": {"schema_version": 1, "attempt_id": attempt_id, "node_id": node_id,
                                     "discovered": [], "proposed_verdict": "inconclusive", "claim": "",
-                                    "evidence_refs": [], "next_observation": ""},
+                                    "evidence_refs": [], "next_observation": "", "observations": observations({})},
                 "result_schema": RESULT_SCHEMA, "previous_result": previous,
+                "discovery_evidence": self._discovery_evidence(node_id, state),
+                "discovery_context": self._discovery_context(node_id, state),
                 "recent": self.history[-2:], "sibling_ranks": ranks[:20], "total_siblings": len(siblings),
                 "remaining": {"seconds": max(0, int(self.gate.deadline - self.gate.clock())),
                               "model_calls": self.gate.budgets["model_calls"] - self.gate.usage()["model_calls"],
@@ -127,9 +133,140 @@ class V4Runner:
             previous["details_truncated"] = True
         if len(json.dumps(value, ensure_ascii=False)) > self.context_budget and previous:
             previous["claim"], previous["details_truncated"] = "", True
+        provenance = value["discovery_evidence"]
+        while len(json.dumps(value, ensure_ascii=False)) > self.context_budget and provenance and provenance["evidence_refs"]:
+            provenance["evidence_refs"].pop()
+            provenance["truncated"] = True
+        if len(json.dumps(value, ensure_ascii=False)) > self.context_budget and provenance:
+            provenance["claim"], provenance["truncated"] = "", True
+        discovery = value["discovery_context"]
+        for field in ("hints", "surfaces", "sources", "assets"):
+            while len(json.dumps(value, ensure_ascii=False)) > self.context_budget and discovery[field]:
+                discovery[field].pop()
+                discovery["truncated"] = True
         if len(json.dumps(value, ensure_ascii=False)) > self.context_budget:
             raise V4BudgetStop("context_budget")
         return value
+
+    @staticmethod
+    def _discovery_evidence(node_id, state):
+        """Expose evidence from the successful attempt that introduced this node."""
+        node = state["nodes"][node_id]
+        parents = {path["parent_id"] for path in node["discovery_paths"]}
+        matches = []
+        for parent_id in parents:
+            for attempt_id in state["nodes"][parent_id]["attempts"]:
+                attempt = state["attempts"][attempt_id]
+                if attempt["status"] != "imported" or attempt["execution_status"] != "succeeded":
+                    continue
+                result = attempt["result"]
+                if any(dedup_key(item) == node["dedup_key"] for item in result["discovered"]):
+                    matches.append((attempt["imported_seq"], parent_id, attempt))
+        if not matches:
+            return None
+        matches.sort(reverse=True)
+        _, parent_id, attempt = next((item for item in matches if item[2]["result"]["evidence_refs"]), matches[0])
+        result = attempt["result"]
+        refs = result["evidence_refs"]
+        claim = result["claim"]
+        return {"parent_id": parent_id, "attempt_id": attempt["attempt_id"], "claim": claim[:1000],
+                "evidence_refs": [{"path": ref["path"], "description": ref["description"][:200]}
+                                  for ref in refs[:8]],
+                "truncated": len(claim) > 1000 or len(refs) > 8
+                             or any(len(ref["description"]) > 200 for ref in refs)}
+
+    def _discovery_context(self, node_id, state):
+        """Summarize preserved same-origin observations; the model submits discoveries."""
+        target = normalize_url(self.log.metadata["target"])
+        origin = urlsplit(target)
+        allowed = (origin.scheme, origin.hostname, origin.port or (443 if origin.scheme == "https" else 80))
+        node = state["nodes"][node_id]
+        refs, seen_refs = [], set()
+        for attempt_id in node["attempts"]:
+            attempt = state["attempts"][attempt_id]
+            if attempt["status"] != "imported" or attempt["execution_status"] != "succeeded":
+                continue
+            for ref in attempt["evidence_refs"]:
+                if ref.get("source") != "model_file" or "runtime_path" not in ref:
+                    continue
+                identity = (ref["sha256"], ref["runtime_path"])
+                if identity not in seen_refs:
+                    refs.append(ref)
+                    seen_refs.add(identity)
+        full = {"schema_version": 1, "node_id": node_id, "assets": [], "surfaces": [], "hints": [],
+                "sources": [], "truncated": len(refs) > 16}
+        seen_items = {key: set() for key in ("assets", "surfaces", "hints")}
+        for ref in reversed(refs[-16:]):
+            runtime_path = evidence_path(ref["runtime_path"])
+            cache_key = (ref["sha256"], node["locator"]["url"], runtime_path,
+                         runtime_path.lower().endswith((".js", ".mjs", ".cjs")))
+            if cache_key not in self._discovery_cache:
+                source_url, content_type, source_url_inferred = node["locator"]["url"], "", True
+                try:
+                    raw = _read_bounded(self.log.run_dir, ref["path"], MAX_EVIDENCE_BYTES)
+                    if len(raw) != ref["bytes"] or hashlib.sha256(raw).hexdigest() != ref["sha256"]:
+                        raise ValueError("Preserved evidence changed")
+                    body = raw.decode("utf-8", "replace")
+                    for line in body[:4096].splitlines()[:20]:
+                        match = re.match(r"(?i)^\s*(?:URL\s*:\s*|(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+)(https?://\S+)", line)
+                        if match:
+                            source_url = normalize_url(match.group(1))
+                            source = urlsplit(source_url)
+                            if (source.scheme, source.hostname, source.port or (443 if source.scheme == "https" else 80)) != allowed:
+                                raise ValueError("Evidence source is outside the allowed origin")
+                            source_url_inferred = False
+                        match = re.match(r"(?i)^\s*Content-Type\s*:\s*(.+)", line)
+                        if match:
+                            content_type = match.group(1).strip()[:200]
+                    if cache_key[-1] or urlsplit(source_url).path.lower().endswith((".js", ".mjs", ".cjs")):
+                        content_type = "application/javascript"
+                    from v4_discovery import analyze_response
+                    analysis = analyze_response(body, source_url, content_type=content_type,
+                                                allowed_origin=target, limit=100)
+                    self._discovery_cache[cache_key] = {"source_url": source_url,
+                        "source_url_inferred": source_url_inferred, "analysis": analysis}
+                except (OSError, ValueError) as exc:
+                    self._discovery_cache[cache_key] = {"source_url": source_url,
+                        "source_url_inferred": source_url_inferred, "excluded_reason": str(exc)[:160],
+                        "analysis": {"assets": [], "surfaces": [], "hints": [], "truncated": True}}
+            cached = self._discovery_cache[cache_key]
+            source = {"evidence_path": runtime_path, "source_url": cached["source_url"],
+                      "source_url_inferred": cached["source_url_inferred"], "sha256": ref["sha256"]}
+            if "excluded_reason" in cached:
+                source["excluded_reason"] = cached["excluded_reason"]
+            full["sources"].append(source)
+            for field in seen_items:
+                for item in cached["analysis"][field]:
+                    identity = json.dumps(item, ensure_ascii=False, sort_keys=True)
+                    if identity not in seen_items[field]:
+                        full[field].append(item)
+                        seen_items[field].add(identity)
+            full["truncated"] = full["truncated"] or cached["analysis"]["truncated"]
+        fetched = {}
+        for source in full["sources"]:
+            if not source["source_url_inferred"] and "excluded_reason" not in source:
+                fetched.setdefault(source["source_url"], source["evidence_path"])
+        names = {}
+        for asset in full["assets"]:
+            names.setdefault(urlsplit(asset["url"]).path.rsplit("/", 1)[-1].lower(), []).append(asset["url"])
+        inferred = {}
+        for source in full["sources"]:
+            if source["source_url_inferred"] and "excluded_reason" not in source:
+                matching = names.get(source["evidence_path"].rsplit("/", 1)[-1].lower(), [])
+                if len(matching) == 1 and matching[0] not in fetched:
+                    inferred.setdefault(matching[0], source["evidence_path"])
+        full["assets"] = [{**asset, "fetched": asset["url"] in fetched or asset["url"] in inferred,
+                           "fetched_inferred": asset["url"] in inferred,
+                           **({"evidence_path": (fetched | inferred)[asset["url"]]}
+                              if asset["url"] in fetched or asset["url"] in inferred else {})}
+                          for asset in full["assets"]]
+        relative = f"work/discovery/{node_id}.json"
+        directory = _safe_path(self.runtime.runtime_dir, "work/discovery")
+        directory.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(_safe_path(self.runtime.runtime_dir, relative), full)
+        return {**{key: full[key][:20] for key in ("assets", "surfaces", "hints", "sources")},
+                "truncated": full["truncated"] or any(len(full[key]) > 20 for key in seen_items),
+                "full_analysis_path": relative}
 
     @staticmethod
     def _sanitize_result_observations(value):
@@ -224,7 +361,9 @@ class V4Runner:
                 command = self.harness.decide(self.log.run_id, context, model=self.log.metadata["model"],
                     settings=self.log.metadata["model_settings"], deadline=self.gate.deadline,
                     command_validator=lambda candidate: self._validate_command(candidate, context["attempt"]["result_path"],
-                        pending_followup=(context["previous_result"] or {}).get("next_observation", "")))
+                        pending_followup=(context["previous_result"] or {}).get("next_observation", ""),
+                        require_candidate_observation=(context["node"]["kind"] == "candidate"
+                            and context["previous_result"] is None)))
             except V4BudgetStop as exc:
                 if exc.reason == "node_limit":
                     self.log.append("v4_node_limit", {"node_id": node_id, "reason": "deep_calls_reserved"})
@@ -259,6 +398,7 @@ class V4Runner:
             output = self.runtime.run(self.log.run_id, command.runtime_payload(), call_id=command.call_id, timeout=timeout)
             node_tools += 1
             self.history.append({"node_id": node_id, "action": command.action, "exit_code": output.exit_code,
+                                 "path": command.path if command.action in ("read_file", "write_file") else "",
                                  "stdout": output.stdout[-2500:], "stderr": output.stderr[-1000:]})
             if not attempt:
                 continue
@@ -284,8 +424,9 @@ class V4Runner:
                                      "result_path": attempt["result_path"]}
                 repair["result_template"]["attempt_id"] = attempt["attempt_id"]
                 repair.pop("result_schema", None)
+                contract_detail = (" Contract error: " + str(exc)[:240] + ".") if isinstance(exc, ContractError) else ""
                 repair["instruction"] = ("The preceding tool already ran for this attempt but its result JSON is "
-                    + reason + ". Use action=write_file, path=attempt.result_path, and content as a JSON string "
+                    + reason + "." + contract_detail + " Use action=write_file, path=attempt.result_path, and content as a JSON string "
                     "made from result_template. Include specific discovered input surfaces if observed. "
                     "Keep every template field. evidence_refs may refer only to separately written observation files, "
                     "never a node-results JSON or an absolute path. Do not run another target request in this response.")
@@ -385,9 +526,11 @@ class V4Runner:
         return current is not None and current not in known_observations
 
     @staticmethod
-    def _validate_command(command, result_path, *, pending_followup=""):
+    def _validate_command(command, result_path, *, pending_followup="", require_candidate_observation=False):
         if command.action == "finish" and pending_followup.strip():
             raise ValueError("A follow-up observation is pending. Investigate previous_result.next_observation and write a new result before finish")
+        if command.action == "finish" and require_candidate_observation:
+            raise ValueError("Candidate has no successful observation. Run a controlled test and write its result before finish; HTTP 500 alone does not confirm the hypothesis")
         if command.action == "run_python":
             problems = check_generated_code(command.code)
             if problems:

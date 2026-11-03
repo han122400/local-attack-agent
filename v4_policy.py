@@ -5,7 +5,7 @@ from risk_rubric import is_finite_number
 
 # Node limits bound consecutive unproductive results and tools since progress.
 # Productive follow-ups use the shared run budgets.
-DEFAULT_SETTINGS = {"version": "v4-execution-v2", "node_attempts": 2, "node_tool_calls": 6,
+DEFAULT_SETTINGS = {"version": "v4-execution-v2", "node_attempts": 3, "node_tool_calls": 6,
                     "deep_reserve_calls": 4, "max_cost_usd": .10, "remote_call_reserve_usd": .005}
 
 

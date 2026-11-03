@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from session_log import safe_relative_path
 from risk_rubric import observations, OBSERVATIONS_SCHEMA
@@ -96,8 +96,20 @@ def validate_discovery(value: dict) -> dict:
         hypothesis = {"type": category, "statement": _text(hypothesis["statement"], "hypothesis", 4000)}
     elif hypothesis is not None:
         raise ContractError("Surface nodes have no vulnerability hypothesis")
+    locator = validate_locator(value["locator"])
+    if value["kind"] == "surface":
+        parts = urlsplit(locator["url"])
+        asset_suffixes = (".js", ".mjs", ".cjs", ".css", ".map", ".svg", ".png", ".jpg",
+                          ".jpeg", ".gif", ".ico", ".woff", ".woff2", ".ttf", ".webp")
+        input_name = locator["input"].lower()
+        query_names = {name.lower() for name, _ in parse_qsl(parts.query, keep_blank_values=True)}
+        asset_input = input_name.endswith(asset_suffixes)
+        asset_path = parts.path.lower().endswith(asset_suffixes)
+        if ((asset_input and (parts.path in ("", "/") or parts.path.rsplit("/", 1)[-1].lower() == input_name))
+                or (asset_path and input_name not in query_names)):
+            raise ContractError("Static resource filename is not an input surface")
     result = {"kind": value["kind"], "relation": value["relation"],
-              "locator": validate_locator(value["locator"]), "hypothesis": hypothesis}
+              "locator": locator, "hypothesis": hypothesis}
     if "observations" in value:
         result["observations"] = observations(value["observations"])
     return result

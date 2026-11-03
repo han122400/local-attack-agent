@@ -52,7 +52,8 @@ class LoopTests(unittest.TestCase):
         self.log = SessionLog(Path(self.temp.name), "a" * 32, {"experiment_mode": "v4", "target": "https://example.test/",
             "model": "mock:model", "goal": "inspect", "model_settings": {"think": False, "options": {"num_ctx": 8192, "num_predict": 4096}},
             "budgets": {"seconds": 120, "model_calls": 30, "tool_calls": 30, "command_seconds": 10, "finalize_seconds": 10},
-            "scorer_provider": "openrouter", "scorer_model": "typesafe/jev-1.14", "scorer_settings": {}, "v4_settings": {}})
+            "scorer_provider": "openrouter", "scorer_model": "typesafe/jev-1.14", "scorer_settings": {},
+            "v4_settings": {"node_attempts": 2}})
         self.addCleanup(self.log.close)
 
     def transport(self, callback):
@@ -70,6 +71,23 @@ class LoopTests(unittest.TestCase):
                   "result_path": context["attempt"]["result_path"]}
         return {"action": action, "plan": "inspect", "reason": "investigate current node", "path": "", "content": "",
                 "code": "", "command": json.dumps(result) if action == "run_command" else ""}
+
+    def test_recent_includes_prepared_file_path_for_the_next_decision(self):
+        runtime = Runtime(self.log)
+
+        def callback(context):
+            if context["node"]["id"] != "N0001":
+                return self.command(context)
+            if not context["recent"]:
+                return {"action": "write_file", "plan": "prepare probe", "reason": "observe target",
+                        "path": "work/probe.py", "content": "print('ready')", "command": "", "code": ""}
+            self.assertEqual(context["recent"][-1]["action"], "write_file")
+            self.assertEqual(context["recent"][-1]["path"], "work/probe.py")
+            self.assertEqual(context["recent"][-1]["exit_code"], 0)
+            return self.command(context, [surface("https://example.test/search?q=")])
+
+        runner = V4Runner(self.log, runtime, transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
 
     def test_followup_observation_continues_before_traversing_discoveries(self):
         runtime = Runtime(self.log)
@@ -185,6 +203,23 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(root["investigation_state"], "incomplete")
         self.assertEqual(root["investigation_reason"], "no_progress_limit")
         self.assertEqual(root["verification"]["next_observation"], "Analyze the response")
+
+    def test_three_consecutive_unproductive_results_allow_a_third_observation(self):
+        self.log.update(v4_settings={"node_attempts": 3})
+        root_calls = 0
+
+        def callback(context):
+            nonlocal root_calls
+            if context["node"]["id"] != "N0001":
+                return self.command(context)
+            root_calls += 1
+            if root_calls < 3:
+                return self.command(context, next_observation="Inspect an independent input")
+            return self.command(context, [surface("https://example.test/search?q=")])
+
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        self.assertEqual(root_calls, 3)
 
     def test_pending_followup_at_tool_limit_is_incomplete(self):
         self.log.update(v4_settings={"node_tool_calls": 1})
@@ -436,6 +471,24 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(responses, 2)
         self.assertEqual(TreeStore(self.log).rebuild()["attempts"]["A0001"]["status"], "imported")
 
+    def test_static_asset_discovery_repair_explains_the_contract_failure(self):
+        def callback(context):
+            if context["node"]["id"] != "N0001":
+                return self.command(context)
+            if "instruction" not in context:
+                asset = surface("https://example.test/")
+                asset["locator"]["input"] = "main.js"
+                return self.command(context, [asset])
+            self.assertIn("Static resource filename is not an input surface", context["instruction"])
+            corrected = dict(context["result_template"])
+            corrected["discovered"] = [surface("https://example.test/search?q=")]
+            return {"action": "write_file", "plan": "repair result", "reason": "remove static asset",
+                    "path": context["attempt"]["result_path"], "content": json.dumps(corrected),
+                    "command": "", "code": ""}
+
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+
     def test_repair_uses_remaining_node_tool_budget(self):
         self.log.update(v4_settings={"node_tool_calls": 1})
         called = []
@@ -543,6 +596,72 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(node["verification_state"], "inconclusive")
         self.assertFalse(any(event["kind"].startswith("oracle_") for event in self.log.snapshot_events()))
         self.assertNotIn("oracle_calls", self.log.metadata["v4_usage"])
+
+    def test_candidate_premature_finish_after_malformed_replies_still_gets_an_observation(self):
+        candidate_replies = 0
+
+        def callback(context):
+            nonlocal candidate_replies
+            if context["node"]["id"] == "N0001":
+                return self.command(context, [surface("https://example.test/search?q=", "candidate")])
+            candidate_replies += 1
+            if candidate_replies <= 2:
+                return {**self.command(context, action="finish"), "code": "unused"}
+            if candidate_replies == 3:
+                return self.command(context, action="finish")
+            command = self.command(context)
+            result = json.loads(command["command"])
+            result["observations"] = {"response_status": 500, "query_behavior": "error"}
+            return {**command, "command": json.dumps(result)}
+
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        candidate = TreeStore(self.log).rebuild()["nodes"]["N0002"]
+        self.assertEqual(candidate_replies, 4)
+        self.assertEqual(len(candidate["attempts"]), 1)
+        self.assertEqual(candidate["investigation_state"], "done")
+        self.assertEqual(candidate["verification_state"], "inconclusive")
+
+    def test_candidate_repeated_premature_finish_is_bounded_by_node_and_global_budgets(self):
+        self.log.update(budgets={**self.log.metadata["budgets"], "model_calls": 6})
+
+        def callback(context):
+            if context["node"]["id"] == "N0001":
+                return self.command(context, [surface("https://example.test/search?q=", "candidate")])
+            return self.command(context, action="finish")
+
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("incomplete", "investigation_incomplete"))
+        candidate = TreeStore(self.log).rebuild()["nodes"]["N0002"]
+        self.assertEqual(candidate["investigation_reason"], "model_format")
+        self.assertEqual(candidate["attempts"], [])
+        self.assertEqual(self.log.metadata["v4_usage"]["execution_calls"], 5)
+        self.assertEqual(self.log.metadata["v4_usage"]["model_calls"], 6)
+        self.assertEqual(self.log.metadata["v4_usage"]["tool_calls"], 1)
+
+    def test_candidate_context_exposes_the_parent_attempt_that_discovered_it(self):
+        runtime = Runtime(self.log)
+        evidence = runtime.runtime_dir / "work" / "parent-response.txt"
+        evidence.write_text("HTTP 500 from a probe", encoding="utf-8")
+        root_calls = 0
+
+        def callback(context):
+            nonlocal root_calls
+            if context["node"]["id"] == "N0001":
+                root_calls += 1
+                if root_calls == 1:
+                    return self.command(context, [surface("https://example.test/search?q=", "candidate")],
+                        next_observation="Inspect another input",
+                        evidence_refs=[{"path": "work/parent-response.txt", "description": "initial probe response"}])
+                return self.command(context)
+            self.assertEqual(context.get("discovery_evidence"), {
+                "parent_id": "N0001", "attempt_id": "A0001", "claim": "model claim",
+                "evidence_refs": [{"path": "work/parent-response.txt", "description": "initial probe response"}],
+                "truncated": False})
+            return self.command(context)
+
+        runner = V4Runner(self.log, runtime, transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
 
 
 if __name__ == "__main__":
