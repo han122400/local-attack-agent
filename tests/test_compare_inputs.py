@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from code_checks import check_generated_code
 from command_runtime import WORKER_SOURCE
+from browser_http import BrowserHTTP
 
 
 class FixturePage:
@@ -48,7 +49,8 @@ def worker_helpers(page):
     nodes = [node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name in names]
     nodes += [node for node in ast.walk(tree) if isinstance(node, ast.Assign)
               and any(isinstance(t, ast.Name) and t.id == "helpers" for t in node.targets)]
-    namespace = {"page": page, "target_origin": "http://127.0.0.1:3000"}
+    namespace = {"page": page, "target_origin": "http://127.0.0.1:3000",
+                 "http": BrowserHTTP(SimpleNamespace(), "http://127.0.0.1:3000")}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "worker_helpers", "exec"), namespace)
     return namespace["helpers"]
 

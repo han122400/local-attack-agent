@@ -201,9 +201,49 @@ async def main():
             else:
                 result["text_sample"] = await page.evaluate("() => (document.body ? document.body.innerText : '').slice(0, 400)")
             return result
+        async def compare_inputs(index, normal_value, test_value, result_selector, settle_ms=1200):
+            """Collect normal/test/normal with one model command; compare visible samples, never verdicts."""
+            if type(index) is not int or index < 0 or not isinstance(normal_value, str) or not isinstance(test_value, str):
+                raise ValueError("Use a visible input index and string input values")
+            if not isinstance(result_selector, str) or not result_selector.strip():
+                raise ValueError("A result_selector is required for comparison")
+            if normal_value == test_value:
+                raise ValueError("Normal and test values must differ")
+            if type(settle_ms) is not int or settle_ms < 0:
+                raise ValueError("settle_ms must be a nonnegative integer")
+            samples, identity = {}, None
+            def signature(field):
+                return tuple(field.get(key, "") for key in ("tag", "type", "name", "id", "label"))
+            for stage, value in (("normal", normal_value), ("test", test_value), ("recheck", normal_value)):
+                try:
+                    fields = (await list_inputs())["inputs"]
+                    field = next((row for row in fields if row["index"] == index), None)
+                    if field is None or (identity is not None and signature(field) != identity):
+                        raise ValueError("The input disappeared or changed identity; locate it again")
+                    identity = signature(field)
+                    if sum(signature(row) == identity for row in fields) != 1:
+                        raise ValueError("Input identity is ambiguous; compare manually")
+                    sample = await submit_input(index, value, result_selector, settle_ms=settle_ms)
+                    samples[stage] = sample
+                    if (not sample.get("submitted") or type(sample.get("result_count")) is not int
+                            or not isinstance(sample.get("result_sample"), list)):
+                        raise ValueError("Submission or result sample could not be observed")
+                except Exception as exc:
+                    return {"status": "inconclusive", "stage": stage, "error": str(exc)[:240], "samples": samples}
+            normal, test, recheck = (samples[key] for key in ("normal", "test", "recheck"))
+            stable = (normal["result_count"], normal["result_sample"]) == (recheck["result_count"], recheck["result_sample"])
+            observed = any(sample["result_count"] > 0 for sample in samples.values())
+            return {"status": "compared" if stable and observed else "inconclusive", "comparison": {
+                        "result_count_delta": test["result_count"] - normal["result_count"],
+                        "sample_changed": test["result_sample"] != normal["result_sample"],
+                        "baseline_sample_stable": stable},
+                    "scope": "Visible result count and first five text samples only; empty samples may mean a wrong selector. Not vulnerability confirmation.",
+                    "samples": samples}
+
+
         helpers = {"get_text": get_text, "get_json": get_json, "http_get": http.http_get,
                    "goto_and_render": goto_and_render, "list_inputs": list_inputs,
-                   "submit_input": submit_input, "target_origin": target_origin,
+                   "submit_input": submit_input, "compare_inputs": compare_inputs, "target_origin": target_origin,
                    "captured_requests": http.captured_requests, "replay_request": http.replay_request}
         send(sock, {"type": "ready"})
         buffer = b""
@@ -300,7 +340,7 @@ class ExecutionResult:
     exception_type: str | None = None
     retryable: bool | None = None
     blocked_requests: list[dict] = field(default_factory=list)
-    request_templates: list[dict] = field(default_factory=list)
+    request_templates: list[dict] | None = None
 
 
 class CommandRuntime:
@@ -745,7 +785,7 @@ class CommandRuntime:
                     result.cause_code = reply.get("cause_code")
                     result.exception_type = reply.get("exception_type")
                     result.blocked_requests = reply.get("blocked_requests", [])
-                    result.request_templates = reply.get("request_templates", [])
+                    result.request_templates = reply.get("request_templates")
                     if result.exit_code != 0:
                         result.retryable = True
                     if reply.get("timed_out"):
@@ -766,6 +806,8 @@ class CommandRuntime:
             result.failure_source = "system" if action == "run_python" else "execution"
             result.cause_code = "browser_worker_unresponsive" if action == "run_python" else "execution_timeout"
             result.retryable = True
+            if action == "run_python":
+                result.request_templates = []
             if action == "run_python" and self._worker is not None:
                 self._kill_tree(self._worker, self._owned[self._worker.pid])
                 self._unregister(self._worker)
@@ -779,6 +821,8 @@ class CommandRuntime:
             self._cancel.set()
             raise
         except Exception as exc:
+            if action == "run_python" and isinstance(exc, (EOFError, ConnectionError)):
+                result.request_templates = []
             result.exception = str(exc)
             result.exit_code = 1
             result.exception_type = type(exc).__name__

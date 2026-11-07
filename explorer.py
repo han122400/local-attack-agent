@@ -411,7 +411,7 @@ class ExplorerV3:
             execution = runtime.run(run_id, command.runtime_payload(), call_id=command.call_id,
                                     timeout=command_timeout)
             record = asdict(execution)
-            if execution.request_templates:
+            if execution.request_templates is not None:
                 request_templates = execution.request_templates
             record.pop("request_templates", None)
             record["stdout"] = _digest(record["stdout"], 1500)
@@ -423,8 +423,8 @@ class ExplorerV3:
                            "result": record})
             # Structured memory: keep the model's claim (plan/reason) separate from the actual observation,
             # and code-success (status) separate from investigation-success (evidence present).
-            if policy and execution.cancelled:
-                status, observed, error = "error", "", "execution cancelled"
+            if execution.cancelled:
+                status, observed, error = "error", _digest(execution.stdout), "execution cancelled"
             elif execution.timed_out:
                 status, observed, error = "timeout", _digest(execution.stdout), "code timed out"
             elif execution.exit_code == 0:

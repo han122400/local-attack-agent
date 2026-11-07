@@ -21,7 +21,7 @@ from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
 from urllib.request import Request as UrlRequest, urlopen
-
+from planning import SYSTEM_PROMPT_VERSION, available_prompt_versions
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -465,6 +465,15 @@ EXPLORER = ExplorerV3()
 app = FastAPI(title="Juice Explorer", docs_url=None, redoc_url=None)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1"])
 
+@app.get("/api/prompts")
+def get_prompts() -> JSONResponse:
+    return JSONResponse(
+        {
+            "versions": available_prompt_versions(),
+            "default": SYSTEM_PROMPT_VERSION,
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
 @app.get("/api/state")
 def get_state() -> JSONResponse:
@@ -639,9 +648,8 @@ async def start(request: Request) -> dict:
                 raise ValueError(f"선택한 모델의 컨텍스트 한도는 {info['context_length']} 토큰입니다.")
             if info.get("max_completion_tokens") and options.get("num_predict", -1) > info["max_completion_tokens"]:
                 raise ValueError(f"선택한 모델의 출력 한도는 {info['max_completion_tokens']} 토큰입니다.")
-        started = EXPLORER.start(target, model, goal=goal, model_settings=settings,
-                                 scenario_source=scenario_source, chain_mode=chain_mode,
-                                 budgets=body.get("budgets"))
+        started = EXPLORER.start(target, model, goal=goal, model_settings=settings, scenario_source=scenario_source,
+                                 chain_mode=chain_mode, budgets=body.get("budgets"), prompt_version=body.get("prompt_version"),)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:

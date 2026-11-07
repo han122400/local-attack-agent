@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import uuid
 from email.message import Message
 from email.parser import BytesParser
 from email.policy import default
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import quote_plus, unquote_plus, urlsplit, urlunsplit
 
 
 class BrowserHTTP:
@@ -17,6 +19,9 @@ class BrowserHTTP:
         self.blocked_requests = []
         self._requests = {}
         self._counter = 0
+        self._request_prefix = uuid.uuid4().hex[:12]
+        self._scoped_pages = {}
+        self._scope_lock = asyncio.Lock()
         self.step = ""
 
     @staticmethod
@@ -40,7 +45,8 @@ class BrowserHTTP:
         self.blocked_requests = []
 
     def _block_reason(self, url, method):
-        if not isinstance(url, str) or not url:
+        if (not isinstance(url, str) or not url or "\\" in url
+                or any(ord(char) <= 32 or ord(char) == 127 for char in url)):
             return "invalid_url"
         try:
             parts = urlsplit(url)
@@ -55,15 +61,51 @@ class BrowserHTTP:
     def _check(self, url, method):
         reason = self._block_reason(url, method)
         if reason:
-            self.blocked_requests.append({"url": self._public_url(url)[:240], "method": method, "reason": reason})
-            self.blocked_requests = self.blocked_requests[-8:]
+            self._record_block(url, method, reason)
             raise ValueError(f"Blocked by harness: {reason}; target origin only")
+
+    def _record_block(self, url, method, reason):
+        item = {"url": self._public_url(url)[:240], "method": method, "reason": reason}
+        if item not in self.blocked_requests:
+            self.blocked_requests.append(item)
+        self.blocked_requests = self.blocked_requests[-8:]
+
+    async def _ensure_browser_scope(self, page):
+        async with self._scope_lock:
+            if page in self._scoped_pages:
+                return
+            scheme, hostname, port = self.origin
+            hostname = ("[" + hostname + "]" if ":" in hostname
+                        else re.sub(r"([*+?{}()\\])", r"\\\1", hostname))
+            authority = hostname if port == {"http": 80, "https": 443}.get(scheme) else f"{hostname}:{port}"
+            session = await self.context.new_cdp_session(page)
+            await session.send("Network.enable")
+            # Playwright routes only the initial URL; Chromium must also block redirect destinations.
+            await session.send("Network.setBlockedURLs", {"urlPatterns": [
+                {"urlPattern": f"{scheme}://{authority}/*", "block": False}], "urls": ["*"]})
+            page.on("requestfailed", self._on_request_failed)
+            page.once("close", lambda *_: self._scoped_pages.pop(page, None))
+            self._scoped_pages[page] = session
+
+    def _on_request_failed(self, request):
+        reason = self._block_reason(request.url, request.method)
+        if reason:
+            self._record_block(request.url, request.method, reason)
+        elif "ERR_BLOCKED_BY_CLIENT" in (request.failure or ""):
+            self._record_block(request.url, request.method, "browser_scope_policy_blocked")
 
     async def guard(self, route):
         request = route.request
         try:
             self._check(request.url, request.method)
         except ValueError:
+            await route.abort()
+            return
+        try:
+            await self._ensure_browser_scope(request.frame.page)
+        except Exception as exc:
+            self._record_block(request.url, request.method, "scope_guard_unavailable")
+            print("HARNESS_SCOPE_SETUP_FAILED:", type(exc).__name__, str(exc)[:160])
             await route.abort()
             return
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
@@ -74,7 +116,7 @@ class BrowserHTTP:
                 if body is not None and len(body) > 2_000_000:
                     raise ValueError("request body exceeds the 2 MB replay limit")
                 self._counter += 1
-                request_id = f"REQ-{self._counter:04d}"
+                request_id = f"REQ-{self._request_prefix}-{self._counter:04d}"
                 self._requests[request_id] = {"id": request_id, "url": request.url, "method": request.method,
                     "headers": headers, "body": body, "step": self.step}
                 # shortcut: eight in-memory form requests; add persistence only if longer replay history is needed.
@@ -85,9 +127,7 @@ class BrowserHTTP:
         await route.continue_()
 
     async def guard_web_socket(self, route):
-        self.blocked_requests.append({"url": self._public_url(route.url)[:240], "method": "WEBSOCKET",
-                                      "reason": "websocket_not_supported"})
-        self.blocked_requests = self.blocked_requests[-8:]
+        self._record_block(route.url, "WEBSOCKET", "websocket_not_supported")
         await route.close()
 
     @staticmethod
@@ -118,18 +158,61 @@ class BrowserHTTP:
         return marker, parts
 
     @classmethod
+    def _urlencoded_parts(cls, body, content_type):
+        charset = cls._content_type(content_type).get_content_charset() or "utf-8"
+        parts = body.split(b"&")
+        if len(parts) > 512:
+            raise ValueError("too many form fields to edit")
+        names = [(index, unquote_plus(part.partition(b"=")[0].decode("ascii"), encoding=charset, errors="strict"))
+                 for index, part in enumerate(parts) if part]
+        return parts, names, charset
+
+    @staticmethod
+    def _json_parts(body):
+        text = body.decode("utf-8")
+        decoder = json.JSONDecoder()
+        spaces = re.compile(r"[ \t\r\n]*")
+        def whitespace(index):
+            return spaces.match(text, index).end()
+        index = whitespace(1 if text.startswith("\ufeff") else 0)
+        if text[index:index + 1] != "{":
+            raise ValueError("JSON replay requires an object")
+        index, parts = whitespace(index + 1), []
+        while text[index:index + 1] != "}":
+            name, index = decoder.raw_decode(text, index)
+            if not isinstance(name, str):
+                raise ValueError("invalid JSON field name")
+            index = whitespace(index)
+            if text[index:index + 1] != ":":
+                raise ValueError("missing JSON field separator")
+            start = whitespace(index + 1)
+            try:
+                _, end = decoder.raw_decode(text, start)
+            except RecursionError as exc:
+                raise ValueError("JSON nesting exceeds the field editing limit") from exc
+            parts.append((name, start, end))
+            index = whitespace(end)
+            if text[index:index + 1] == "}":
+                break
+            if text[index:index + 1] != ",":
+                raise ValueError("invalid JSON object separator")
+            index = whitespace(index + 1)
+            if text[index:index + 1] == "}":
+                raise ValueError("invalid trailing JSON comma")
+        if text[index:index + 1] != "}" or whitespace(index + 1) != len(text):
+            raise ValueError("invalid JSON object ending")
+        return text, parts
+
+    @classmethod
     def _fields(cls, item):
         body, content_type = item["body"] or b"", item["headers"].get("content-type", "")
-        if "application/x-www-form-urlencoded" in content_type:
-            charset = cls._content_type(content_type).get_content_charset() or "utf-8"
-            return parse_qsl(body.decode("ascii"), keep_blank_values=True, encoding=charset, max_num_fields=512)
-        if "multipart/form-data" in content_type:
+        media_type = content_type.lower()
+        if "application/x-www-form-urlencoded" in media_type:
+            return [(name, "") for _, name in cls._urlencoded_parts(body, content_type)[1]]
+        if "multipart/form-data" in media_type:
             return [(part[0], "") for part in cls._multipart_parts(body, content_type)[1] if part[0]]
-        if "json" in content_type:
-            value = json.loads(body)
-            if not isinstance(value, dict):
-                raise ValueError("JSON replay requires an object")
-            return list(value.items())
+        if "json" in media_type:
+            return [(name, "") for name, _, _ in cls._json_parts(body)[1]]
         raise ValueError("field edits require an observed form or JSON object")
 
     def captured_requests(self):
@@ -137,7 +220,7 @@ class BrowserHTTP:
         for item in self._requests.values():
             try:
                 names = sorted({name for name, _ in self._fields(item)})
-            except (ValueError, UnicodeError, LookupError):
+            except (ValueError, UnicodeError, LookupError, RecursionError):
                 names = None
             url = self._public_url(item["url"])
             card = {"id": item["id"], "url": url, "method": item["method"], "fields": None, "step": item["step"]}
@@ -168,10 +251,14 @@ class BrowserHTTP:
             if unknown:
                 raise ValueError("unknown field names: " + ", ".join(sorted(unknown)))
             content_type = item["headers"].get("content-type", "")
-            if "application/x-www-form-urlencoded" in content_type:
-                charset = self._content_type(content_type).get_content_charset() or "utf-8"
-                body = urlencode([(name, fields.get(name, value)) for name, value in pairs], encoding=charset).encode("ascii")
-            elif "multipart/form-data" in content_type:
+            media_type = content_type.lower()
+            if "application/x-www-form-urlencoded" in media_type:
+                parts, names, charset = self._urlencoded_parts(body, content_type)
+                for index, name in names:
+                    if name in fields:
+                        parts[index] = parts[index].partition(b"=")[0] + b"=" + quote_plus(fields[name], encoding=charset).encode("ascii")
+                body = b"&".join(parts)
+            elif "multipart/form-data" in media_type:
                 marker, parts = self._multipart_parts(body, content_type)
                 for name, filename, start, end, charset in reversed(parts):
                     if name in fields:
@@ -180,7 +267,11 @@ class BrowserHTTP:
                             raise ValueError("field edit would change file data or multipart structure")
                         body = body[:start] + value + body[end:]
             else:
-                body = json.dumps({**dict(pairs), **fields}).encode("utf-8")
+                text, parts = self._json_parts(body)
+                for name, start, end in reversed(parts):
+                    if name in fields:
+                        text = text[:start] + json.dumps(fields[name], ensure_ascii=False) + text[end:]
+                body = text.encode("utf-8")
         # Cookies come from the live browser context; transport headers must match the replayed bytes.
         headers = {k: v for k, v in item["headers"].items()
                    if k not in {"cookie", "host", "content-length", "connection", "transfer-encoding", "accept-encoding"}

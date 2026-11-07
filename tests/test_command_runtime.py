@@ -130,6 +130,15 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(finished["blocked_requests"], blocks)
         self.assertEqual(finished["request_templates"], templates)
 
+    def test_lost_worker_connection_expires_request_templates(self):
+        self.runtime._browser_enabled = True
+        with patch.object(self.runtime, "_worker", SimpleNamespace(poll=lambda: None)), \
+             patch.object(self.runtime, "_send_control"), \
+             patch.object(self.runtime, "_wait_control", side_effect=EOFError("worker exited")):
+            result = self.runtime.run(RUN_ID, {"action": "run_python", "code": "print('observe')"})
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(result.request_templates, [])
+
 
 class BrowserWorkerTests(unittest.TestCase):
     def test_generated_exception_and_dead_worker_have_distinct_origins(self):

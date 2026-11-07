@@ -224,7 +224,7 @@ function renderAgentStatus(){
     const result=latestExecution;
     setText('observationStatus',`${result.exec_id} · ${executionLabel(result)} · ${result.elapsed??'—'}초`);
     const failure=result.exception?.trim().split('\n').at(-1);
-    const blocks=(result.blocked_requests||[]).map(item=>`하네스 요청 차단: ${item.method} ${item.url} · ${{outside_target_origin:'대상 범위 밖',unsupported_method:'지원하지 않는 HTTP 메서드',invalid_url:'올바르지 않은 URL',websocket_not_supported:'WebSocket 연결 미지원'}[item.reason]||item.reason}`).join('\n');
+    const blocks=(result.blocked_requests||[]).map(item=>`하네스 요청 차단: ${item.method} ${item.url} · ${{outside_target_origin:'대상 범위 밖',unsupported_method:'지원하지 않는 HTTP 메서드',invalid_url:'올바르지 않은 URL',websocket_not_supported:'WebSocket 연결 미지원',scope_guard_unavailable:'범위 검사 준비 실패',browser_scope_policy_blocked:'브라우저 범위 제한'}[item.reason]||item.reason}`).join('\n');
     setText('latestObservation',[failure,blocks,result.stdout,result.stderr].filter(Boolean).join('\n').slice(0,2400)||`${actionLabel(result.action)} 완료${result.path?'\n'+result.path:''} · 출력 없음`);
     $('observationStatus').classList.toggle('error-text',result.exit_code!==0);
   }

@@ -23,8 +23,9 @@ def response(body=b"ok", content_type="text/plain; charset=utf-8", status=200, h
 
 def route(body=b"csrfToken=secret&q=normal&q=second", content_type="application/x-www-form-urlencoded", **kwargs):
     request = SimpleNamespace(url=kwargs.get("url", TARGET + "form"), method=kwargs.get("method", "POST"),
+                              frame=SimpleNamespace(page=kwargs.get("page", Mock())),
                               post_data_buffer=body, all_headers=AsyncMock(return_value={
-                                  "content-type": content_type, "cookie": "session=private",
+                                  "content-type": content_type, "cookie": "session=private", "authorization": "Bearer private",
                                   "content-length": str(len(body)), "next-action": "observed-action"}))
     return SimpleNamespace(request=request, continue_=AsyncMock(), abort=AsyncMock())
 
@@ -33,6 +34,8 @@ class BrowserHTTPTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.context = SimpleNamespace(request=SimpleNamespace(get=AsyncMock(return_value=response()),
                                                               fetch=AsyncMock(return_value=response())))
+        self.cdp = SimpleNamespace(send=AsyncMock())
+        self.context.new_cdp_session = AsyncMock(return_value=self.cdp)
         self.http = BrowserHTTP(self.context, TARGET)
         self.http.begin_step("EXEC-1")
 
@@ -99,12 +102,44 @@ class BrowserHTTPTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_credentials_invalid_urls_and_nondefault_ports_cannot_escape_scope(self):
         for url in (None, "https://fixture.invalid:0/", "https://fixture.invalid:444/",
-                    "https://user:secret@fixture.invalid/", "https://[invalid/"):
+                    "https://user:secret@fixture.invalid/", "https://[invalid/",
+                    "https://outside.invalid\\@fixture.invalid/", "https://fixture.invalid/\n"):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 await self.http.http_get(url)
         self.context.request.get.assert_not_awaited()
         await self.http.http_get("https://fixture.invalid:443/")
         self.context.request.get.assert_awaited_once()
+
+    async def test_native_redirect_scope_is_installed_before_browser_request_continues(self):
+        incoming, events = route(), []
+        async def send(method, *args):
+            events.append(method)
+        async def continued():
+            events.append("continued")
+        self.cdp.send.side_effect = send
+        incoming.continue_.side_effect = continued
+        await self.http.guard(incoming)
+        self.assertEqual(events, ["Network.enable", "Network.setBlockedURLs", "continued"])
+        policy = self.cdp.send.call_args.args[1]
+        self.assertEqual(policy["urls"], ["*"])
+        self.assertEqual(policy["urlPatterns"], [{"urlPattern": TARGET + "*", "block": False}])
+        failed_handler = next(call.args[1] for call in incoming.request.frame.page.on.call_args_list
+                              if call.args[0] == "requestfailed")
+        failed_handler(SimpleNamespace(url="https://outside.invalid/redirect", method="POST", failure="net::ERR_BLOCKED_BY_CLIENT"))
+        self.assertEqual(self.http.blocked_requests[-1]["reason"], "outside_target_origin")
+        await self.http.guard(route(page=incoming.request.frame.page))
+        self.context.new_cdp_session.assert_awaited_once()
+
+    async def test_browser_request_is_not_sent_when_redirect_scope_cannot_be_installed(self):
+        self.cdp.send.side_effect = RuntimeError("scope setup failed")
+        incoming = route()
+        with patch("builtins.print") as output:
+            await self.http.guard(incoming)
+        output.assert_called_once()
+        incoming.abort.assert_awaited_once()
+        incoming.continue_.assert_not_awaited()
+        self.assertEqual(self.http.blocked_requests[-1]["reason"], "scope_guard_unavailable")
+        self.assertEqual(self.http.captured_requests(), [])
 
     async def test_replay_changes_only_named_form_values_and_uses_current_context_cookies(self):
         incoming = route()
@@ -118,6 +153,7 @@ class BrowserHTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("cookie", options["headers"])
         self.assertNotIn("content-length", options["headers"])
         self.assertEqual(options["headers"]["next-action"], "observed-action")
+        self.assertEqual(options["headers"]["authorization"], "Bearer private")
         self.assertEqual(options["max_redirects"], 0)
         await self.http.replay_request(request_id)
         self.assertEqual(self.context.request.fetch.call_args.kwargs["data"], incoming.request.post_data_buffer)
@@ -149,7 +185,9 @@ class BrowserHTTPTests(unittest.IsolatedAsyncioTestCase):
     async def test_field_edits_preserve_untouched_raw_encoding_and_json_numbers(self):
         for body, content_type, expected in (
                 (b"csrf=%FF&q=normal", "application/x-www-form-urlencoded", b"csrf=%FF&q=changed"),
-                (b'{"q":"normal","nonce":1e400}', "application/json", b'{"q":"changed","nonce":1e400}')):
+                (b'{"q":"normal","nonce":1e400}', "Application/JSON", b'{"q":"changed","nonce":1e400}'),
+                (b' {"token":"\\u0061","q":"normal","q":"again"}\n', "application/json",
+                 b' {"token":"\\u0061","q":"changed","q":"changed"}\n')):
             with self.subTest(content_type=content_type):
                 await self.http.guard(route(body, content_type))
                 await self.http.replay_request(self.http.captured_requests()[-1]["id"], {"q": "changed"})
