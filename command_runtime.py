@@ -88,8 +88,17 @@ def installed_chromium() -> str | None:
     return str(matches[-1]) if matches else None
 
 
+def bounded_preview(text: str, limit: int = 65536) -> str:
+    if len(text) <= limit:
+        return text
+    marker = "\n[... middle omitted; see original ...]\n"
+    head = (limit - len(marker)) * 2 // 3
+    return text[:head] + marker + text[-(limit - len(marker) - head):]
+
+
 WORKER_SOURCE = r'''import ast
 import asyncio
+import builtins
 import contextlib
 import inspect
 import json
@@ -97,6 +106,7 @@ import os
 import socket
 import sys
 import traceback
+import types
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -104,6 +114,8 @@ project = Path(sys.argv[5])
 sys.path.insert(0, str(project / ".deps"))
 from playwright.async_api import async_playwright
 from browser_http import BrowserHTTP
+from j2_policy import CandidateNotebook, bounded_discovery
+from web_discovery import analyze_response
 
 def send(sock, item):
     sock.sendall((json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8"))
@@ -129,7 +141,8 @@ async def main():
             options["executable_path"] = executable
         browser = await playwright.chromium.launch(**options)
         context = await browser.new_context(service_workers="block", accept_downloads=False)
-        http = BrowserHTTP(context, target)
+        is_j2 = len(sys.argv) > 7 and sys.argv[7] == "J2"
+        http = BrowserHTTP(context, target, body_limit=2_000_000 if is_j2 else 2000)
         await context.route("**/*", http.guard)
         await context.route_web_socket("**/*", http.guard_web_socket)
         page = await context.new_page()
@@ -138,21 +151,41 @@ async def main():
             """GET a URL within the target origin and return its response text."""
             http._check(url, "GET")
             response = await context.request.get(url, max_redirects=0)
+            http.record_response(response)
             return await response.text()
         async def get_json(url):
             """GET a URL within the target origin and return parsed JSON."""
             http._check(url, "GET")
             response = await context.request.get(url, max_redirects=0)
+            http.record_response(response)
             return await response.json()
+        def discover_inputs(body, source_url, content_type=""):
+            result = analyze_response(body, source_url, content_type=content_type, allowed_origin=target)
+            if is_j2:
+                summary = bounded_discovery({"source_url": source_url, **result})
+                if summary is not None:
+                    discovery_summaries.append(summary)
+                    if len(discovery_summaries) > 4:
+                        del discovery_summaries[0]
+                        summary["truncated"] = True
+            return result
         async def goto_and_render(url, timeout=15000, settle_ms=1200):
             """Navigate within the target origin and let the SPA route render.
 
             Uses domcontentloaded + a short settle wait. networkidle is avoided on purpose:
             this app keeps polling, so networkidle may never fire and would hang until timeout.
             """
-            http._check(url, "GET")
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-            await page.wait_for_timeout(settle_ms)
+            try:
+                http._check(url, "GET")
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                await page.wait_for_timeout(settle_ms)
+            except Exception as exc:
+                if is_j2 and len(helper_errors) < 16:
+                    helper_errors.append({"helper": "goto_and_render", "error_type": type(exc).__name__,
+                                          "url": http._public_url(url)})
+                raise
+            if is_j2 and len(helper_outcomes) < 16:
+                helper_outcomes.append({"helper": "goto_and_render", "outcome": "completed", "url": http._public_url(url)})
             return page
         async def list_inputs():
             """Return the page's visible inputs (index/tag/type/name/id/label/value) and nearby button
@@ -242,6 +275,7 @@ async def main():
 
 
         helpers = {"get_text": get_text, "get_json": get_json, "http_get": http.http_get,
+                   "discover_inputs": discover_inputs,
                    "goto_and_render": goto_and_render, "list_inputs": list_inputs,
                    "submit_input": submit_input, "compare_inputs": compare_inputs, "target_origin": target_origin,
                    "captured_requests": http.captured_requests, "replay_request": http.replay_request}
@@ -256,6 +290,8 @@ async def main():
                     continue
                 exec_id = message["exec_id"]
                 http.begin_step(exec_id)
+                notebook = CandidateNotebook()
+                discovery_summaries, helper_errors, helper_outcomes = [], [], []
                 source = Path(message["path"])
                 limit = message.get("timeout")
                 timed_out = False
@@ -266,7 +302,19 @@ async def main():
                         async def run_user_code():
                             namespace = {"__name__": "__agent__", "__file__": str(source),
                                          "browser": browser, "context": context, "page": page,
+                                         "note_candidate": notebook.note_candidate,
                                          "asyncio": asyncio, **helpers}
+                            modules = {}
+                            for name, bindings in (("tools", {**helpers, "note_candidate": notebook.note_candidate}),
+                                                   ("browser", {"page": page, "context": context, "browser": browser})):
+                                module = types.ModuleType(name)
+                                module.__dict__.update(bindings)
+                                modules[name] = module
+                            def runtime_import(name, globals=None, locals=None, fromlist=(), level=0):
+                                if level == 0 and name in modules:
+                                    return modules[name]
+                                return builtins.__import__(name, globals, locals, fromlist, level)
+                            namespace["__builtins__"] = {**vars(builtins), "__import__": runtime_import}
                             tree = ast.parse(source.read_text(encoding="utf-8"), str(source))
                             # If the code already calls main() at top level, do not auto-call it again;
                             # otherwise the user's main ran twice and its output was duplicated.
@@ -310,6 +358,10 @@ async def main():
                             "timed_out": timed_out, "exception": detail[-4000:],
                             "failure_source": failure_source, "cause_code": cause_code,
                             "exception_type": exception_type, "blocked_requests": http.blocked_requests,
+                            "investigation_notes": notebook.notes,
+                            "http_observations": http.http_observations,
+                            "discovery_summaries": discovery_summaries, "helper_errors": helper_errors,
+                            "helper_outcomes": helper_outcomes,
                             "request_templates": http.captured_requests()})
         finally:
             await context.close()
@@ -341,6 +393,11 @@ class ExecutionResult:
     retryable: bool | None = None
     blocked_requests: list[dict] = field(default_factory=list)
     request_templates: list[dict] | None = None
+    investigation_notes: list[dict] = field(default_factory=list)
+    http_observations: list[dict] = field(default_factory=list)
+    discovery_summaries: list[dict] = field(default_factory=list)
+    helper_errors: list[dict] = field(default_factory=list)
+    helper_outcomes: list[dict] = field(default_factory=list)
 
 
 class CommandRuntime:
@@ -521,6 +578,8 @@ class CommandRuntime:
         worker_path = self.runtime_dir / "tools" / "_browser_worker.py"
         worker_path.write_text(WORKER_SOURCE, encoding="utf-8")
         shutil.copyfile(Path(__file__).with_name("browser_http.py"), worker_path.with_name("browser_http.py"))
+        for name in ("j2_policy.py", "j2_progress.py", "web_discovery.py"):
+            shutil.copyfile(Path(__file__).with_name(name), worker_path.with_name(name))
         token = uuid.uuid4().hex
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.bind(("127.0.0.1", 0))
@@ -528,7 +587,8 @@ class CommandRuntime:
         server.settimeout(20)
         executable = installed_chromium() or ""
         args = [self.python, "-u", str(worker_path), "127.0.0.1", str(server.getsockname()[1]),
-                token, self.target, str(Path(__file__).resolve().parent), executable]
+                token, self.target, str(Path(__file__).resolve().parent), executable,
+                self.log.metadata.get("prompt_version", "")]
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         process = subprocess.Popen(args, cwd=self.runtime_dir, env=self._environment(),
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -596,8 +656,7 @@ class CommandRuntime:
                 return
             record = self._output.setdefault(exec_id, {"stdout": "", "stderr": "", "truncated": False})
             prior = record[channel]
-            if len(prior) < 65536:
-                record[channel] = (prior + chunk)[:65536]
+            record[channel] = bounded_preview(prior + chunk)
             if len(prior) + len(chunk) > 65536:
                 record["truncated"] = True
 
@@ -699,7 +758,9 @@ class CommandRuntime:
                 stage = "file_api"
                 path = self._file_path(command["path"], writing=False)
                 result.path = str(path)
-                result.stdout = path.read_text(encoding="utf-8")[:65536]
+                text = path.read_text(encoding="utf-8")
+                result.stdout = bounded_preview(text)
+                result.output_truncated = len(text) > 65536
                 result.exit_code = 0
             elif action == "write_file":
                 stage = "file_api"
@@ -786,6 +847,11 @@ class CommandRuntime:
                     result.exception_type = reply.get("exception_type")
                     result.blocked_requests = reply.get("blocked_requests", [])
                     result.request_templates = reply.get("request_templates")
+                    result.investigation_notes = reply.get("investigation_notes", [])
+                    result.http_observations = reply.get("http_observations", [])
+                    result.discovery_summaries = reply.get("discovery_summaries", [])
+                    result.helper_errors = reply.get("helper_errors", [])
+                    result.helper_outcomes = reply.get("helper_outcomes", [])
                     if result.exit_code != 0:
                         result.retryable = True
                     if reply.get("timed_out"):
@@ -836,7 +902,7 @@ class CommandRuntime:
             output = self._output.pop(exec_id, {})
             result.stdout = result.stdout or output.get("stdout", "")
             result.stderr = output.get("stderr", "")
-            result.output_truncated = output.get("truncated", False)
+            result.output_truncated = result.output_truncated or output.get("truncated", False)
             result.elapsed = round(time.monotonic() - began, 3)
             if self._output_error is not None:
                 raise self._output_error

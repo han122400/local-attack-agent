@@ -29,6 +29,16 @@ COMMAND = {"action": "finish", "plan": "done", "reason": "observed", "path": "",
 
 
 class OpenRouterTests(unittest.TestCase):
+    def test_reporting_schema_remains_finish_only_in_remote_payload(self):
+        from planning import COMMAND_SCHEMA
+        schema = next(branch for branch in COMMAND_SCHEMA["oneOf"]
+                      if branch["properties"]["action"]["const"] == "finish")
+        request = providers._request_payload({"model": MODEL, "messages": [{"role": "user", "content": "report"}],
+                                             "format": schema, "options": {}}, CATALOG["data"][0])
+        properties = request["response_format"]["json_schema"]["schema"]["properties"]
+        self.assertEqual(properties["action"]["const"], "finish")
+        self.assertEqual(properties["content"]["const"], "")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

@@ -14,7 +14,6 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -132,9 +131,11 @@ def evaluate(case, policy, decide, *, max_calls=8):
 
 def main():
     from model_settings import default_model_settings
+    from planning import SYSTEM_PROMPT_VERSION, available_prompt_versions, load_prompt
     defaults = default_model_settings()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--prompt-version", default=SYSTEM_PROMPT_VERSION, choices=available_prompt_versions())
     parser.add_argument("--cases", default="two_cases")
     parser.add_argument("--policies", default="original")
     parser.add_argument("--max-calls", type=int, default=8)
@@ -149,7 +150,7 @@ def main():
             or any(p not in POLICIES for p in policies) or not 1 <= args.max_calls <= 12
             or not 60 <= args.seconds_per_run <= 600):
         parser.error("Use a local model, known cases/policies, 1–12 calls and a 60–600 second run limit")
-    from harness import Harness, SYSTEM_PROMPT
+    from harness import Harness
     from session_log import SessionLog
 
     common = ("\nThis is a controlled OFFLINE replay. There is no browser, shell or real site. "
@@ -158,7 +159,9 @@ def main():
               "Inspect all listed cases. Missing fixture files may be reported as blocked.\n")
     settings = {**defaults, "keep_alive": "1m", "options": {
         **defaults["options"], "seed": args.seed, "num_ctx": args.num_ctx, "num_predict": args.num_predict}}
+    base_prompt, _ = load_prompt(args.prompt_version)
     report = {"scope": "offline model decision replay; no website/code execution or vulnerability accuracy measurement",
+              "prompt_version": args.prompt_version,
               "model": args.model, "settings": settings, "results": []}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for case in cases:
@@ -171,15 +174,18 @@ def main():
             print(f"START {case} / {policy}", flush=True)
             with tempfile.TemporaryDirectory(prefix="harness-policy-") as directory:
                 log = SessionLog(Path(directory), uuid.uuid4().hex, {})
-                agent = Harness(log, max_calls=args.max_calls)
+                prompt = base_prompt + common + extra
+                prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+                agent = Harness(log, max_calls=args.max_calls, system_prompt=prompt,
+                                system_prompt_version=args.prompt_version,
+                                system_prompt_sha256=prompt_hash)
                 deadline = time.monotonic() + args.seconds_per_run
                 def decide(context):
                     return agent.decide(log.run_id, context, model=args.model, settings=settings, deadline=deadline)
                 try:
-                    with patch("harness.SYSTEM_PROMPT", SYSTEM_PROMPT + common + extra):
-                        row = evaluate(CASES[case], policy, decide, max_calls=args.max_calls)
+                    row = evaluate(CASES[case], policy, decide, max_calls=args.max_calls)
                     row.update(case=case, provider_calls=agent.calls,
-                               system_prompt_sha256=hashlib.sha256((SYSTEM_PROMPT + common + extra).encode()).hexdigest(),
+                               system_prompt_sha256=agent.system_prompt_sha256,
                                eligible_for_policy_comparison=not bool(row["model_failure"]),
                                **profile_events(log))
                     report["results"].append(row)

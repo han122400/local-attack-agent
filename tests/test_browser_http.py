@@ -31,6 +31,14 @@ def route(body=b"csrfToken=secret&q=normal&q=second", content_type="application/
 
 
 class BrowserHTTPTests(unittest.IsolatedAsyncioTestCase):
+    async def test_long_response_metadata_is_marked_so_prefixes_are_not_exact_matches(self):
+        http = BrowserHTTP(self.context, TARGET)
+        reply = response()
+        reply.url = TARGET + "x" * 300
+        http.record_response(reply)
+        self.assertTrue(http.http_observations[0]["url_truncated"])
+        self.assertEqual(len(http.http_observations[0]["url"]), 240)
+
     def setUp(self):
         self.context = SimpleNamespace(request=SimpleNamespace(get=AsyncMock(return_value=response()),
                                                               fetch=AsyncMock(return_value=response())))
@@ -58,6 +66,25 @@ class BrowserHTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["binary"])
         self.assertEqual(result["byte_length"], 3)
         self.assertEqual(result["body"], "")
+
+    async def test_j2_retains_bundle_content_beyond_the_legacy_preview(self):
+        body = 'const pad="' + 'x' * 30000 + '"; fetch("/search?q=normal")'
+        self.context.request.get.return_value = response(body.encode(), "application/javascript")
+        http = BrowserHTTP(self.context, TARGET, body_limit=2_000_000)
+        result = await http.http_get(TARGET + "app.js")
+        self.assertEqual(result["body"], body)
+        self.assertFalse(result["body_truncated"])
+        self.context.request.get.assert_awaited_once()
+        self.assertEqual(http.http_observations[0]["status"], 200)
+        self.assertNotIn("body", http.http_observations[0])
+        http.begin_step("next")
+        self.assertEqual(http.http_observations, [])
+
+    async def test_expanded_body_still_has_a_finite_limit(self):
+        self.context.request.get.return_value = response(b"x" * 7000)
+        result = await BrowserHTTP(self.context, TARGET, body_limit=6000).http_get(TARGET)
+        self.assertEqual(len(result["body"]), 6000)
+        self.assertTrue(result["body_truncated"])
 
     async def test_text_charset_and_json_are_preserved(self):
         self.context.request.get.return_value = response("café".encode("latin-1"), "text/plain; charset=iso-8859-1")
@@ -232,7 +259,8 @@ class BrowserHTTPTests(unittest.IsolatedAsyncioTestCase):
         context = self.context
         context.allowed_route = route()
         context.denied_route = route(url="https://outside.invalid/")
-        context.new_page = AsyncMock(return_value=SimpleNamespace())
+        context.new_page = AsyncMock(return_value=SimpleNamespace(
+            goto=AsyncMock(side_effect=[TimeoutError("navigation timeout"), None]), wait_for_timeout=AsyncMock()))
         context.close = AsyncMock()
         async def register(pattern, guard):
             context.guard = guard
@@ -249,25 +277,60 @@ class BrowserHTTPTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             source, stdout, stderr = (root / name for name in ("probe.py", "stdout", "stderr"))
             source.write_text("await context.guard(context.allowed_route)\n"
+                              "from tools import http_get as imported_get\n"
+                              "from browser import page as imported_page\n"
+                              "assert imported_get is http_get and imported_page is page\n"
                               "await context.guard(context.denied_route)\n"
                               "print(await replay_request(captured_requests()[0]['id'], {'q':'changed'}))\n"
+                              "summary = discover_inputs('<form><input name=term></form>', target_origin, 'text/html')\n"
+                              "print(summary)\nsummary['surfaces'].clear()\n"
+                              "try:\n    await goto_and_render(target_origin + '/?secret=value')\n"
+                              "except TimeoutError:\n    print('caught navigation error')\n"
+                              "await goto_and_render(target_origin, settle_ms=0)\n"
+                              "print(note_candidate('search term', next_observation='check normal processing'))\n"
                               "raise ValueError('after observation')\n", encoding="utf-8")
-            args = ["worker.py", "127.0.0.1", "12345", "token", TARGET, directory, ""]
+            args = ["worker.py", "127.0.0.1", "12345", "token", TARGET, directory, "", "J2"]
+            http_instances = []
+            def create_http(context, target, **options):
+                instance = BrowserHTTP(context, target, **options)
+                http_instances.append(instance)
+                return instance
             namespace, sent = {"__name__": "worker_unit_test"}, []
+            clean = root / "next.py"
+            clean.write_text("print('next step')", encoding="utf-8")
             messages = iter([{"type": "execute", "exec_id": "EXEC-7", "path": str(source),
-                              "stdout_path": str(stdout), "stderr_path": str(stderr), "timeout": 2}, {"type": "stop"}])
+                              "stdout_path": str(stdout), "stderr_path": str(stderr), "timeout": 2},
+                             {"type": "execute", "exec_id": "EXEC-8", "path": str(clean),
+                              "stdout_path": str(root / 'next.stdout'), "stderr_path": str(root / 'next.stderr'), "timeout": 2},
+                             {"type": "stop"}])
             with patch.object(sys, "argv", args), patch.object(sys, "path", list(sys.path)):
                 exec(compile(WORKER_SOURCE, "worker.py", "exec"), namespace)
                 namespace.update(async_playwright=FakePlaywright,
+                                 BrowserHTTP=create_http,
                                  send=lambda sock, item: sent.append(item), recv=lambda sock, buffer: (next(messages), b""))
                 with patch.object(namespace["socket"], "create_connection", return_value=Mock()):
                     await namespace["main"]()
-            result = sent[-1]
+            results = [item for item in sent if item['type'] == 'result']
+            result = results[0]
             self.assertEqual(result["exit_code"], 1)
             self.assertEqual(result["exception_type"], "ValueError")
             self.assertEqual(result["blocked_requests"][0]["reason"], "outside_target_origin")
             self.assertEqual(result["request_templates"][0]["step"], "EXEC-7")
             self.assertIn("'status': 200", stdout.read_text())
+            self.assertIn("'input': 'term'", stdout.read_text())
+            self.assertEqual(result['investigation_notes'][0]['name'], 'search term')
+            self.assertEqual(results[1]['investigation_notes'], [])
+            self.assertEqual(result["http_observations"][0]["status"], 200)
+            self.assertEqual(result["http_observations"][0]["method"], "POST")
+            self.assertEqual(results[1]["http_observations"], [])
+            self.assertEqual(result["discovery_summaries"][0]["surfaces"][0]["locator"]["input"], "term")
+            self.assertNotIn("snippet", result["discovery_summaries"][0]["hints"][0])
+            self.assertEqual(results[1]["discovery_summaries"], [])
+            self.assertEqual(result["helper_errors"], [{"helper": "goto_and_render", "error_type": "TimeoutError", "url": TARGET}])
+            self.assertEqual(results[1]["helper_errors"], [])
+            self.assertEqual(result["helper_outcomes"], [{"helper": "goto_and_render", "outcome": "completed", "url": TARGET.rstrip('/')}])
+            self.assertEqual(results[1]["helper_outcomes"], [])
+            self.assertEqual(http_instances[0].body_limit, 2_000_000)
             self.assertIn(b"q=changed", context.request.fetch.call_args.kwargs["data"])
             driver.chromium.launch.assert_awaited_once()
             context.close.assert_awaited_once()

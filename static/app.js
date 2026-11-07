@@ -4,7 +4,7 @@ const runId = runMatch ? runMatch[1] : null;
 const historyMode = !runId && new URLSearchParams(location.search).get('view') === 'history';
 const validRunId = value => /^[0-9a-f]{32}$/.test(String(value || ''));
 const dateText = value => value ? new Date(value * 1000).toLocaleString('ko-KR') : '—';
-const statusText = value => ({preparing:'준비 중',running:'탐색 중',stopping:'중단 중',finalizing:'정리 중',resetting:'환경 초기화 중',finished:'종료',recovery_required:'복구 필요',completed:'완료',stopped:'중단됨',timed_out:'시간 초과',error:'오류',succeeded:'완료',not_applicable:'해당 없음',pending:'대기',failed:'실패',preserved:'보존됨',finalized:'확정됨',collecting:'수집 중'})[value] || value || '확인 중';
+const statusText = value => ({preparing:'준비 중',running:'탐색 중',stopping:'중단 중',finalizing:'정리 중',resetting:'환경 초기화 중',finished:'종료',recovery_required:'복구 필요',completed:'완료',incomplete:'조사 미완료',stopped:'중단됨',timed_out:'시간 초과',error:'오류',succeeded:'완료',not_applicable:'해당 없음',pending:'대기',failed:'실패',preserved:'보존됨',finalized:'확정됨',collecting:'수집 중'})[value] || value || '확인 중';
 const textNode = (tag, value, className='') => { const item=document.createElement(tag); item.textContent=String(value ?? ''); if(className)item.className=className; return item; };
 const setText = (id, value) => { $(id).textContent=String(value ?? ''); };
 async function jsonRequest(url, options) {
@@ -551,12 +551,16 @@ async function loadScore(state){
     const s=await jsonRequest(`/api/runs/${id}/score`);
     const cost=s.cost_usd==null?'—':`$${Number(s.cost_usd).toFixed(4)}`;
     const cards=$('scoreCards'); cards.replaceChildren();
-    for(const [label,value] of [['점수',s.score],['증거',s.evidence],['실패',s.failed],
+    for(const [label,value] of [['점수',s.score],['실행 출력',s.execution_output_steps??s.evidence],['실패',s.failed],
         ['반복',s.repeats],['압축',s.compactions],['비용',cost]]){
       const card=document.createElement('div');
       card.append(textNode('strong',value),textNode('p',label,'field-note'));
       cards.append(card);
     }
+    const p=s.pipeline_metrics;
+    setText('scorePipelineNote',p
+      ?`선언 리소스 ${p.declared_resources} · 제공 텍스트 분석 기록 ${p.analyzed_resources} · 분석 기록 없음 ${p.unreviewed_resources} · 보안 영향 주장 ${p.claim_counts.security_effect}건(미검증). 본문 전체 확보·실제 발견의 독립 검증을 뜻하지 않습니다.`
+      :'진행·검증 수준 기록 없음. 기존 점수로 취약점 발견 여부를 판단할 수 없습니다.');
     panel.hidden=false; scoreShownKey=key;
   }catch(_){panel.hidden=true;}
 }

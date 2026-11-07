@@ -108,6 +108,26 @@ class RunApiTests(unittest.TestCase):
         self.assertEqual(request["system_prompt_version"], "J1")
         self.assertEqual(request["system_prompt_sha256"], digest)
 
+    def test_j2_selection_reaches_model_and_saved_report(self):
+        sent = []
+        def report(payload):
+            sent.append(payload)
+            yield from finished(payload)
+        self.explorer.transport = report
+        with patch.object(app, "EXPLORER", self.explorer), patch("app.get_ollama_models", return_value=[{"name": "mock:model"}]):
+            versions = self.client.get("/api/prompts").json()
+            self.assertIn("J2", versions["versions"])
+            response = self.client.post("/api/start", json={"goal": "inspect", "model": "mock:model",
+                "target": "https://fixture.invalid/", "prompt_version": "J2", "budgets": {"model_calls": 1}})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.explorer.worker.join(10)
+            state = self.client.get(f"/api/runs/{response.json()['run_id']}").json()
+        self.assertEqual(state["prompt_version"], "J2")
+        self.assertEqual(state["run_result"], "incomplete")
+        self.assertIn("J2 후보 기록", state["report"])
+        self.assertNotIn("j1_state", state)
+        self.assertEqual(sent[0]["messages"][0]["content"], load_prompt("J2")[0])
+
     def test_reset_recovers_named_incomplete_run_without_erasing_logs(self):
         run_id = "a" * 32
         log = SessionStore(self.root).create(run_id, {"goal": "inspect", "run_result": "interrupted"})

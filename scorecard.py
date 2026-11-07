@@ -84,6 +84,21 @@ def score_run(session: dict, run_dir: Path) -> dict:
 
     started, finished = session.get("started_at"), session.get("finished_at")
     duration = round(finished - started) if isinstance(started, (int, float)) and isinstance(finished, (int, float)) else None
+    j2 = session.get("j2_state") or {}
+    pipeline = j2.get("pipeline") or {}
+    pipeline_metrics = None
+    if pipeline.get("review"):
+        candidates = j2.get("candidates") or []
+        levels = ("hypothesis", "normal_behavior", "controlled_comparison", "security_effect")
+        claims = [item for item in candidates if item.get("evidence_level", "hypothesis") != "hypothesis"]
+        pipeline_metrics = {**pipeline["review"],
+            "claim_counts": {level: sum(item.get("evidence_level", "hypothesis") == level for item in candidates) for level in levels},
+            "claims_with_available_references": sum(bool(item.get("available_observation_steps"))
+                and not item.get("unavailable_observation_steps") and not item.get("partial") for item in claims),
+            "claims_with_missing_references": sum(not item.get("available_observation_steps")
+                or bool(item.get("unavailable_observation_steps")) or bool(item.get("partial")) for item in claims),
+            "helper_error_count": sum(len(item.get("helper_errors", [])) for item in j2.get("executions", [])),
+            "verified_findings": None, "verification": "model_claims_and_execution_references_only"}
 
     return {
         "run_id": session.get("run_id", run_dir.name),
@@ -95,6 +110,8 @@ def score_run(session: dict, run_dir: Path) -> dict:
         "instrumented": instrumented,
         "steps": steps,
         "evidence": evidence,
+        "execution_output_steps": evidence,
+        "pipeline_metrics": pipeline_metrics,
         "inconclusive": inconclusive,
         "failed": failed,
         "repeats": repeats,
@@ -177,6 +194,8 @@ def print_detail(rows: list[dict], query: str) -> None:
           f"inconclusive={row['inconclusive']}  failed={row['failed']}  repeats={row['repeats']}  "
           f"compactions={row['compactions']}  duration={row['duration_s']}s")
     print("-" * 80)
+    if row.get("pipeline_metrics"):
+        print("pipeline (claims are unverified):", json.dumps(row["pipeline_metrics"], ensure_ascii=False))
     for f in session.get("findings") or []:
         flag = "EV" if f.get("evidence") else ("!!" if f.get("status") in ("error", "timeout") else "..")
         rep = f"  <repeat of step {f['repeat_of']}>" if f.get("repeat_of") else ""

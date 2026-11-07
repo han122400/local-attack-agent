@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from code_checks import check_generated_code
 from command_runtime import WORKER_SOURCE
 from browser_http import BrowserHTTP
+from web_discovery import analyze_response
 
 
 class FixturePage:
@@ -45,11 +46,12 @@ class FixturePage:
 
 def worker_helpers(page):
     tree = ast.parse(WORKER_SOURCE)
-    names = {"get_text", "get_json", "http_get", "goto_and_render", "list_inputs", "submit_input", "compare_inputs"}
-    nodes = [node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name in names]
+    names = {"get_text", "get_json", "http_get", "goto_and_render", "list_inputs", "submit_input", "compare_inputs", "discover_inputs"}
+    nodes = [node for node in ast.walk(tree) if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name in names]
     nodes += [node for node in ast.walk(tree) if isinstance(node, ast.Assign)
               and any(isinstance(t, ast.Name) and t.id == "helpers" for t in node.targets)]
     namespace = {"page": page, "target_origin": "http://127.0.0.1:3000",
+                 "target": "http://127.0.0.1:3000", "analyze_response": analyze_response,
                  "http": BrowserHTTP(SimpleNamespace(), "http://127.0.0.1:3000")}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "worker_helpers", "exec"), namespace)
     return namespace["helpers"]

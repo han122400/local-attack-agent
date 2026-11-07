@@ -9,6 +9,7 @@ from dataclasses import replace
 import httpx2 as httpx
 
 from j1_policy import pack_j1_context
+from j2_policy import pack_j2_context
 from model_settings import validate_model_settings
 from model_providers import OpenRouterError, is_openrouter, openrouter_stream, strip_tool_call_framing
 from planning import (COMMAND_SCHEMA, SYSTEM_PROMPT, SYSTEM_PROMPT_SHA256, SYSTEM_PROMPT_VERSION,
@@ -82,20 +83,23 @@ class Harness:
             raise ValueError("Harness belongs to another run")
         selected = validate_model_settings(settings)
         j1_budget = int(selected["options"].get("num_ctx", 8192) * 3.3 * 0.65) - len(self.system_prompt)
-        if self.system_prompt_version == "J1":
+        pack_context = pack_j2_context if self.system_prompt_version == "J2" else pack_j1_context
+        if self.system_prompt_version in {"J1", "J2"}:
             try:
-                context = pack_j1_context(context, j1_budget)
+                context = pack_context(context, j1_budget)
             except ValueError as exc:
                 raise ModelFailure("context", str(exc)) from exc
         report_only = self.report_reserve > 0 and bool(context.get("remaining", {}).get("finish_soon"))
         call_limit = (min(self.max_calls, self.calls + self.report_reserve) if report_only
                       else self.max_calls - self.report_reserve)
+        schema = (next(branch for branch in COMMAND_SCHEMA["oneOf"]
+                       if branch["properties"]["action"]["const"] == "finish") if report_only else COMMAND_SCHEMA)
         options = dict(selected["options"])
         # Persist a raised output budget across steps: once a length-truncation forced num_predict up,
         # keep at least that floor so later steps do not truncate at the original cap again.
         if self.output_num_predict_floor is not None and options.get("num_predict", -1) != -1:
             options["num_predict"] = max(int(options.get("num_predict", 0)), self.output_num_predict_floor)
-        payload = {"model": model, "stream": True, "format": COMMAND_SCHEMA,
+        payload = {"model": model, "stream": True, "format": schema,
                    "options": options,
                    "messages": [{"role": "system", "content": self.system_prompt},
                                 {"role": "user", "content": json.dumps(context, ensure_ascii=False)}]}
@@ -125,6 +129,7 @@ class Harness:
             thinking: list[str] = []
             completion: dict = {}
             raw = ""
+            command = None
             try:
                 for chunk in self.transport(payload):
                     if self.stop_requested():
@@ -177,7 +182,7 @@ class Harness:
                     if normalized_fields:
                         self.log.append("command_normalized", {"call_id": call_id, "action": answer.get("action"),
                                                                "fields": normalized_fields})
-                    command = validate_command(answer)
+                    command = replace(validate_command(answer), call_id=call_id)
                     if report_only and command.action != "finish":
                         raise ValueError("Report reserve is active: return action finish; do not execute more tools")
                     if self.command_guard is not None:
@@ -218,11 +223,16 @@ class Harness:
                                   "read_file uses path. Every action including finish requires nonempty plan and reason. "
                                   "Unused path/content/command/code fields must be empty strings. "
                                   "Produce one small step with concise code, without explanatory comments.")
-                if self.system_prompt_version == "J1":
+                if self.system_prompt_version in {"J1", "J2"}:
                     previous = raw[:500] + ("\n[invalid output preview]" if len(raw) > 500 else "")
+                    if self.system_prompt_version == "J2" and command is not None and command.code:
+                        code = command.code
+                        previous = json.dumps({"action": command.action, "code_preview":
+                            code if len(code) <= 400 else code[:200] + "\n[middle omitted; source saved]\n" + code[-200:]},
+                            ensure_ascii=False)
                     retry_feedback = [{"role": "assistant", "content": previous}, {"role": "user", "content": feedback}]
                     try:
-                        context = pack_j1_context(context, j1_budget - sum(len(m["content"]) for m in retry_feedback))
+                        context = pack_context(context, j1_budget - sum(len(m["content"]) for m in retry_feedback))
                     except ValueError as error:
                         raise ModelFailure("context", str(error), call_id) from error
                     messages = [payload["messages"][0], {"role": "user", "content": json.dumps(context, ensure_ascii=False)}, *retry_feedback]

@@ -1,0 +1,43 @@
+{
+  "scope": "Offline preservation and regression probes; no browser, target, live model, or vulnerability-success measurement.",
+  "runtime": {
+    "before": {
+      "file_end_retained": false,
+      "file_truncation_visible": false,
+      "stream_end_retained": false,
+      "stream_chars": 65536,
+      "complete_stream_in_log": true
+    },
+    "after": {
+      "file_end_retained": true,
+      "file_truncation_visible": true,
+      "stream_end_retained": true,
+      "stream_chars": 65536,
+      "complete_stream_in_log": true
+    }
+  },
+  "archived_sync_helper_errors": [
+    {
+      "run": "193369e7fe0a43d089327e9ad8da5742",
+      "exec": "EXEC-0003",
+      "before_caught": false,
+      "after_caught": true
+    },
+    {
+      "run": "193369e7fe0a43d089327e9ad8da5742",
+      "exec": "EXEC-0023",
+      "before_caught": false,
+      "after_caught": true
+    }
+  ],
+  "evaluation": {
+    "before": {
+      "distinct_sent_policy_prompts": 1,
+      "reported_hashes_match_sent_prompts": false
+    },
+    "after": {
+      "distinct_sent_policy_prompts": 2,
+      "reported_hashes_match_sent_prompts": true
+    }
+  }
+}

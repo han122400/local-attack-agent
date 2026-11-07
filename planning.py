@@ -97,12 +97,19 @@ class Command:
 def normalize_command_inputs(answer: object) -> tuple[object, list[str]]:
     """Remove only unambiguous payload noise before applying the strict contract.
 
-    Never choose between conflicting payloads or move text into a required field.
+    A misplaced finish report is retained in reason; executable payloads are never mixed.
     Paths retain their exact semantics and are not repaired here.
     """
     if not isinstance(answer, dict):
         return answer, []
     normalized = dict(answer)
+    if (answer.get("action") == "finish" and isinstance(answer.get("content"), str)
+            and answer["content"].strip() and isinstance(answer.get("reason"), str)
+            and all(answer.get(key, "") == "" for key in ("path", "command", "code"))):
+        normalized["reason"] = (answer["content"] if answer["reason"] == answer["content"] else
+                                "\n\n".join(text for text in (answer["reason"], answer["content"]) if text.strip()))
+        normalized["content"] = ""
+        return normalized, ["content_to_reason"]
     active = {"write_file": "content", "run_command": "command", "run_python": "code"}.get(answer.get("action"))
     chosen = answer.get(active) if active else None
     fields = []

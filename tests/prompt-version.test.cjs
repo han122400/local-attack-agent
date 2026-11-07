@@ -35,6 +35,13 @@ test('J1 is selectable without changing the v2 default',async()=>{
   assert.equal(select.value,'J1');
 });
 
+test('J2 can be restored and incomplete investigations have a Korean label',async()=>{
+  const {context,select}=dashboard(async()=>({ok:true,json:async()=>({versions:['J1','J2','v4'],default:'v4'})}));
+  await context.loadPrompts('J2');
+  assert.equal(select.value,'J2');
+  assert.equal(vm.runInContext('statusText("incomplete")',context),'조사 미완료');
+});
+
 test('a failed prompt request is explained instead of silently showing 기본값',async()=>{
   const {context,hint}=dashboard(async()=>({ok:false,status:404,json:async()=>({detail:'Not Found'})}));
   await context.loadPrompts();

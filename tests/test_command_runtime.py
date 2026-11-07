@@ -56,6 +56,28 @@ class RuntimeTests(unittest.TestCase):
         result = self.runtime.run(RUN_ID, {"action": "read_file", "path": "work/link.txt"})
         self.assertNotEqual(result.exit_code, 0)
 
+    def test_large_file_preview_keeps_the_end_and_marks_missing_middle(self):
+        source = "BEGIN\n" + "x" * 100000 + "\nFINAL-OBSERVATION"
+        (self.runtime.runtime_dir / "work/large.txt").write_text(source, encoding="utf-8")
+        result = self.runtime.run(RUN_ID, {"action": "read_file", "path": "work/large.txt"})
+        self.assertTrue(result.output_truncated)
+        self.assertTrue(result.stdout.startswith("BEGIN\n"))
+        self.assertTrue(result.stdout.endswith("FINAL-OBSERVATION"))
+        self.assertLessEqual(len(result.stdout), 65536)
+        self.assertEqual((self.runtime.runtime_dir / "work/large.txt").read_text(), source)
+
+    def test_stream_overflow_retains_latest_result_and_full_log(self):
+        chunks = ["BEGIN\n" + "x" * 65000, "y" * 10000, "z" * 10000 + "\nFINAL-OBSERVATION"]
+        for chunk in chunks:
+            self.runtime._add_output("EXEC-test", "stdout", chunk)
+        output = self.runtime._output["EXEC-test"]
+        self.assertTrue(output["truncated"])
+        self.assertTrue(output["stdout"].startswith("BEGIN\n"))
+        self.assertTrue(output["stdout"].endswith("FINAL-OBSERVATION"))
+        self.assertLessEqual(len(output["stdout"]), 65536)
+        logged = [event["text"] for event in self.log.read_events() if event["kind"] == "exec_output"]
+        self.assertEqual("".join(logged), "".join(chunks))
+
     def test_timeout_stops_command_and_children(self):
         result = self.runtime.run(RUN_ID, {"action": "run_command", "command": "ping -n 10 127.0.0.1 > NUL"}, timeout=0.2)
         self.assertTrue(result.timed_out)
@@ -118,7 +140,12 @@ class RuntimeTests(unittest.TestCase):
         blocks = [{"url": "https://outside.invalid/", "method": "GET", "reason": "outside_target_origin"}]
         templates = [{"id": "REQ-0001", "url": "http://127.0.0.1:3000/form", "method": "POST", "fields": ["q"], "step": "EXEC-0001"}]
         reply = {"type": "result", "exec_id": "EXEC-0001", "exit_code": 1, "exception": "after request",
-                 "blocked_requests": blocks, "request_templates": templates}
+                 "blocked_requests": blocks, "request_templates": templates,
+                 "investigation_notes": [{"name": "search", "state": "open"}],
+                 "discovery_summaries": [{"source_url": "http://127.0.0.1:3000/", "assets": []}],
+                 "helper_errors": [{"helper": "goto_and_render", "error_type": "TimeoutError", "url": "http://127.0.0.1:3000/"}],
+                 "helper_outcomes": [{"helper": "goto_and_render", "outcome": "completed", "url": "http://127.0.0.1:3000/"}],
+                 "http_observations": [{"url": "http://127.0.0.1:3000/search", "method": "GET", "status": 200}]}
         self.runtime._browser_enabled = True
         with patch.object(self.runtime, "_worker", SimpleNamespace(poll=lambda: None)), \
              patch.object(self.runtime, "_send_control"), patch.object(self.runtime, "_wait_control", return_value=reply), \
@@ -126,9 +153,18 @@ class RuntimeTests(unittest.TestCase):
             result = self.runtime.run(RUN_ID, {"action": "run_python", "code": "print('observed')"})
         self.assertEqual(result.blocked_requests, blocks)
         self.assertEqual(result.request_templates, templates)
+        self.assertEqual(result.investigation_notes, [{"name": "search", "state": "open"}])
+        self.assertEqual(result.http_observations[0]["status"], 200)
+        self.assertEqual(result.discovery_summaries, reply["discovery_summaries"])
+        self.assertEqual(result.helper_errors, reply["helper_errors"])
         finished = next(event for event in self.log.read_events() if event["kind"] == "exec_finished")
         self.assertEqual(finished["blocked_requests"], blocks)
         self.assertEqual(finished["request_templates"], templates)
+        self.assertEqual(finished["investigation_notes"], result.investigation_notes)
+        self.assertEqual(finished["http_observations"], result.http_observations)
+        self.assertEqual(finished["discovery_summaries"], result.discovery_summaries)
+        self.assertEqual(finished["helper_errors"], result.helper_errors)
+        self.assertEqual(finished["helper_outcomes"], reply["helper_outcomes"])
 
     def test_lost_worker_connection_expires_request_templates(self):
         self.runtime._browser_enabled = True

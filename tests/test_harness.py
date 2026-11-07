@@ -100,6 +100,25 @@ class HarnessTests(unittest.TestCase):
                 validate_command(answer)
             log.close()
 
+    def test_final_report_in_content_is_preserved_without_an_extra_call(self):
+        with tempfile.TemporaryDirectory() as folder:
+            log = SessionLog(Path(folder), RUN_ID, {})
+            self.addCleanup(log.close)
+            answer = {"action": "finish", "plan": "보고", "reason": "범위와 한계 요약",
+                "path": "", "content": "## 최종 보고서\n일부 요청은 실행되지 않아 미평가 상태다.", "command": "", "code": ""}
+            def transport(payload):
+                schema = payload["format"]["properties"]
+                self.assertEqual(schema["action"]["const"], "finish")
+                self.assertTrue(all(schema[key]["const"] == "" for key in ("path", "content", "command", "code")))
+                yield {"message": {"content": json.dumps(answer)}, "done": True}
+            harness = Harness(log, transport=transport, max_calls=1, report_reserve=1)
+            command = harness.decide(RUN_ID, {"remaining": {"finish_soon": True}}, model="fixture", settings={})
+            self.assertEqual(command.action, "finish")
+            self.assertIn(answer["content"], command.reason)
+            self.assertIn(answer["reason"], command.reason)
+            self.assertEqual(command.content, "")
+            self.assertEqual(harness.calls, 1)
+
     def test_conflicting_or_merely_similar_unused_payloads_still_fail(self):
         for extra in ("print('different')", "print(1) "):
             with self.subTest(extra=extra), tempfile.TemporaryDirectory() as temp:

@@ -13,10 +13,14 @@ from urllib.parse import quote_plus, unquote_plus, urlsplit, urlunsplit
 
 
 class BrowserHTTP:
-    def __init__(self, context, target):
+    def __init__(self, context, target, *, body_limit=2000):
+        if type(body_limit) is not int or not 1 <= body_limit <= 2_000_000:
+            raise ValueError("body_limit must be between 1 and 2000000 characters")
+        self.body_limit = body_limit
         self.context = context
         self.origin = self._origin(target)
         self.blocked_requests = []
+        self.http_observations = []
         self._requests = {}
         self._counter = 0
         self._request_prefix = uuid.uuid4().hex[:12]
@@ -43,6 +47,15 @@ class BrowserHTTP:
     def begin_step(self, step):
         self.step = step
         self.blocked_requests = []
+        self.http_observations = []
+
+    def record_response(self, response, method="GET"):
+        url = self._public_url(response.url)
+        item = {"url": url[:240], "method": method, "status": response.status}
+        if len(url) > 240:
+            item["url_truncated"] = True
+        self.http_observations.append(item)
+        self.http_observations = self.http_observations[-16:]
 
     def _block_reason(self, url, method):
         if (not isinstance(url, str) or not url or "\\" in url
@@ -278,14 +291,14 @@ class BrowserHTTP:
                    and not k.startswith(":")}
         response = await self.context.request.fetch(item["url"], method=item["method"], headers=headers,
                                                     data=body, max_redirects=0)
-        return await self._observation(response)
+        return await self._observation(response, method=item["method"])
 
     async def http_get(self, url):
         self._check(url, "GET")
         return await self._observation(await self.context.request.get(url, max_redirects=0))
 
-    @staticmethod
-    async def _observation(response):
+    async def _observation(self, response, *, method="GET"):
+        self.record_response(response, method)
         raw = await response.body()
         headers = {k.lower(): v for k, v in response.headers.items()}
         for name in {"authorization", "proxy-authorization", "set-cookie"} & headers.keys():
@@ -304,7 +317,7 @@ class BrowserHTTP:
                 body = raw.decode("utf-8", errors="replace")
         result = {"url": response.url, "status": response.status, "ok": response.ok, "headers": headers,
                   "content_type": content_type, "length": len(body) if textual else len(raw), "byte_length": len(raw),
-                  "body": body[:2000], "body_truncated": len(body) > 2000, "binary": not textual}
+                  "body": body[:self.body_limit], "body_truncated": len(body) > self.body_limit, "binary": not textual}
         if "json" in media_type:
             try:
                 result["json"] = json.loads(body)

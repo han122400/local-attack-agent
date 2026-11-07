@@ -1,0 +1,89 @@
+{
+  "scope": "deterministic metadata ablation with the same fixture selector; not an old-commit benchmark, model comparison, security validation or measured discovery gain",
+  "results": [
+    {
+      "mode": "references_only_ablation",
+      "expected_resources": 2,
+      "analyzed_expected_resources": 1,
+      "missed_expected_resources": 1,
+      "redundant_analyses": 5,
+      "unsupported_completion_claims": 0,
+      "invalid_actions": 0,
+      "finished": false,
+      "decision_calls": 6,
+      "external_requests": 0,
+      "trace": [
+        {
+          "action": "analyze",
+          "url": "https://fixture.invalid/alpha.87ab.js"
+        },
+        {
+          "action": "analyze",
+          "url": "https://fixture.invalid/alpha.87ab.js"
+        },
+        {
+          "action": "analyze",
+          "url": "https://fixture.invalid/alpha.87ab.js"
+        },
+        {
+          "action": "analyze",
+          "url": "https://fixture.invalid/alpha.87ab.js"
+        },
+        {
+          "action": "analyze",
+          "url": "https://fixture.invalid/alpha.87ab.js"
+        },
+        {
+          "action": "analyze",
+          "url": "https://fixture.invalid/alpha.87ab.js"
+        }
+      ],
+      "finish_review": {
+        "declared_resources": 2,
+        "response_metadata_resources": 0,
+        "analyzed_resources": 1,
+        "unreviewed_resources": 1,
+        "limited_analyses": 0,
+        "failure_groups": 0,
+        "preflight_rejections": 0,
+        "must_visit_all": false
+      }
+    },
+    {
+      "mode": "progress",
+      "expected_resources": 2,
+      "analyzed_expected_resources": 2,
+      "missed_expected_resources": 0,
+      "redundant_analyses": 0,
+      "unsupported_completion_claims": 0,
+      "invalid_actions": 0,
+      "finished": true,
+      "decision_calls": 3,
+      "external_requests": 0,
+      "trace": [
+        {
+          "action": "analyze",
+          "url": "https://fixture.invalid/alpha.87ab.js"
+        },
+        {
+          "action": "analyze",
+          "url": "https://fixture.invalid/beta.6def.js"
+        },
+        {
+          "action": "finish",
+          "claims_complete": true
+        }
+      ],
+      "finish_review": {
+        "declared_resources": 2,
+        "response_metadata_resources": 0,
+        "analyzed_resources": 2,
+        "unreviewed_resources": 0,
+        "limited_analyses": 0,
+        "failure_groups": 0,
+        "preflight_rejections": 0,
+        "must_visit_all": false
+      }
+    }
+  ]
+}

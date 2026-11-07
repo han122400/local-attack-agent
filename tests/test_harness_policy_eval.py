@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import hashlib
 import json
 import sys
 import tempfile
@@ -15,11 +16,46 @@ from session_log import SessionLog
 
 
 class PolicyEvaluationTests(unittest.TestCase):
+    def test_policy_prompt_and_recorded_hash_match_the_actual_model_request(self):
+        sent = []
+        def transport(payload):
+            sent.append(payload["messages"][0]["content"])
+            yield {"message": {"content": json.dumps({"action": "finish", "plan": "report", "reason": "no fixture read",
+                "path": "", "content": "", "command": "", "code": ""})}, "done": True}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "result.json"
+            arguments = ["eval", "--model", "fixture", "--policies", "original,case_finish", "--output", str(output)]
+            with patch.object(sys, "argv", arguments), patch("harness._model_stream", transport), contextlib.redirect_stdout(io.StringIO()):
+                main()
+            rows = json.loads(output.read_text())["results"]
+        self.assertNotEqual(sent[0], sent[1])
+        for row, prompt in zip(rows, sent):
+            self.assertEqual(row["system_prompt_sha256"], hashlib.sha256(prompt.encode("utf-8")).hexdigest())
+
     def reader(self, context):
         current = context["current"]
         if current["complete"]:
             return Command("finish", "done", "case reviewed")
         return Command("read_file", "read fixture", "follow next reference", path=current["next_file"])
+
+    def test_cli_can_measure_j2_without_sending_the_default_prompt(self):
+        from planning import load_prompt
+        sent = []
+        def transport(payload):
+            sent.append(payload["messages"][0]["content"])
+            command = self.reader(json.loads(payload["messages"][1]["content"]))
+            yield {"message": {"content": json.dumps({**command.runtime_payload(), "plan": command.plan,
+                                                      "reason": command.reason})}, "done": True}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "result.json"
+            arguments = ["eval", "--model", "fixture", "--prompt-version", "J2", "--policies", "case_finish",
+                         "--max-calls", "4", "--output", str(output)]
+            with patch.object(sys, "argv", arguments), patch("harness._model_stream", transport), contextlib.redirect_stdout(io.StringIO()):
+                main()
+            report = json.loads(output.read_text())
+        self.assertEqual(report["prompt_version"], "J2")
+        self.assertTrue(all(prompt.startswith(load_prompt("J2")[0]) for prompt in sent))
+        self.assertEqual(report["results"][0]["completed_tasks"], 2)
 
     def test_three_step_rule_can_abandon_a_solvable_four_step_case(self):
         original = evaluate(CASES["four_step_setup"], "original", self.reader)
