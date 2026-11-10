@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import a5_benchmark
+from tools import a5_benchmark
 import engine.command_runtime as command_runtime
 import engine.model_providers as model_providers
 import engine.planning as planning

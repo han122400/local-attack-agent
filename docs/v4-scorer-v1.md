@@ -68,4 +68,4 @@
 
 ## 연결 확인 CLI
 
-`python check_v4_scorer.py`는 합성 JSON만 출력한다. `--live`를 명시해야 POST 1회를 수행한다. `--env-file <프로젝트 .env 경로>`로 기존 키를 메모리에서만 읽을 수 있다. 키 내용은 명령 인자로 넘기지 않는다. 각 호출은 별도 proof를 만들고 기존 성공 기록을 덮어쓰지 않는다. A4에서 실제 `/api/start` 연결을 추가했으며 사용법은 [실행 계약](v4-execution-v1.md)을 따른다.
+`python -m tools.check_v4_scorer`는 합성 JSON만 출력한다. `--live`를 명시해야 POST 1회를 수행한다. `--env-file <프로젝트 .env 경로>`로 기존 키를 메모리에서만 읽을 수 있다. 키 내용은 명령 인자로 넘기지 않는다. 각 호출은 별도 proof를 만들고 기존 성공 기록을 덮어쓰지 않는다. A4에서 실제 `/api/start` 연결을 추가했으며 사용법은 [실행 계약](v4-execution-v1.md)을 따른다.

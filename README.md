@@ -81,9 +81,10 @@ Thinking과 Temperature는 모델이 지원할 때만 적용합니다. 컨텍스
 - `app.py`: 대시보드 실행 진입점
 - `web/app.py`: FastAPI API와 실행 관리
 - `orchestrator.py`: 브라우저 관찰, LLM 계획 실행, 가설 실험 및 응답 비교
-- `model_providers.py`: OpenRouter 모델 목록, 설정 변환 및 스트리밍 어댑터
-- `planning.py`: 계획 스키마, 모델 지시문, 결정 검증
-- `lab.py`: 로컬 Juice Shop 컨테이너 상태 확인과 시작
+- `engine/model_providers.py`: OpenRouter 모델 목록, 설정 변환 및 스트리밍 어댑터
+- `engine/planning.py`: 계획 스키마, 모델 지시문, 결정 검증
+- `engine/lab.py`: 로컬 Juice Shop 컨테이너 상태 확인과 시작
+- `tools/`: 벤치마크와 점검 명령
 - `web/static/`: 대시보드
 - `tests/`: 테스트
 - `Version/`: v1·v2 설계 문서

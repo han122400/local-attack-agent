@@ -25,9 +25,9 @@ v3의 브라우저는 에이전트가 대상 상태를 읽는 실행 도구다. 
 ## 실행
 
 ```powershell
-python a5_benchmark.py
-python a5_benchmark.py --execute --exclusive-lab --env-file 'C:\Users\vinny\Desktop\personal_project\Local attack agent\.env'
-python a5_benchmark.py --config benchmarks/a5-guided-v1.json --execute --exclusive-lab --env-file 'C:\Users\vinny\Desktop\personal_project\Local attack agent\.env'
+python -m tools.a5_benchmark
+python -m tools.a5_benchmark --execute --exclusive-lab --env-file 'C:\Users\vinny\Desktop\personal_project\Local attack agent\.env'
+python -m tools.a5_benchmark --config benchmarks/a5-guided-v1.json --execute --exclusive-lab --env-file 'C:\Users\vinny\Desktop\personal_project\Local attack agent\.env'
 ```
 
 첫 명령은 네트워크·브라우저·컨테이너에 손대지 않는 설정 확인이다. 두 번째 명령은 실제 실습을 실행하고 `runs/a5_pairs/<pair_id>.json`과 각 `runs/<run_id>/`에 근거를 남긴다. 실습 컨테이너를 다른 작업이 사용 중이면 `--exclusive-lab`을 주지 않는다. 중단/정리 실패 시 쌍을 완료로 표시하지 않고 기존 run의 복구 절차를 먼저 따른다. API·대시보드의 v3/v4 방식 선택 UI는 B 단계다.

@@ -4,7 +4,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-import check_v4_discovery as checker
+from tools import check_v4_discovery as checker
 import test_v4_loop as fixtures
 from test_scorer_session import FakeAdapter
 

@@ -5,8 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import a5_benchmark
-from a5_benchmark import (CONFIG_PATH, config_digest, final_observation,
+from tools import a5_benchmark
+from tools.a5_benchmark import (CONFIG_PATH, config_digest, final_observation,
                           summarize_run, validate_config)
 from engine.planning import load_prompt
 
@@ -27,10 +27,10 @@ class A5BenchmarkTests(unittest.TestCase):
                 "State": {"Running": True, "StartedAt": "epoch"},
                 "NetworkSettings": {"Ports": {"3000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "3000"}]}},
                 "Id": "container", "Image": "sha256:image"}
-        with patch("a5_benchmark._docker", return_value=subprocess.CompletedProcess([], 0, json.dumps([info]), "")):
+        with patch("tools.a5_benchmark._docker", return_value=subprocess.CompletedProcess([], 0, json.dumps([info]), "")):
             self.assertEqual(a5_benchmark.lab_identity()["container_id"], "container")
         info["Config"]["Image"] = "other"
-        with patch("a5_benchmark._docker", return_value=subprocess.CompletedProcess([], 0, json.dumps([info]), "")):
+        with patch("tools.a5_benchmark._docker", return_value=subprocess.CompletedProcess([], 0, json.dumps([info]), "")):
             with self.assertRaisesRegex(RuntimeError, "identity unavailable"):
                 a5_benchmark.lab_identity()
 
