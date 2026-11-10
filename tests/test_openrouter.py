@@ -9,7 +9,7 @@ from unittest.mock import patch
 import httpx2 as httpx
 from fastapi import HTTPException
 
-import app
+from web import app
 import engine.lab as lab
 import engine.model_providers as providers
 from engine.command_runtime import CommandRuntime

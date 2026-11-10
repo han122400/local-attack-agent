@@ -8,7 +8,7 @@ import psutil
 
 from fastapi.testclient import TestClient
 
-import app as dashboard
+from web import app as dashboard
 
 
 @unittest.skipUnless(os.environ.get("V3_REAL_OLLAMA") == "1", "requires local Ollama and juice-lab")

@@ -1,6 +1,6 @@
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
-const settings=require('../static/model-settings-config.js');
+const settings=require('../web/static/model-settings-config.js');
 
 test('OpenRouter uses remote labels, model limits and provider sampling defaults',()=>{
   const config=settings.describe('openrouter',{context_length:131072,max_completion_tokens:8192,supported_parameters:['reasoning','temperature']});

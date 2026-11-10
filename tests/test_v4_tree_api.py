@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-import app
+from web import app
 from engine.session_log import SessionStore
 from engine.tree import TreeStore
 from test_v4_tree import surface

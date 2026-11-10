@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-import app
+from web import app
 from orchestrator import ExplorerV3
 from engine.session_log import SessionStore
 

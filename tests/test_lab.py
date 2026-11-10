@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-import app
+from web import app
 import engine.lab as lab
 
 
@@ -87,21 +87,21 @@ class LabRouteTests(unittest.TestCase):
 
     def test_status_route_and_local_start(self):
         state = {"status": "stopped", "can_start": True}
-        with patch("app.get_lab_status", return_value=state):
+        with patch("web.app.get_lab_status", return_value=state):
             response = self.client.get("/api/lab")
             self.assertEqual(response.json(), state)
             self.assertEqual(response.headers["cache-control"], "no-store")
-        with patch("app.start_lab", return_value={"status": "starting"}) as start:
+        with patch("web.app.start_lab", return_value={"status": "starting"}) as start:
             response = self.client.post("/api/lab/start", headers={"Origin": "http://127.0.0.1:8765"})
             self.assertEqual(response.status_code, 200)
             start.assert_called_once_with()
 
     def test_cross_site_start_is_blocked_and_errors_are_returned(self):
-        with patch("app.start_lab") as start:
+        with patch("web.app.start_lab") as start:
             response = self.client.post("/api/lab/start", headers={"Origin": "https://example.com"})
             self.assertEqual(response.status_code, 403)
             start.assert_not_called()
-        with patch("app.start_lab", side_effect=RuntimeError("Docker 연결 안 됨")):
+        with patch("web.app.start_lab", side_effect=RuntimeError("Docker 연결 안 됨")):
             response = self.client.post("/api/lab/start")
             self.assertEqual(response.status_code, 503)
             self.assertEqual(response.json()["detail"], "Docker 연결 안 됨")

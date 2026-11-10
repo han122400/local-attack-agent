@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-import app
+from web import app
 from orchestrator import ExplorerV3
 from engine.session_log import SessionStore
 
@@ -41,8 +41,8 @@ class V4PreparationTests(unittest.TestCase):
         self.explorer.lease.release()
 
     def _prepare(self):
-        with patch("app.get_openrouter_models", side_effect=AssertionError("No model catalog in A2")), \
-             patch("app.get_ollama_models", side_effect=AssertionError("No model catalog in A2")):
+        with patch("web.app.get_openrouter_models", side_effect=AssertionError("No model catalog in A2")), \
+             patch("web.app.get_ollama_models", side_effect=AssertionError("No model catalog in A2")):
             response = self.client.post("/api/v4/prepare", json=self.body)
         self.assertEqual(response.status_code, 201, response.text)
         return response.json()["run_id"]
@@ -67,7 +67,7 @@ class V4PreparationTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/runs").json()["runs"][0]["experiment_mode"], "v4")
 
     def test_start_cannot_run_v3_with_a_v4_label(self):
-        with patch("app.get_ollama_models", side_effect=AssertionError("Reject before model lookup")):
+        with patch("web.app.get_ollama_models", side_effect=AssertionError("Reject before model lookup")):
             response = self.client.post("/api/start", json={**self.body, "prompt_version": "v3"})
         self.assertEqual(response.status_code, 400, response.text)
         self.assertEqual(SessionStore(self.root).list_runs(), [])

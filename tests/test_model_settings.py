@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi import HTTPException
 from starlette.requests import Request
 
-import app
+from web import app
 from orchestrator import ExplorerV3
 from engine.harness import Harness, ModelFailure
 from engine.session_log import SessionLog, SessionStore
@@ -17,7 +17,7 @@ from engine.session_log import SessionLog, SessionStore
 def start_request(body):
     request = Request({"type": "http", "headers": [(b"content-type", b"application/json")]})
     request._json = body
-    with patch("app.run_in_threadpool", AsyncMock(side_effect=lambda function, *args: function(*args))):
+    with patch("web.app.run_in_threadpool", AsyncMock(side_effect=lambda function, *args: function(*args))):
         coroutine = app.start(request)
         try:
             coroutine.send(None)
@@ -31,7 +31,7 @@ def start_request(body):
 class ModelSettingsTests(unittest.TestCase):
     def test_custom_settings_reach_the_run_from_start_api(self):
         settings = {"think": True, "keep_alive": "10m", "options": {"temperature": 0.7, "num_ctx": 16384, "num_predict": 2048, "top_k": 20}}
-        with patch("app.get_ollama_models", return_value=[{"name": "qwen3.5:9b"}]), patch.object(app.EXPLORER, "start", return_value="a" * 32) as start:
+        with patch("web.app.get_ollama_models", return_value=[{"name": "qwen3.5:9b"}]), patch.object(app.EXPLORER, "start", return_value="a" * 32) as start:
             self.assertEqual(start_request({"goal": "inspect", "model": "qwen3.5:9b", "model_settings": settings})["run_id"], "a" * 32)
         self.assertEqual(start.call_args.kwargs.get("model_settings"), settings)
 
@@ -41,7 +41,7 @@ class ModelSettingsTests(unittest.TestCase):
                    {"options": {"num_ctx": True}}, {"options": {"num_predict": 0}},
                    {"options": {"num_ctx": 999999999}}, {"options": {"unknown": 1}}]
         for settings in invalid:
-            with self.subTest(settings=settings), patch("app.get_ollama_models", return_value=[{"name": app.MODEL}]), patch.object(app.EXPLORER, "start") as start:
+            with self.subTest(settings=settings), patch("web.app.get_ollama_models", return_value=[{"name": app.MODEL}]), patch.object(app.EXPLORER, "start") as start:
                 with self.assertRaises(HTTPException) as error:
                     start_request({"goal": "inspect", "model_settings": settings})
                 self.assertEqual(error.exception.status_code, 400)
@@ -91,7 +91,7 @@ class ModelSettingsTests(unittest.TestCase):
     def test_model_details_include_actual_capabilities_without_loading_weights(self):
         show = {"capabilities": ["completion", "thinking"], "thinking": {"values": [False, True], "default": True},
                 "model_info": {"qwen35.context_length": 262144}, "parameters": "temperature 1\ntop_k 20", "details": {"family": "qwen35"}}
-        with patch("app.get_ollama_models", return_value=[{"name": "qwen3.5:9b"}]), patch("app.urlopen", return_value=io.BytesIO(json.dumps(show).encode())) as opened:
+        with patch("web.app.get_ollama_models", return_value=[{"name": "qwen3.5:9b"}]), patch("web.app.urlopen", return_value=io.BytesIO(json.dumps(show).encode())) as opened:
             response = app.ollama_model_details("qwen3.5:9b")
         body = json.loads(response.body)
         self.assertEqual(body["thinking"], show["thinking"])

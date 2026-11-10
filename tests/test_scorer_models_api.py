@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-import app
+from web import app
 
 
 class ScorerModelsApiTests(unittest.TestCase):

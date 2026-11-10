@@ -10,7 +10,7 @@ from urllib.error import URLError
 from fastapi import HTTPException
 from starlette.requests import Request
 
-import app
+from web import app
 import orchestrator as explorer_module
 from engine.harness import Harness
 from engine.session_log import SessionLog, SessionStore
@@ -24,7 +24,7 @@ class ModelRouteTests(unittest.TestCase):
         request = Request({"type": "http", "headers": headers})
         request._json = body
         # Exercise the route without Windows' socket-backed event loop.
-        with patch("app.run_in_threadpool", AsyncMock(side_effect=lambda function: function()), create=True):
+        with patch("web.app.run_in_threadpool", AsyncMock(side_effect=lambda function: function()), create=True):
             coroutine = app.start(request)
             try:
                 coroutine.send(None)
@@ -36,7 +36,7 @@ class ModelRouteTests(unittest.TestCase):
 
     def test_installed_models_are_loaded_from_local_ollama(self):
         payload = {"models": [{"name": "qwen3.5:2b", "size": 2000}, {"name": "other:7b", "size": 7000}]}
-        with patch("app.urlopen", return_value=io.BytesIO(json.dumps(payload).encode())) as opened:
+        with patch("web.app.urlopen", return_value=io.BytesIO(json.dumps(payload).encode())) as opened:
             response = app.ollama_models()
         self.assertEqual(json.loads(response.body)["models"], payload["models"])
         self.assertEqual(json.loads(response.body)["default_model"], app.MODEL)
@@ -44,10 +44,10 @@ class ModelRouteTests(unittest.TestCase):
         self.assertEqual(opened.call_args.args[0], "http://127.0.0.1:11434/api/tags")
 
     def test_empty_list_and_unavailable_ollama_are_distinct(self):
-        with patch("app.urlopen", return_value=io.BytesIO(b'{"models": []}')):
+        with patch("web.app.urlopen", return_value=io.BytesIO(b'{"models": []}')):
             response = app.ollama_models()
             self.assertEqual(json.loads(response.body)["models"], [])
-        with patch("app.urlopen", side_effect=URLError("offline")):
+        with patch("web.app.urlopen", side_effect=URLError("offline")):
             with self.assertRaises(HTTPException) as error:
                 app.ollama_models()
             self.assertEqual(error.exception.status_code, 503)
@@ -55,13 +55,13 @@ class ModelRouteTests(unittest.TestCase):
 
     def test_malformed_model_list_is_reported(self):
         for payload in ([], {"models": None}, {"models": [None]}, {"models": [{"name": ""}]}):
-            with self.subTest(payload=payload), patch("app.urlopen", return_value=io.BytesIO(json.dumps(payload).encode())):
+            with self.subTest(payload=payload), patch("web.app.urlopen", return_value=io.BytesIO(json.dumps(payload).encode())):
                 with self.assertRaises(HTTPException) as error:
                     app.ollama_models()
                 self.assertEqual(error.exception.status_code, 503)
 
     def test_start_passes_installed_model_to_explorer(self):
-        with patch("app.get_ollama_models", return_value=[{"name": "other:7b", "size": 7000}]), patch.object(app.EXPLORER, "start", return_value="a" * 32) as start:
+        with patch("web.app.get_ollama_models", return_value=[{"name": "other:7b", "size": 7000}]), patch.object(app.EXPLORER, "start", return_value="a" * 32) as start:
             response = self.start_request({"target": explorer_module.TARGET, "model": "other:7b", "goal": "inspect"})
         self.assertEqual(response, {"started": True, "run_id": "a" * 32, "run_url": "/runs/" + "a" * 32})
         start.assert_called_once_with(explorer_module.TARGET, "other:7b", goal="inspect", model_settings=None,
@@ -69,14 +69,14 @@ class ModelRouteTests(unittest.TestCase):
 
     def test_start_rejects_unknown_or_invalid_model_before_running(self):
         for model in ("missing:7b", "", None, ["other:7b"]):
-            with self.subTest(model=model), patch("app.get_ollama_models", return_value=[{"name": "other:7b"}]), patch.object(app.EXPLORER, "start") as start:
+            with self.subTest(model=model), patch("web.app.get_ollama_models", return_value=[{"name": "other:7b"}]), patch.object(app.EXPLORER, "start") as start:
                 with self.assertRaises(HTTPException) as error:
                     self.start_request({"goal": "inspect", "model": model})
                 self.assertEqual(error.exception.status_code, 400)
                 start.assert_not_called()
 
     def test_missing_model_uses_default_and_running_run_is_rejected(self):
-        with patch("app.get_ollama_models", return_value=[{"name": app.MODEL}]), patch.object(app.EXPLORER, "start", return_value=False) as start:
+        with patch("web.app.get_ollama_models", return_value=[{"name": app.MODEL}]), patch.object(app.EXPLORER, "start", return_value=False) as start:
             with self.assertRaises(HTTPException) as error:
                 self.start_request({"goal": "inspect"})
         self.assertEqual(error.exception.status_code, 409)
@@ -84,7 +84,7 @@ class ModelRouteTests(unittest.TestCase):
                                       scenario_source="manual", chain_mode="none", budgets=None)
 
     def test_start_reports_unavailable_ollama_and_blocks_cross_site(self):
-        with patch("app.get_ollama_models", side_effect=RuntimeError("Ollama 연결 실패")), patch.object(app.EXPLORER, "start") as start:
+        with patch("web.app.get_ollama_models", side_effect=RuntimeError("Ollama 연결 실패")), patch.object(app.EXPLORER, "start") as start:
             with self.assertRaises(HTTPException) as error:
                 self.start_request({"goal": "inspect", "model": "other:7b"})
             self.assertEqual(error.exception.status_code, 503)

@@ -3,7 +3,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-import app
+from web import app
 
 
 class ScopeTests(unittest.TestCase):
@@ -51,7 +51,7 @@ class ScopeTests(unittest.TestCase):
         fake = io.BytesIO(b"".join(json.dumps({"message": {"content": piece}}).encode() + b"\n" for piece in pieces))
         candidates = [{"url": "http://127.0.0.1:3000/main.js", "kind": "script"}]
         received = []
-        with patch("app.urlopen", return_value=fake) as opened:
+        with patch("web.app.urlopen", return_value=fake) as opened:
             candidate_id, reason, fallback, output = app.choose_with_ollama(candidates, [], 3, on_text=received.append)
         self.assertEqual((candidate_id, reason, fallback), (0, "확인", False))
         self.assertEqual(received, pieces)

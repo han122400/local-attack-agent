@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-import app
+from web import app
 from orchestrator import ExplorerV3
 from engine.session_log import SessionStore
 
@@ -35,7 +35,7 @@ class RunApiTests(unittest.TestCase):
         self.explorer.lease.release()
 
     def test_start_returns_run_id_and_run_scoped_state(self):
-        with patch.object(app, "EXPLORER", self.explorer), patch("app.get_ollama_models", return_value=[{"name": "mock:model"}]):
+        with patch.object(app, "EXPLORER", self.explorer), patch("web.app.get_ollama_models", return_value=[{"name": "mock:model"}]):
             response = self.client.post("/api/start", json={"goal": "inspect catalog", "model": "mock:model",
                                                             "target": "https://my-site.example/catalog",
                                                             "scenario_source": "manual", "chain_mode": "none"})
@@ -53,7 +53,7 @@ class RunApiTests(unittest.TestCase):
             self.assertEqual(self.client.get("/api/runs/" + "f" * 32).status_code, 404)
 
     def test_unsupported_modes_and_wrong_run_controls_are_rejected(self):
-        with patch.object(app, "EXPLORER", self.explorer), patch("app.get_ollama_models", return_value=[{"name": "mock:model"}]):
+        with patch.object(app, "EXPLORER", self.explorer), patch("web.app.get_ollama_models", return_value=[{"name": "mock:model"}]):
             for mode in ({"scenario_source": "auto"}, {"chain_mode": "campaign"}):
                 response = self.client.post("/api/start", json={"goal": "inspect", "model": "mock:model", **mode})
                 self.assertEqual(response.status_code, 400)

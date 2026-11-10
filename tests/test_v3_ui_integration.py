@@ -15,7 +15,7 @@ from unittest.mock import patch
 import uvicorn
 from playwright.sync_api import sync_playwright
 
-import app
+from web import app
 from engine.command_runtime import installed_chromium
 from orchestrator import ExplorerV3
 

@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-import app
+from web import app
 from orchestrator import ExplorerV3
 from engine.session_log import SessionStore
 from test_scorer_session import FakeAdapter
@@ -33,7 +33,7 @@ class ExecutionApiTests(unittest.TestCase):
                      "scorer_provider": "openrouter", "scorer_model": "typesafe/jev-1.14", "scorer_settings": {}}
 
     def test_api_persists_incomplete_result_when_model_finishes_without_observations(self):
-        with patch("app.get_ollama_models", return_value=[{"name": "mock:model"}]):
+        with patch("web.app.get_ollama_models", return_value=[{"name": "mock:model"}]):
             response = self.client.post("/api/start", json=self.body)
         self.assertEqual(response.status_code, 200, response.text)
         run_id = response.json()["run_id"]
@@ -55,7 +55,7 @@ class ExecutionApiTests(unittest.TestCase):
     def test_api_accepts_local_ollama_scorer_settings(self):
         body = {**self.body, "scorer_provider": "local", "scorer_model": "qwen3.5:9b",
                 "scorer_settings": {"protocol": "ollama", "base_url": "http://127.0.0.1:11434/"}}
-        with patch("app.get_ollama_models", return_value=[{"name": "mock:model"}]):
+        with patch("web.app.get_ollama_models", return_value=[{"name": "mock:model"}]):
             response = self.client.post("/api/start", json=body)
         self.assertEqual(response.status_code, 200, response.text)
         self.explorer.worker.join(10)
@@ -67,7 +67,7 @@ class ExecutionApiTests(unittest.TestCase):
 
     def test_mode_prompt_mismatch_and_bad_settings_reject_before_model_lookup(self):
         for changes in ({"prompt_version": "v3"}, {"v4_settings": {"node_attempts": 0}}, {"experiment_mode": "v3", "prompt_version": "v4"}):
-            with patch("app.get_ollama_models", side_effect=AssertionError("No lookup for invalid config")):
+            with patch("web.app.get_ollama_models", side_effect=AssertionError("No lookup for invalid config")):
                 response = self.client.post("/api/start", json={**self.body, **changes})
             self.assertEqual(response.status_code, 400, response.text)
 
@@ -84,7 +84,7 @@ class ExecutionApiTests(unittest.TestCase):
             yield {"message": {"content": json.dumps({"action": "run_command", "plan": "local fixture", "reason": "write result",
                 "path": "", "content": "", "code": "", "command": command})}}
         self.explorer.transport = result_transport
-        with patch("app.get_ollama_models", return_value=[{"name": "mock:model"}]):
+        with patch("web.app.get_ollama_models", return_value=[{"name": "mock:model"}]):
             response = self.client.post("/api/start", json=self.body)
         self.assertEqual(response.status_code, 200, response.text)
         run_id = response.json()["run_id"]
@@ -129,7 +129,7 @@ class ExecutionApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/prompts?experiment_mode=v4").json()["versions"], ["v4"])
 
     def test_lost_execution_metadata_recovers_without_resuming_models(self):
-        with patch("app.get_ollama_models", return_value=[{"name": "mock:model"}]):
+        with patch("web.app.get_ollama_models", return_value=[{"name": "mock:model"}]):
             run_id = self.client.post("/api/start", json=self.body).json()["run_id"]
         self.explorer.worker.join(10)
         (self.root / run_id / "session.json").unlink()
