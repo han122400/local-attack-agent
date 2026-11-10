@@ -140,10 +140,12 @@ class V4Runner:
         if len(json.dumps(value, ensure_ascii=False)) > self.context_budget and provenance:
             provenance["claim"], provenance["truncated"] = "", True
         discovery = value["discovery_context"]
-        for field in ("hints", "surfaces", "sources", "assets"):
-            while len(json.dumps(value, ensure_ascii=False)) > self.context_budget and discovery[field]:
-                discovery[field].pop()
-                discovery["truncated"] = True
+        # Items are newest-first: drop the oldest, keeping each field's newest entry until every field is down to one.
+        for floor in (1, 0):
+            for field in ("hints", "surfaces", "sources", "assets"):
+                while len(json.dumps(value, ensure_ascii=False)) > self.context_budget and len(discovery[field]) > floor:
+                    discovery[field].pop()
+                    discovery["truncated"] = True
         if len(json.dumps(value, ensure_ascii=False)) > self.context_budget:
             raise V4BudgetStop("context_budget")
         return value
