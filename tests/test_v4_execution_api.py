@@ -7,8 +7,8 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 import app
-from explorer import ExplorerV3
-from session_log import SessionStore
+from orchestrator import ExplorerV3
+from engine.session_log import SessionStore
 from test_scorer_session import FakeAdapter
 
 
@@ -101,8 +101,8 @@ class ExecutionApiTests(unittest.TestCase):
         self.assertTrue((self.root / run_id / imported[0]["payload"]["result_ref"]["path"]).is_file())
 
     def test_interrupted_attempt_is_preserved_without_confirming_or_resuming(self):
-        from command_runtime import CommandRuntime
-        from v4_tree import TreeStore
+        from engine.command_runtime import CommandRuntime
+        from engine.tree import TreeStore
         log = SessionStore(self.root).create("c" * 32, {**self.body, "v4_stage": "execution", "managed_processes": [],
             "phase": "running", "budgets": {"finalize_seconds": 10}, "lab_reset_status": "not_applicable"})
         tree = TreeStore(log)
@@ -145,8 +145,8 @@ class ExecutionApiTests(unittest.TestCase):
         self.assertEqual(metadata["v4_usage"]["cost_usd"], 0)
 
     def test_corrupt_execution_log_yields_degraded_report_and_preserves_runtime(self):
-        from command_runtime import CommandRuntime
-        from v4_tree import TreeStore
+        from engine.command_runtime import CommandRuntime
+        from engine.tree import TreeStore
         log = SessionStore(self.root).create("b" * 32, {**self.body, "v4_stage": "execution", "managed_processes": [],
             "phase": "running", "budgets": {"finalize_seconds": 10}, "lab_reset_status": "not_applicable"})
         TreeStore(log).initialize(self.body["target"])
@@ -167,8 +167,8 @@ class ExecutionApiTests(unittest.TestCase):
         self.assertFalse(self.explorer.can_start()[0])
 
     def test_bad_recovery_ownership_still_produces_a_report_and_retains_runtime(self):
-        from command_runtime import CommandRuntime
-        from v4_tree import TreeStore
+        from engine.command_runtime import CommandRuntime
+        from engine.tree import TreeStore
         log = SessionStore(self.root).create("d" * 32, {**self.body, "v4_stage": "execution", "phase": "running",
             "managed_processes": [{"pid": "invalid", "created_at": 1.0, "run_id": "d" * 32}],
             "budgets": {"finalize_seconds": 10}, "lab_reset_status": "not_applicable"})

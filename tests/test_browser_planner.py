@@ -8,8 +8,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from explorer import ExplorerV3
-from session_log import SessionStore
+from orchestrator import ExplorerV3
+from engine.session_log import SessionStore
 
 
 HTML = b'''<!doctype html><title>Fixture catalog</title>

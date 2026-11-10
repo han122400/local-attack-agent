@@ -8,9 +8,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from session_log import LogFailure, SessionLog
-from v4_contracts import ContractError
-from v4_tree import TreeStore, replay_tree
+from engine.session_log import LogFailure, SessionLog
+from engine.contracts import ContractError
+from engine.tree import TreeStore, replay_tree
 
 
 RUN_ID = "a" * 32
@@ -215,7 +215,7 @@ class TreeStoreTests(unittest.TestCase):
         self.assertEqual(self.tree.state["attempts"][attempt["attempt_id"]]["status"], "pending")
 
     def test_snapshot_write_failure_is_recoverable_from_committed_event(self):
-        with patch("v4_tree.atomic_write_json", side_effect=OSError("snapshot unavailable")):
+        with patch("engine.tree.atomic_write_json", side_effect=OSError("snapshot unavailable")):
             with self.assertRaises(LogFailure):
                 self.tree.discover(self.root_id, surface())
         rebuilt = TreeStore(self.log)

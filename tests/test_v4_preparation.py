@@ -9,8 +9,8 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 import app
-from explorer import ExplorerV3
-from session_log import SessionStore
+from orchestrator import ExplorerV3
+from engine.session_log import SessionStore
 
 
 def finish(_payload):
@@ -113,7 +113,7 @@ class V4PreparationTests(unittest.TestCase):
         self.assertFalse((self.root / run_id / "runtime").exists())
 
     def test_snapshot_failure_leaves_a_recoverable_preparation(self):
-        with patch("v4_tree.atomic_write_json", side_effect=OSError("disk unavailable")):
+        with patch("engine.tree.atomic_write_json", side_effect=OSError("disk unavailable")):
             response = self.client.post("/api/v4/prepare", json=self.body)
         self.assertEqual(response.status_code, 503, response.text)
         runs = SessionStore(self.root).list_runs()
@@ -123,9 +123,9 @@ class V4PreparationTests(unittest.TestCase):
         self.assertTrue(self.explorer.can_start()[0])
 
     def test_scored_preparation_recovers_usage_and_risks_without_network(self):
-        from session_log import SessionLog
-        from v4_tree import TreeStore
-        from scorer_session import RiskScorer
+        from engine.session_log import SessionLog
+        from engine.tree import TreeStore
+        from engine.scorer_session import RiskScorer
         from test_scorer_session import FakeAdapter
         from test_v4_tree import surface
         run_id = self._prepare()
@@ -139,8 +139,8 @@ class V4PreparationTests(unittest.TestCase):
             log.close()
         (self.root / run_id / "session.json").unlink()
         (self.root / run_id / "scorer.json").write_text("{broken", encoding="utf-8")
-        with patch("decision_provider.OpenRouterDecisions.resolve", side_effect=AssertionError("No catalog during replay")), \
-             patch("decision_provider.OpenRouterDecisions.evaluate", side_effect=AssertionError("No inference during replay")):
+        with patch("engine.decision_provider.OpenRouterDecisions.resolve", side_effect=AssertionError("No catalog during replay")), \
+             patch("engine.decision_provider.OpenRouterDecisions.evaluate", side_effect=AssertionError("No inference during replay")):
             self.assertTrue(self.explorer.recover(run_id))
         saved = self.explorer.get_run(run_id)
         self.assertEqual(saved["scorer_validation"], "catalog_verified")

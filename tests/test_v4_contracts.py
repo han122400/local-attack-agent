@@ -3,8 +3,8 @@
 import copy
 import unittest
 
-from v4_contracts import ContractError, dedup_key, validate_discovery, validate_result
-from experiment_config import validate_experiment_config
+from engine.contracts import ContractError, dedup_key, validate_discovery, validate_result
+from engine.experiment_config import validate_experiment_config
 
 
 def discovery(**changes):

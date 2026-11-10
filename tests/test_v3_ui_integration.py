@@ -16,8 +16,8 @@ import uvicorn
 from playwright.sync_api import sync_playwright
 
 import app
-from command_runtime import installed_chromium
-from explorer import ExplorerV3
+from engine.command_runtime import installed_chromium
+from orchestrator import ExplorerV3
 
 
 ATTACK_TEXT = '<img src=x onerror="window.__xss=1"><script>window.__xss=1</script>'

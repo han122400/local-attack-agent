@@ -5,11 +5,11 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from session_log import LogFailure, atomic_write_json
-from lab import TARGET as LAB_TARGET
-from v4_contracts import dedup_key
-from v4_tree import TreeStore, investigation_gaps, latest_observation
-from v4_usage import summarize_usage
+from engine.session_log import LogFailure, atomic_write_json
+from engine.lab import TARGET as LAB_TARGET
+from engine.contracts import dedup_key
+from engine.tree import TreeStore, investigation_gaps, latest_observation
+from engine.usage import summarize_usage
 
 
 def readable_prefix(log):
@@ -164,7 +164,7 @@ class SnapshotLog:
     failed = True
 
     def __init__(self, root, metadata):
-        from session_log import validate_run_id
+        from engine.session_log import validate_run_id
         self.metadata = dict(metadata)
         self.run_id = validate_run_id(metadata["run_id"])
         self.run_dir = Path(root).resolve() / self.run_id
@@ -191,7 +191,7 @@ def owned_records(metadata, events):
 
 
 def emergency_recovery(root, metadata, error):
-    from command_runtime import CommandRuntime
+    from engine.command_runtime import CommandRuntime
     log = SnapshotLog(root, metadata)
     runtime = CommandRuntime(root, log)
     events, _corruption = readable_prefix(log)
@@ -269,7 +269,7 @@ def finalize_v4(log, runtime, run_result, reason, *, lab_reset):
         if log.metadata.get("target") == LAB_TARGET and log.metadata.get("lab_reset_status") != "succeeded":
             _metadata(log, phase="resetting", lab_reset_status="running")
             remaining(120)
-            from lab import reset_lab
+            from engine.lab import reset_lab
             reset = lab_reset(deadline=deadline) if lab_reset is reset_lab else lab_reset()
             remaining(120)
             if not isinstance(reset, dict) or reset.get("verified") is not True:

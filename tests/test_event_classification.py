@@ -3,8 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from event_classification import classify_event
-from session_log import SessionLog, SessionStore
+from engine.event_classification import classify_event
+from engine.session_log import SessionLog, SessionStore
 
 
 class EventClassificationTests(unittest.TestCase):

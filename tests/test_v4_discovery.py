@@ -1,7 +1,7 @@
 import unittest
 
-from v4_contracts import validate_discovery
-from v4_discovery import analyze_response
+from engine.contracts import validate_discovery
+from engine.discovery import analyze_response
 
 
 SOURCE = "https://shop.example/account/start"

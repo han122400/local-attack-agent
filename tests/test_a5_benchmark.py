@@ -8,7 +8,7 @@ from unittest.mock import patch
 import a5_benchmark
 from a5_benchmark import (CONFIG_PATH, config_digest, final_observation,
                           summarize_run, validate_config)
-from planning import load_prompt
+from engine.planning import load_prompt
 
 
 class A5BenchmarkTests(unittest.TestCase):

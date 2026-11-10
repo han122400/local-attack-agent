@@ -2,7 +2,7 @@
 
 import unittest
 
-from planning import COMMAND_SCHEMA, SYSTEM_PROMPT, available_prompt_versions, load_prompt, validate_command
+from engine.planning import COMMAND_SCHEMA, SYSTEM_PROMPT, available_prompt_versions, load_prompt, validate_command
 
 
 def answer(action="finish", **fields):

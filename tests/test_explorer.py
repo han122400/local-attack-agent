@@ -5,8 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from explorer import ExplorerV3, safe_target, validate_budgets
-from session_log import SessionStore
+from orchestrator import ExplorerV3, safe_target, validate_budgets
+from engine.session_log import SessionStore
 
 
 def reply(action, **values):

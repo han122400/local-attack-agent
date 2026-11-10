@@ -9,11 +9,11 @@ The composite score is a convenience for A/B comparison; the raw columns are the
 live in SCORE_WEIGHTS and are meant to be tuned.
 
 Usage (from the project folder):
-    python scorecard.py                     # table of every finished run, newest last
-    python scorecard.py <run_id|prefix>     # per-step detail for one run
-    python scorecard.py --group model       # aggregate mean/stdev grouped by a field
-    python scorecard.py --group num_ctx     # ... or by context size, goal, scenario_source, model
-    python scorecard.py --json              # machine-readable per-run metrics
+    python -m tools.scorecard                     # table of every finished run, newest last
+    python -m tools.scorecard <run_id|prefix>     # per-step detail for one run
+    python -m tools.scorecard --group model       # aggregate mean/stdev grouped by a field
+    python -m tools.scorecard --group num_ctx     # ... or by context size, goal, scenario_source, model
+    python -m tools.scorecard --json              # machine-readable per-run metrics
 """
 
 from __future__ import annotations

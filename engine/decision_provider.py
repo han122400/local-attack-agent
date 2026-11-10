@@ -10,8 +10,8 @@ from urllib.parse import urlsplit
 
 import httpx2 as httpx
 
-from model_providers import openrouter_key
-from risk_rubric import (CRITERIA, ScoreContractError, build_ordinal_request, build_score_request,
+from engine.model_providers import openrouter_key
+from engine.risk_rubric import (CRITERIA, ScoreContractError, build_ordinal_request, build_score_request,
                          canonical_bytes, validate_ordinal_answer, validate_response, validate_usage)
 
 
@@ -90,7 +90,7 @@ class OpenRouterDecisions:
                     chunks.append(chunk)
                 # Use the same strict parser as local result files (duplicate
                 # fields/non-finite JSON are errors), without keeping raw text.
-                from v4_tree import _json_result
+                from engine.tree import _json_result
                 return _json_result(b"".join(chunks))
         except ProviderError:
             raise
@@ -245,7 +245,7 @@ class LocalOllamaScorer:
                     if size > MAX_RESPONSE_BYTES:
                         raise ProviderError("response_too_large")
                     chunks.append(chunk)
-                from v4_tree import _json_result
+                from engine.tree import _json_result
                 return _json_result(b"".join(chunks))
         except ProviderError:
             raise
@@ -317,7 +317,7 @@ class LocalOllamaScorer:
                     or not isinstance(response.get("message"), dict)
                     or not isinstance(response["message"].get("content"), str) or usage is None):
                 raise ScoreContractError("invalid_response_contract")
-            from v4_tree import _json_result
+            from engine.tree import _json_result
             answer = _json_result(response["message"]["content"].encode("utf-8"))
             if (not isinstance(answer, dict) or set(answer) != {"scores"} or not isinstance(answer["scores"], dict)
                     or set(answer["scores"]) != set(node_ids)):

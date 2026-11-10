@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from session_log import SessionLog, LogFailure, SessionStore, ControllerLease
+from engine.session_log import SessionLog, LogFailure, SessionStore, ControllerLease
 
 
 RUN_ID = "a" * 32
@@ -61,7 +61,7 @@ class SessionLogTests(unittest.TestCase):
                     raise error
                 return original_replace(source, destination)
 
-            with patch("session_log.os.replace", side_effect=transient_replace):
+            with patch("engine.session_log.os.replace", side_effect=transient_replace):
                 log.update(phase="finished")
             self.assertEqual(len(attempts), 3)
             self.assertFalse(log.failed)

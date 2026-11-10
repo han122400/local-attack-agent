@@ -20,17 +20,17 @@ from urllib.request import urlopen
 
 from dotenv import dotenv_values
 
-from command_runtime import installed_chromium
-from decision_provider import OpenRouterDecisions
-from experiment_config import validate_experiment_config
-from explorer import ExplorerV3, RUNS_ROOT, validate_budgets
-from lab import reset_lab
-from model_settings import validate_model_settings
-from planning import load_prompt
-from scorer_state import effective_settings
-from session_log import atomic_write_json
-from lab import CONTAINER, TARGET as LAB_TARGET, _docker
-from v4_policy import execution_settings
+from engine.command_runtime import installed_chromium
+from engine.decision_provider import OpenRouterDecisions
+from engine.experiment_config import validate_experiment_config
+from orchestrator import ExplorerV3, RUNS_ROOT, validate_budgets
+from engine.lab import reset_lab
+from engine.model_settings import validate_model_settings
+from engine.planning import load_prompt
+from engine.scorer_state import effective_settings
+from engine.session_log import atomic_write_json
+from engine.lab import CONTAINER, TARGET as LAB_TARGET, _docker
+from engine.policy import execution_settings
 
 
 PROTOCOL = "a5-paired-v2"

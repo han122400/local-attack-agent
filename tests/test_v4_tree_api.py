@@ -10,8 +10,8 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 import app
-from session_log import SessionStore
-from v4_tree import TreeStore
+from engine.session_log import SessionStore
+from engine.tree import TreeStore
 from test_v4_tree import surface
 
 

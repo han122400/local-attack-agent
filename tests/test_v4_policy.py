@@ -1,6 +1,6 @@
 import unittest
 
-from v4_policy import execution_settings
+from engine.policy import execution_settings
 
 
 class PolicyTests(unittest.TestCase):

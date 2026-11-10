@@ -10,8 +10,8 @@ import json
 import re
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
-from session_log import safe_relative_path
-from risk_rubric import observations, OBSERVATIONS_SCHEMA
+from engine.session_log import safe_relative_path
+from engine.risk_rubric import observations, OBSERVATIONS_SCHEMA
 
 
 SCHEMA_VERSION = 1

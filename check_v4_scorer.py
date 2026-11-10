@@ -9,10 +9,10 @@ from engine.paths import RUNS_ROOT
 
 from dotenv import dotenv_values
 
-from decision_provider import OpenRouterDecisions, ProviderError, estimated_cost, utc_now
-from risk_rubric import (CONTRACT_VERSION, RUBRIC_VERSION, build_score_request,
+from engine.decision_provider import OpenRouterDecisions, ProviderError, estimated_cost, utc_now
+from engine.risk_rubric import (CONTRACT_VERSION, RUBRIC_VERSION, build_score_request,
                          PROBABILITY_SUM_TOLERANCE, WEIGHTED_SCORE_TOLERANCE)
-from session_log import atomic_write_json
+from engine.session_log import atomic_write_json
 
 
 def main():

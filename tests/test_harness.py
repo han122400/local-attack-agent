@@ -3,10 +3,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from harness import Harness, ModelFailure
-from model_providers import OpenRouterError
-from planning import Command, normalize_command_inputs, validate_command
-from session_log import SessionLog
+from engine.harness import Harness, ModelFailure
+from engine.model_providers import OpenRouterError
+from engine.planning import Command, normalize_command_inputs, validate_command
+from engine.session_log import SessionLog
 
 
 RUN_ID = "d" * 32

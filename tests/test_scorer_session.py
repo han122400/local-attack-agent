@@ -6,12 +6,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from decision_provider import ProviderError
-from risk_rubric import validate_answer
-from scorer_session import RiskScorer
-from session_log import SessionLog, LogFailure
-from v4_contracts import ContractError
-from v4_tree import TreeStore, replay_tree
+from engine.decision_provider import ProviderError
+from engine.risk_rubric import validate_answer
+from engine.scorer_session import RiskScorer
+from engine.session_log import SessionLog, LogFailure
+from engine.contracts import ContractError
+from engine.tree import TreeStore, replay_tree
 from test_scorer_contract import answer
 from test_v4_tree import surface
 
@@ -212,7 +212,7 @@ class ScorerSessionTests(unittest.TestCase):
         adapter = FakeAdapter()
         scorer = self.scorer(adapter)
         scorer.configure()
-        with patch("v4_tree.atomic_write_json", side_effect=OSError("disk unavailable")), self.assertRaises(LogFailure):
+        with patch("engine.tree.atomic_write_json", side_effect=OSError("disk unavailable")), self.assertRaises(LogFailure):
             scorer.score_children(self.root)
         self.assertFalse(adapter.calls)
         self.tree.rebuild()
@@ -285,7 +285,7 @@ class ScorerSessionTests(unittest.TestCase):
 
     def test_decoding_failure_finishes_reserved_request_and_retains_unknown_cost(self):
         import httpx2 as httpx
-        from decision_provider import OpenRouterDecisions
+        from engine.decision_provider import OpenRouterDecisions
         from test_scorer_provider import CATALOG
         def handler(request):
             if request.method == "GET":

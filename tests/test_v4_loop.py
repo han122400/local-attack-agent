@@ -4,11 +4,11 @@ import threading
 import unittest
 from pathlib import Path
 
-from command_runtime import ExecutionResult
-from session_log import SessionLog
-from v4_loop import V4Runner, BudgetGate
-from v4_policy import V4BudgetStop
-from v4_tree import TreeStore
+from engine.command_runtime import ExecutionResult
+from engine.session_log import SessionLog
+from strategies.greedy import V4Runner, BudgetGate
+from engine.policy import V4BudgetStop
+from engine.tree import TreeStore
 from test_scorer_session import FakeAdapter, good
 from test_v4_tree import surface
 
@@ -320,7 +320,7 @@ class LoopTests(unittest.TestCase):
             return self.command(context)
         def score(ids):
             result = good(ids)
-            from risk_rubric import validate_answer
+            from engine.risk_rubric import validate_answer
             from test_scorer_contract import answer
             for key in ids:
                 index = 1 if key == "N0002" else 3

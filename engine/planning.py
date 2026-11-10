@@ -66,6 +66,14 @@ def load_prompt(version: str) -> tuple[str, str]:
 SYSTEM_PROMPT_VERSION = "v3"
 SYSTEM_PROMPT, SYSTEM_PROMPT_SHA256 = load_prompt(SYSTEM_PROMPT_VERSION)
 
+_CHARS_PER_TOKEN = 3.3
+_PROMPT_FRACTION = 0.65
+
+
+def context_char_budget(num_ctx: int, system_prompt: str = SYSTEM_PROMPT) -> int:
+    total_prompt_chars = int(max(1024, num_ctx) * _CHARS_PER_TOKEN * _PROMPT_FRACTION)
+    return max(2000, total_prompt_chars - len(system_prompt))
+
 
 @dataclass(frozen=True)
 class Command:

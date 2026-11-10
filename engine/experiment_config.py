@@ -10,7 +10,7 @@ import math
 import re
 from urllib.parse import urlsplit
 
-from v4_contracts import normalize_url
+from engine.contracts import normalize_url
 
 
 _INTEGER_LIMITS = {"max_retries": (0, 5), "max_calls": (1, 500), "max_calls_per_parent": (1, 500),
@@ -29,7 +29,7 @@ def require_execution_ready(config: dict) -> None:
 
 
 def compatible_prompt(mode: str, requested=None) -> str:
-    from planning import SYSTEM_PROMPT_VERSION, available_prompt_versions
+    from engine.planning import SYSTEM_PROMPT_VERSION, available_prompt_versions
     selected = requested or ("v4" if mode == "v4" else SYSTEM_PROMPT_VERSION)
     if selected not in available_prompt_versions() or ((selected == "v4") != (mode == "v4")):
         raise ValueError("Prompt version is incompatible with experiment_mode")

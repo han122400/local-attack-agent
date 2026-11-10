@@ -5,9 +5,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from harness import Harness
-from lab import reset_lab
-from session_log import SessionLog
+from engine.harness import Harness
+from engine.lab import reset_lab
+from engine.session_log import SessionLog
 
 
 class DeadlineTests(unittest.TestCase):
@@ -21,12 +21,12 @@ class DeadlineTests(unittest.TestCase):
                 self.assertGreater(timeout_seconds, 0)
                 self.assertLessEqual(timeout_seconds, .25)
                 yield {"message": {"content": json.dumps(command)}}
-            with patch("harness._model_stream", side_effect=stream):
+            with patch("engine.harness._model_stream", side_effect=stream):
                 Harness(log).decide(log.run_id, {}, model="mock:model", settings={"think": False, "options": {"num_ctx": 8192, "num_predict": 4096}},
                                     deadline=time.monotonic() + .25)
 
     def test_expired_reset_deadline_does_not_issue_docker_command(self):
-        with patch("lab._docker", side_effect=AssertionError("No Docker after deadline")):
+        with patch("engine.lab._docker", side_effect=AssertionError("No Docker after deadline")):
             with self.assertRaises((TimeoutError, RuntimeError)):
                 reset_lab(deadline=time.monotonic() - 1)
 

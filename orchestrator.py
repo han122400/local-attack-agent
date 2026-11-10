@@ -11,36 +11,23 @@ import uuid
 from dataclasses import asdict
 from pathlib import Path
 from engine.paths import RUNS_ROOT
-from experiment_config import validate_experiment_config, require_execution_ready, compatible_prompt
-from v4_contracts import SCHEMA_VERSION
-from v4_tree import TreeStore
+from engine.experiment_config import validate_experiment_config, require_execution_ready, compatible_prompt
+from engine.contracts import SCHEMA_VERSION
+from engine.tree import TreeStore
 from urllib.parse import urlsplit
 
-from command_runtime import CommandRuntime
-from harness import Harness, ModelFailure
-from lab import reset_lab
-from model_settings import default_model_settings, validate_model_settings
-from planning import SYSTEM_PROMPT, SYSTEM_PROMPT_VERSION, available_prompt_versions, load_prompt
-from session_log import ControllerLease, LogFailure, SessionLog, SessionStore, validate_run_id
+from engine.command_runtime import CommandRuntime
+from engine.harness import Harness, ModelFailure
+from engine.lab import reset_lab
+from engine.model_settings import default_model_settings, validate_model_settings
+from engine.planning import SYSTEM_PROMPT, SYSTEM_PROMPT_VERSION, available_prompt_versions, load_prompt, context_char_budget
+from engine.session_log import ControllerLease, LogFailure, SessionLog, SessionStore, validate_run_id
 
 
 TARGET = "http://127.0.0.1:3000/"
 MODEL = "qwen3.5:2b"
 DEFAULT_BUDGETS = {"seconds": 1200, "model_calls": 40, "tool_calls": 80,
                    "command_seconds": 30, "finalize_seconds": 120}
-
-# The full prompt (system + context) must fit num_ctx with room left for the model's output. We budget the
-# CONTEXT (the user message) in chars — a token proxy, since tokens are only known after a call — after
-# subtracting the system prompt and reserving ~35% of num_ctx for output. When the context exceeds this
-# budget the oldest structured history is dropped and a context_compacted event is emitted.
-_CHARS_PER_TOKEN = 3.3        # rough for mixed Korean/English/code
-_PROMPT_FRACTION = 0.65       # share of num_ctx used for the prompt (rest reserved for output)
-
-
-def context_char_budget(num_ctx: int, system_prompt: str = SYSTEM_PROMPT) -> int:
-    total_prompt_chars = int(max(1024, num_ctx) * _CHARS_PER_TOKEN * _PROMPT_FRACTION)
-    return max(2000, total_prompt_chars - len(system_prompt))
-
 
 def _digest(text: str, limit: int = 240) -> str:
     """Head+tail digest so a long output keeps its start AND end, not only the trailing noise."""
@@ -152,7 +139,7 @@ class ExplorerV3:
         experiment = validate_experiment_config({"experiment_mode": experiment_mode, "scorer_provider": scorer_provider,
                                                 "scorer_model": scorer_model, "scorer_settings": {} if scorer_settings is None else scorer_settings})
         require_execution_ready(experiment)
-        from v4_policy import execution_settings
+        from engine.policy import execution_settings
         execution = execution_settings(v4_settings) if experiment_mode == "v4" else None
         if scenario_source != "manual" or chain_mode != "none":
             raise ValueError("Only manual scenario with none chain is implemented")
@@ -322,7 +309,7 @@ class ExplorerV3:
             log.update(phase="running")
             runtime.start_session(run_id, target=log.metadata["target"], browser=self.browser_enabled)
             if log.metadata.get("experiment_mode") == "v4":
-                from v4_loop import V4Runner
+                from strategies.greedy import V4Runner
                 result, reason = V4Runner(log, runtime, transport=self.transport, scorer_adapter=self.scorer_adapter,
                                            stop_event=self.stop_event).run()
             else:
@@ -461,7 +448,7 @@ class ExplorerV3:
     def _finalize(self, run_id: str, log: SessionLog, runtime: CommandRuntime,
                   run_result: str, reason: str) -> None:
         if log.metadata.get("experiment_mode") == "v4":
-            from v4_reporting import finalize_v4
+            from engine.reporting import finalize_v4
             try:
                 finalize_v4(log, runtime, run_result, reason, lab_reset=self.lab_reset)
             finally:
@@ -613,7 +600,7 @@ class ExplorerV3:
                         metadata = self.store.repair_unowned_metadata(run_id)
                     except Exception:
                         if (self.store.root / run_id / "tree.json").exists():
-                            from v4_reporting import SnapshotLog, save_report
+                            from engine.reporting import SnapshotLog, save_report
                             save_report(SnapshotLog(self.store.root, {"run_id": run_id}), "interrupted", "metadata_unavailable",
                                         error="Cannot establish runtime ownership", persist_metadata=False)
                         raise
@@ -661,7 +648,7 @@ class ExplorerV3:
         try:
             records = log.metadata.get("managed_processes", [])
             if log.metadata.get("experiment_mode") == "v4":
-                from v4_reporting import owned_records
+                from engine.reporting import owned_records
                 records = owned_records(log.metadata, log.snapshot_events())
             runtime.restore_owned(run_id, records)
             with self.lock:
@@ -672,7 +659,7 @@ class ExplorerV3:
                 raise
             # Invalid ownership must not skip the reducer-independent report.
             # Keep all runtime files and original ownership records for repair.
-            from v4_reporting import save_report, _metadata
+            from engine.reporting import save_report, _metadata
             try:
                 error = f"{type(exc).__name__}: {exc}"[:500]
                 save_report(log, result, reason, error=error)
@@ -686,7 +673,7 @@ class ExplorerV3:
             self.lease.release()
 
     def _recover_broken_v4(self, run_id, metadata, error):
-        from v4_reporting import emergency_recovery
+        from engine.reporting import emergency_recovery
         try:
             recovered = emergency_recovery(self.store.root, metadata, error)
             with self.lock:

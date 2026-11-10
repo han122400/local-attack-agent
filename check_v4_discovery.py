@@ -17,18 +17,19 @@ from pathlib import Path
 from engine.paths import PROJECT_ROOT
 from urllib.parse import urlsplit
 
-from command_runtime import CommandRuntime
-import harness as harness_module
-from explorer import RUNS_ROOT, context_char_budget, safe_target, validate_budgets
-from experiment_config import validate_experiment_config
-from lab import TARGET as LAB_TARGET, reset_lab
-from model_settings import validate_model_settings
-from planning import load_prompt
-from planning import COMMAND_SCHEMA
-from session_log import ControllerLease, SessionStore
-from v4_policy import execution_settings
-from v4_reporting import finalize_v4
-from v4_tree import TreeStore
+from engine.command_runtime import CommandRuntime
+import engine.harness as harness_module
+from orchestrator import RUNS_ROOT, context_char_budget, safe_target, validate_budgets
+from engine.experiment_config import validate_experiment_config
+from engine.lab import TARGET as LAB_TARGET, reset_lab
+from engine.model_settings import validate_model_settings
+from engine.planning import load_prompt
+from engine.planning import COMMAND_SCHEMA
+from engine.session_log import ControllerLease, SessionStore
+from engine.policy import execution_settings
+from engine.reporting import finalize_v4
+from engine.tree import TreeStore
+from tools._legacy_imports import baseline_builtins
 
 
 ROOT = PROJECT_ROOT
@@ -72,11 +73,17 @@ def source_info(baseline_ref):
             untracked[name] = sha(path.read_bytes())
     if baseline_ref:
         resolved = git_bytes("rev-parse", "--verify", baseline_ref + "^{commit}").decode().strip()
-        loop = git_bytes("show", resolved + ":v4_loop.py")
+        try:
+            loop = git_bytes("show", resolved + ":v4_loop.py")
+        except subprocess.CalledProcessError:
+            try:
+                loop = git_bytes("show", resolved + ":strategies/greedy.py")
+            except subprocess.CalledProcessError as exc:
+                raise ValueError("Baseline commit has no supported loop source") from exc
         prompt = git_bytes("show", resolved + ":prompts/system/v4.txt")
     else:
         resolved = None
-        loop = (ROOT / "v4_loop.py").read_bytes()
+        loop = (ROOT / "strategies" / "greedy.py").read_bytes()
         prompt = (ROOT / "prompts/system/v4.txt").read_bytes()
     return {"commit": commit, "diff_sha256": sha(diff), "untracked_python_sha256": untracked,
             "baseline_ref": resolved, "loop_sha256": sha(loop), "base_prompt_sha256": sha(prompt)}, loop, prompt.decode("utf-8")
@@ -84,10 +91,11 @@ def source_info(baseline_ref):
 
 def runner_type(source, baseline_ref, prompt):
     if not baseline_ref:
-        from v4_loop import V4Runner
+        from strategies.greedy import V4Runner
         return V4Runner
     module = types.ModuleType("discovery_baseline_" + baseline_ref[:12])
     module.__file__ = f"git:{baseline_ref}:v4_loop.py"
+    module.__dict__["__builtins__"] = baseline_builtins()
     exec(compile(source, module.__file__, "exec"), module.__dict__)
     base_digest = sha(prompt.encode("utf-8"))
     module.load_prompt = lambda version: (prompt, base_digest) if version == "v4" else load_prompt(version)

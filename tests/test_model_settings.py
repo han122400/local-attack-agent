@@ -9,9 +9,9 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 import app
-from explorer import ExplorerV3
-from harness import Harness, ModelFailure
-from session_log import SessionLog, SessionStore
+from orchestrator import ExplorerV3
+from engine.harness import Harness, ModelFailure
+from engine.session_log import SessionLog, SessionStore
 
 
 def start_request(body):

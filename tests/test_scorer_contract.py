@@ -4,7 +4,7 @@ import copy
 import json
 import unittest
 
-from risk_rubric import (CRITERIA, RUBRIC_VERSION, ScoreContractError, project_node,
+from engine.risk_rubric import (CRITERIA, RUBRIC_VERSION, ScoreContractError, project_node,
                          build_score_request, validate_answer, validate_response)
 
 
@@ -61,7 +61,7 @@ class ScorerContractTests(unittest.TestCase):
         self.assertEqual(result["confidence"], 1.0)
 
     def test_ordinal_label_keeps_unknown_probability_and_confidence(self):
-        import risk_rubric
+        import engine.risk_rubric as risk_rubric
         self.assertTrue(hasattr(risk_rubric, "validate_ordinal_answer"))
         value = risk_rubric.validate_ordinal_answer(3)
         self.assertEqual(value["score"], 75.0)
@@ -74,7 +74,7 @@ class ScorerContractTests(unittest.TestCase):
                 risk_rubric.validate_ordinal_answer(bad)
 
     def test_local_request_contains_only_categorical_projection(self):
-        import risk_rubric
+        import engine.risk_rubric as risk_rubric
         self.assertTrue(hasattr(risk_rubric, "build_ordinal_request"))
         payload = risk_rubric.build_ordinal_request("qwen3.5:9b", node("N0001", kind="root"),
                                                      [node()], ["N0002"])

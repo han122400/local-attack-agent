@@ -8,19 +8,19 @@ import time
 from dataclasses import replace
 from urllib.parse import urlsplit
 
-from code_checks import check_generated_code
-from harness import Harness, ModelFailure
-from model_providers import is_openrouter
-from planning import load_prompt
-from session_log import atomic_write_json
-from scorer_session import RiskScorer
-from v4_usage import summarize_usage
-from v4_contracts import (ContractError, MAX_RESULT_BYTES, RESULT_SCHEMA, dedup_key, evidence_path,
+from engine.code_checks import check_generated_code
+from engine.harness import Harness, ModelFailure
+from engine.model_providers import is_openrouter
+from engine.planning import load_prompt
+from engine.session_log import atomic_write_json
+from engine.scorer_session import RiskScorer
+from engine.usage import summarize_usage
+from engine.contracts import (ContractError, MAX_RESULT_BYTES, RESULT_SCHEMA, dedup_key, evidence_path,
                           normalize_url, validate_result)
-from v4_policy import V4BudgetStop, execution_settings
-from v4_tree import (TreeStore, MAX_EVIDENCE_BYTES, _json_result, _read_bounded, _safe_path,
+from engine.policy import V4BudgetStop, execution_settings
+from engine.tree import (TreeStore, MAX_EVIDENCE_BYTES, _json_result, _read_bounded, _safe_path,
                      latest_observation, investigation_gaps)
-from risk_rubric import observations, OBSERVATIONS_SCHEMA
+from engine.risk_rubric import observations, OBSERVATIONS_SCHEMA
 
 
 class BudgetGate:
@@ -86,7 +86,7 @@ class V4Runner:
         self.scorer = RiskScorer(self.tree, adapter=scorer_adapter, admit_request=self.gate.admit)
         self.history = []
         self._discovery_cache = {}
-        from explorer import context_char_budget
+        from engine.planning import context_char_budget
         self.context_budget = context_char_budget(log.metadata["model_settings"]["options"].get("num_ctx", 8192), prompt)
 
     def _context(self, node_id, *, unproductive=0, node_tools=0):
@@ -220,7 +220,7 @@ class V4Runner:
                             content_type = match.group(1).strip()[:200]
                     if cache_key[-1] or urlsplit(source_url).path.lower().endswith((".js", ".mjs", ".cjs")):
                         content_type = "application/javascript"
-                    from v4_discovery import analyze_response
+                    from engine.discovery import analyze_response
                     analysis = analyze_response(body, source_url, content_type=content_type,
                                                 allowed_origin=target, limit=100)
                     self._discovery_cache[cache_key] = {"source_url": source_url,

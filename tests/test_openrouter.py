@@ -10,11 +10,11 @@ import httpx2 as httpx
 from fastapi import HTTPException
 
 import app
-import lab
-import model_providers as providers
-from command_runtime import CommandRuntime
-from harness import Harness, ModelFailure
-from session_log import SessionLog
+import engine.lab as lab
+import engine.model_providers as providers
+from engine.command_runtime import CommandRuntime
+from engine.harness import Harness, ModelFailure
+from engine.session_log import SessionLog
 from test_model_settings import start_request
 
 

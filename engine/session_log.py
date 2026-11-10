@@ -16,7 +16,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
 
-from event_classification import classify_event, event_view
+from engine.event_classification import classify_event, event_view
 
 
 RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
@@ -395,7 +395,7 @@ class SessionStore:
             # Keep a lost v4 preparation from entering the legacy v3 lab/reset
             # finalizer. Only configuration fields from the creation event are
             # restored; resource/lifecycle ownership is never inferred from it.
-            from experiment_config import validate_experiment_config
+            from engine.experiment_config import validate_experiment_config
             try:
                 selected = validate_experiment_config(v4_configuration)
             except ValueError as exc:

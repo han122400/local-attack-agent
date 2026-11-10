@@ -6,7 +6,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 import app
-import lab
+import engine.lab as lab
 
 
 def inspected(status):
@@ -19,8 +19,8 @@ class LabTests(unittest.TestCase):
                 "NetworkSettings": {"Ports": {"3000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "3000"}]}}}
         inspected_full = subprocess.CompletedProcess([], 0, json.dumps([info]), "")
         restarted = subprocess.CompletedProcess([], 0, "juice-lab", "")
-        with patch("lab._docker", side_effect=[inspected_full, restarted]) as docker, \
-             patch("lab._probe_initial_state", return_value={"verified": True, "products": 46, "challenges": 116, "solved": 0}):
+        with patch("engine.lab._docker", side_effect=[inspected_full, restarted]) as docker, \
+             patch("engine.lab._probe_initial_state", return_value={"verified": True, "products": 46, "challenges": 116, "solved": 0}):
             result = lab.reset_lab()
         self.assertTrue(result["verified"])
         self.assertEqual(docker.call_args_list[1].args, ("restart", "juice-lab"))
@@ -28,27 +28,27 @@ class LabTests(unittest.TestCase):
     def test_reset_rejects_wrong_container_and_probe_mismatch(self):
         info = {"Config": {"Image": "other:latest"}, "Mounts": [],
                 "NetworkSettings": {"Ports": {"3000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "3000"}]}}}
-        with patch("lab._docker", return_value=subprocess.CompletedProcess([], 0, json.dumps([info]), "")) as docker:
+        with patch("engine.lab._docker", return_value=subprocess.CompletedProcess([], 0, json.dumps([info]), "")) as docker:
             with self.assertRaises(RuntimeError):
                 lab.reset_lab()
             self.assertEqual(docker.call_count, 1)
         info["Config"]["Image"] = "bkimminich/juice-shop:v20.2.0"
-        with patch("lab._docker", side_effect=[subprocess.CompletedProcess([], 0, json.dumps([info]), ""),
+        with patch("engine.lab._docker", side_effect=[subprocess.CompletedProcess([], 0, json.dumps([info]), ""),
                                                subprocess.CompletedProcess([], 0, "juice-lab", "")]), \
-             patch("lab._probe_initial_state", return_value={"verified": False, "products": 46, "challenges": 116, "solved": 1}):
+             patch("engine.lab._probe_initial_state", return_value={"verified": False, "products": 46, "challenges": 116, "solved": 1}):
             with self.assertRaises(RuntimeError):
                 lab.reset_lab(wait_seconds=0)
 
     def test_running_requires_web_response_to_be_ready(self):
-        with patch("lab._docker", return_value=inspected("running")), patch("lab._web_ready", return_value=False):
+        with patch("engine.lab._docker", return_value=inspected("running")), patch("engine.lab._web_ready", return_value=False):
             self.assertEqual(lab.get_status()["status"], "starting")
-        with patch("lab._docker", return_value=inspected("running")), patch("lab._web_ready", return_value=True):
+        with patch("engine.lab._docker", return_value=inspected("running")), patch("engine.lab._web_ready", return_value=True):
             state = lab.get_status()
             self.assertTrue(state["ready"])
             self.assertFalse(state["can_start"])
 
     def test_stopped_container_can_be_started(self):
-        with patch("lab._docker", return_value=inspected("exited")), patch("lab._web_ready") as probe:
+        with patch("engine.lab._docker", return_value=inspected("exited")), patch("engine.lab._web_ready") as probe:
             state = lab.get_status()
             self.assertEqual(state["status"], "stopped")
             self.assertTrue(state["can_start"])
@@ -56,27 +56,27 @@ class LabTests(unittest.TestCase):
 
     def test_missing_container_and_unavailable_docker_are_distinct(self):
         for stderr, status in [("Error: No such object: juice-lab", "missing"), ("cannot connect to daemon", "unavailable")]:
-            with self.subTest(status=status), patch("lab._docker", return_value=subprocess.CompletedProcess([], 1, "", stderr)):
+            with self.subTest(status=status), patch("engine.lab._docker", return_value=subprocess.CompletedProcess([], 1, "", stderr)):
                 state = lab.get_status()
                 self.assertEqual(state["status"], status)
                 self.assertFalse(state["can_start"])
-        with patch("lab._docker", side_effect=FileNotFoundError):
+        with patch("engine.lab._docker", side_effect=FileNotFoundError):
             self.assertEqual(lab.get_status()["status"], "unavailable")
 
     def test_start_only_starts_fixed_existing_container(self):
         results = [inspected("exited"), subprocess.CompletedProcess([], 0, "juice-lab", ""), inspected("running")]
-        with patch("lab._docker", side_effect=results) as docker, patch("lab._web_ready", return_value=False):
+        with patch("engine.lab._docker", side_effect=results) as docker, patch("engine.lab._web_ready", return_value=False):
             self.assertEqual(lab.start_lab()["status"], "starting")
             self.assertEqual(docker.call_args_list[1].args, ("start", "juice-lab"))
 
     def test_already_running_is_not_started_again(self):
-        with patch("lab._docker", return_value=inspected("running")) as docker, patch("lab._web_ready", return_value=True):
+        with patch("engine.lab._docker", return_value=inspected("running")) as docker, patch("engine.lab._web_ready", return_value=True):
             self.assertTrue(lab.start_lab()["ready"])
             self.assertEqual(docker.call_count, 1)
 
     def test_start_failure_is_reported(self):
         for result in [subprocess.CompletedProcess([], 1, "", "port conflict"), subprocess.TimeoutExpired("docker", 20)]:
-            with self.subTest(result=result), patch("lab.get_status", return_value={"status": "stopped", "can_start": True}), patch("lab._docker", side_effect=[result]):
+            with self.subTest(result=result), patch("engine.lab.get_status", return_value={"status": "stopped", "can_start": True}), patch("engine.lab._docker", side_effect=[result]):
                 with self.assertRaises(RuntimeError):
                     lab.start_lab()
 

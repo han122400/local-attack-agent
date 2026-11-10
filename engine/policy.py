@@ -1,6 +1,6 @@
 """Versioned v4 execution limits."""
 
-from risk_rubric import is_finite_number
+from engine.risk_rubric import is_finite_number
 
 
 # Node limits bound consecutive unproductive results and tools since progress.

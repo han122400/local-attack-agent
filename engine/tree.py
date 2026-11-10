@@ -14,11 +14,11 @@ import stat
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from session_log import LogFailure, SessionLog, atomic_write_json, safe_relative_path, validate_run_id
-from v4_contracts import (SCHEMA_VERSION, MAX_RESULT_BYTES, MAX_EVIDENCE_BYTES, MAX_TOTAL_EVIDENCE_BYTES,
+from engine.session_log import LogFailure, SessionLog, atomic_write_json, safe_relative_path, validate_run_id
+from engine.contracts import (SCHEMA_VERSION, MAX_RESULT_BYTES, MAX_EVIDENCE_BYTES, MAX_TOTAL_EVIDENCE_BYTES,
                           ContractError, dedup_key, normalize_url, validate_discovery, validate_id, validate_result)
-from risk_rubric import observations
-from scorer_state import SCORING_EVENTS, apply_scoring_event, empty_scorer, usage as scorer_usage
+from engine.risk_rubric import observations
+from engine.scorer_state import SCORING_EVENTS, apply_scoring_event, empty_scorer, usage as scorer_usage
 
 
 _KINDS = {"tree_initialized", "node_discovered", "node_selected", "node_state_changed",

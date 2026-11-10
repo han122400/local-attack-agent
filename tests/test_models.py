@@ -11,9 +11,9 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 import app
-import explorer as explorer_module
-from harness import Harness
-from session_log import SessionLog, SessionStore
+import orchestrator as explorer_module
+from engine.harness import Harness
+from engine.session_log import SessionLog, SessionStore
 
 
 class ModelRouteTests(unittest.TestCase):

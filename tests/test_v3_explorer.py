@@ -3,8 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from explorer import ExplorerV3
-from session_log import SessionStore
+from orchestrator import ExplorerV3
+from engine.session_log import SessionStore
 
 
 def model_reply(action, **fields):

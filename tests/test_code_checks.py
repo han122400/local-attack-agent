@@ -1,6 +1,6 @@
 import unittest
 
-from code_checks import check_generated_code
+from engine.code_checks import check_generated_code
 
 
 class CodeCheckTests(unittest.TestCase):

@@ -9,8 +9,8 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 import app
-from explorer import ExplorerV3
-from session_log import SessionStore
+from orchestrator import ExplorerV3
+from engine.session_log import SessionStore
 
 
 RUN_ID = "6" * 32

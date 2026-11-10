@@ -6,9 +6,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from command_runtime import CommandRuntime
-from explorer import ExplorerV3
-from session_log import LogFailure, SessionStore
+from engine.command_runtime import CommandRuntime
+from orchestrator import ExplorerV3
+from engine.session_log import LogFailure, SessionStore
 
 
 RUN_ID = "e" * 32

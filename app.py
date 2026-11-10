@@ -28,8 +28,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.concurrency import run_in_threadpool
 
-import scorecard
-from experiment_config import validate_experiment_config, require_execution_ready, V4ExecutionUnavailable, compatible_prompt
+import engine.scorecard as scorecard
+from engine.experiment_config import validate_experiment_config, require_execution_ready, V4ExecutionUnavailable, compatible_prompt
 
 
 TARGET = "http://127.0.0.1:3000/"
@@ -455,12 +455,12 @@ class Explorer:
         return ({"api": 0, "page": 1, "form": 1, "route": 2, "script": 3}.get(kind, 4), 0 if url.endswith("main.js") else 1)
 
 
-from explorer import ExplorerV3, safe_target  # noqa: E402 - v1 helpers above remain for unrelated regression tests.
-from lab import get_status as get_lab_status, start_lab
-from model_settings import settings_schema, validate_model_settings, model_presets
-from model_providers import get_openrouter_models, is_openrouter, openrouter_model
-from session_log import LogFailure, safe_relative_path, validate_run_id
-from planning import SYSTEM_PROMPT_VERSION, available_prompt_versions  # noqa: E402
+from orchestrator import ExplorerV3, safe_target  # noqa: E402 - v1 helpers above remain for unrelated regression tests.
+from engine.lab import get_status as get_lab_status, start_lab
+from engine.model_settings import settings_schema, validate_model_settings, model_presets
+from engine.model_providers import get_openrouter_models, is_openrouter, openrouter_model
+from engine.session_log import LogFailure, safe_relative_path, validate_run_id
+from engine.planning import SYSTEM_PROMPT_VERSION, available_prompt_versions  # noqa: E402
 
 
 EXPLORER = ExplorerV3()
@@ -508,7 +508,7 @@ def ollama_models(provider: str = "ollama") -> JSONResponse:
 
 @app.get("/api/scorer/models")
 def scorer_models(provider: str = "openrouter", base_url: str = "http://127.0.0.1:11434/") -> JSONResponse:
-    from decision_provider import LocalOllamaScorer, OpenRouterDecisions, ProviderError
+    from engine.decision_provider import LocalOllamaScorer, OpenRouterDecisions, ProviderError
     if provider not in ("openrouter", "local"):
         raise HTTPException(status_code=400, detail="Unknown scorer provider")
     if provider == "local":
@@ -651,7 +651,7 @@ async def start(request: Request) -> dict:
         experiment = validate_experiment_config(body)
         require_execution_ready(experiment)
         prompt_version = compatible_prompt(experiment["experiment_mode"], body.get("prompt_version"))
-        from v4_policy import execution_settings
+        from engine.policy import execution_settings
         v4_settings = execution_settings(body.get("v4_settings")) if experiment["experiment_mode"] == "v4" else None
         target = safe_target(body.get("target", TARGET))
         model = body.get("model", MODEL)
@@ -785,8 +785,8 @@ def run_score(run_id: str) -> JSONResponse:
 
 
 def read_v4_tree(run_id: str) -> dict:
-    from v4_tree import replay_tree, _json_result
-    from v4_contracts import ContractError
+    from engine.tree import replay_tree, _json_result
+    from engine.contracts import ContractError
     state = existing_run(run_id)
     if state.get("experiment_mode") != "v4":
         raise HTTPException(status_code=404, detail="This run has no v4 tree")
@@ -808,7 +808,7 @@ def read_v4_tree(run_id: str) -> dict:
 @app.get("/api/runs/{run_id}/tree")
 def run_tree(run_id: str) -> JSONResponse:
     tree = read_v4_tree(run_id)
-    from scorer_state import usage as scorer_usage
+    from engine.scorer_state import usage as scorer_usage
     return JSONResponse({key: tree[key] for key in ("schema_version", "run_id", "root_id", "current_id",
                                                     "last_event_seq", "nodes")}
                         | {"scorer": {"configuration": tree["scorer"]["configuration"],
@@ -818,7 +818,7 @@ def run_tree(run_id: str) -> JSONResponse:
 
 @app.get("/api/runs/{run_id}/nodes/{node_id}")
 def run_node(run_id: str, node_id: str) -> JSONResponse:
-    from v4_contracts import validate_id
+    from engine.contracts import validate_id
     try:
         validate_id(node_id)
     except ValueError as exc:

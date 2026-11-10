@@ -8,8 +8,8 @@ from pathlib import Path
 
 import psutil
 
-from command_runtime import CommandRuntime
-from session_log import SessionLog
+from engine.command_runtime import CommandRuntime
+from engine.session_log import SessionLog
 
 
 RUN_ID = "c" * 32

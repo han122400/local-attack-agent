@@ -5,11 +5,11 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import a5_benchmark
-import command_runtime
-import model_providers
-import planning
-from command_runtime import CommandRuntime
-from session_log import SessionLog
+import engine.command_runtime as command_runtime
+import engine.model_providers as model_providers
+import engine.planning as planning
+from engine.command_runtime import CommandRuntime
+from engine.session_log import SessionLog
 
 
 class ProjectPathTests(unittest.TestCase):

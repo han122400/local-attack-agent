@@ -3,7 +3,7 @@ import json
 import unittest
 
 import test_v4_loop as loop_fixture
-from v4_loop import V4Runner
+from strategies.greedy import V4Runner
 
 
 class DiscoveryContextTests(unittest.TestCase):

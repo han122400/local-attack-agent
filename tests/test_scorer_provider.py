@@ -3,8 +3,8 @@ import unittest
 
 import httpx2 as httpx
 
-from decision_provider import OpenRouterDecisions, ProviderError
-from risk_rubric import CRITERIA
+from engine.decision_provider import OpenRouterDecisions, ProviderError
+from engine.risk_rubric import CRITERIA
 from test_scorer_contract import node, answer
 
 

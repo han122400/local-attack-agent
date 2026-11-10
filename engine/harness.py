@@ -8,11 +8,11 @@ from dataclasses import replace
 
 import httpx2 as httpx
 
-from model_settings import validate_model_settings
-from model_providers import OpenRouterError, is_openrouter, openrouter_stream, strip_tool_call_framing
-from planning import (COMMAND_SCHEMA, SYSTEM_PROMPT, SYSTEM_PROMPT_SHA256, SYSTEM_PROMPT_VERSION,
+from engine.model_settings import validate_model_settings
+from engine.model_providers import OpenRouterError, is_openrouter, openrouter_stream, strip_tool_call_framing
+from engine.planning import (COMMAND_SCHEMA, SYSTEM_PROMPT, SYSTEM_PROMPT_SHA256, SYSTEM_PROMPT_VERSION,
                       Command, normalize_command_inputs, validate_command)
-from session_log import SessionLog
+from engine.session_log import SessionLog
 
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"

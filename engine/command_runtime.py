@@ -26,8 +26,8 @@ from urllib.parse import urlsplit
 
 import psutil
 
-from code_checks import check_generated_code
-from session_log import LogFailure, SessionLog, safe_relative_path, validate_run_id
+from engine.code_checks import check_generated_code
+from engine.session_log import LogFailure, SessionLog, safe_relative_path, validate_run_id
 
 
 if os.name == "nt":

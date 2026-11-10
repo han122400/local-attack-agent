@@ -4,10 +4,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from command_runtime import CommandRuntime
-from session_log import SessionLog
-from v4_tree import TreeStore
-from v4_reporting import save_report, finalize_v4
+from engine.command_runtime import CommandRuntime
+from engine.session_log import SessionLog
+from engine.tree import TreeStore
+from engine.reporting import save_report, finalize_v4
 from test_v4_tree import surface
 
 
@@ -106,7 +106,7 @@ class ReportingTests(unittest.TestCase):
     def test_report_failure_retains_runtime_and_requires_recovery(self):
         runtime = CommandRuntime(Path(self.temp.name), self.log)
         runtime.start_session(self.log.run_id, browser=False)
-        with patch("v4_reporting.save_report", side_effect=OSError("disk full")):
+        with patch("engine.reporting.save_report", side_effect=OSError("disk full")):
             finalize_v4(self.log, runtime, "error", "test_failure", lab_reset=lambda: None)
         self.assertTrue(runtime.runtime_dir.exists())
         self.assertEqual(self.log.metadata["phase"], "recovery_required")
@@ -115,7 +115,7 @@ class ReportingTests(unittest.TestCase):
         import psutil
         runtime = CommandRuntime(Path(self.temp.name), self.log)
         runtime.restore_owned(self.log.run_id, [{"pid": 55555, "created_at": 1.0, "run_id": self.log.run_id, "exec_id": "EXEC-0001"}])
-        with patch("command_runtime.psutil.Process", side_effect=psutil.NoSuchProcess(55555)), \
+        with patch("engine.command_runtime.psutil.Process", side_effect=psutil.NoSuchProcess(55555)), \
              patch.object(self.log, "append", side_effect=AssertionError("No writes")), \
              patch.object(self.log, "update", side_effect=AssertionError("No writes")):
             runtime.stop(self.log.run_id, record=False)
