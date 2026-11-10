@@ -21,6 +21,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from engine.paths import PROJECT_ROOT
 from urllib.parse import urlsplit
 
 import psutil
@@ -517,7 +518,7 @@ class CommandRuntime:
         server.settimeout(20)
         executable = installed_chromium() or ""
         args = [self.python, "-u", str(worker_path), "127.0.0.1", str(server.getsockname()[1]),
-                token, self.target, str(Path(__file__).resolve().parent), executable]
+                token, self.target, str(PROJECT_ROOT), executable]
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         process = subprocess.Popen(args, cwd=self.runtime_dir, env=self._environment(),
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

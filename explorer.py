@@ -10,6 +10,7 @@ import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
+from engine.paths import RUNS_ROOT
 from experiment_config import validate_experiment_config, require_execution_ready, compatible_prompt
 from v4_contracts import SCHEMA_VERSION
 from v4_tree import TreeStore
@@ -25,7 +26,6 @@ from session_log import ControllerLease, LogFailure, SessionLog, SessionStore, v
 
 TARGET = "http://127.0.0.1:3000/"
 MODEL = "qwen3.5:2b"
-RUNS_ROOT = Path(__file__).resolve().parent / "runs"
 DEFAULT_BUDGETS = {"seconds": 1200, "model_calls": 40, "tool_calls": 80,
                    "command_seconds": 30, "finalize_seconds": 120}
 

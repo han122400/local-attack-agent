@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from engine.paths import BENCHMARKS_DIR
 from urllib.request import urlopen
 
 from dotenv import dotenv_values
@@ -33,7 +34,7 @@ from v4_policy import execution_settings
 
 
 PROTOCOL = "a5-paired-v2"
-CONFIG_PATH = Path(__file__).resolve().parent / "benchmarks" / "a5-pair-v2.json"
+CONFIG_PATH = BENCHMARKS_DIR / "a5-pair-v2.json"
 PAIRS_DIR = RUNS_ROOT / "a5_pairs"
 CHALLENGE_KEY = "dbSchemaChallenge"
 LAB_IMAGE = "bkimminich/juice-shop:v20.2.0"

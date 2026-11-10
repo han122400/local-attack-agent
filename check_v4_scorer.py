@@ -5,6 +5,7 @@ import json
 import time
 import uuid
 from pathlib import Path
+from engine.paths import RUNS_ROOT
 
 from dotenv import dotenv_values
 
@@ -18,7 +19,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live", action="store_true", help="Authorize exactly one synthetic POST; no retries")
     parser.add_argument("--env-file", type=Path, help="Read only OPENROUTER_API_KEY, without exporting environment variables")
-    parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parent / "runs" / "scorer-contract-probes")
+    parser.add_argument("--output-dir", type=Path, default=RUNS_ROOT / "scorer-contract-probes")
     args = parser.parse_args()
     parent = {"id": "N0001", "kind": "root", "locator": {"url": "https://example.test/", "method": "GET", "input": "", "auth_context": "anonymous"}}
     child = {"id": "N0002", "kind": "candidate", "locator": {"url": "https://example.test/api/search", "method": "GET", "input": "q", "auth_context": "anonymous"},

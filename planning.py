@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from engine.paths import PROMPTS_DIR
 
 
 ACTIONS = ("read_file", "write_file", "run_command", "run_python", "finish")
@@ -46,7 +47,7 @@ COMMAND_SCHEMA = {
     ],
 }
 
-_PROMPTS_DIR = Path(__file__).resolve().parent / "prompts" / "system"
+_PROMPTS_DIR = PROMPTS_DIR
 
 
 def available_prompt_versions() -> list[str]:

@@ -8,12 +8,12 @@ import math
 import os
 import time
 from pathlib import Path
+from engine.paths import ENV_PATH
 
 import httpx2 as httpx
 from dotenv import dotenv_values
 
 
-ENV_PATH = Path(__file__).resolve().parent / ".env"
 OPENROUTER_PREFIX = "openrouter:"
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 _catalog_cache: dict = {}

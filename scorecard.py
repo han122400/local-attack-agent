@@ -22,8 +22,8 @@ import json
 import statistics
 import sys
 from pathlib import Path
+from engine.paths import RUNS_ROOT
 
-RUNS_ROOT = Path(__file__).resolve().parent / "runs"
 
 # Composite-score weights (sum to 1.0). Tune freely; the raw metrics below do not depend on them.
 SCORE_WEIGHTS = {"evidence_rate": 0.5, "non_waste_rate": 0.3, "clean_finish": 0.2}

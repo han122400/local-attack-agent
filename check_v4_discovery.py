@@ -14,6 +14,7 @@ import time
 import types
 import uuid
 from pathlib import Path
+from engine.paths import PROJECT_ROOT
 from urllib.parse import urlsplit
 
 from command_runtime import CommandRuntime
@@ -30,7 +31,7 @@ from v4_reporting import finalize_v4
 from v4_tree import TreeStore
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = PROJECT_ROOT
 REFERENCE_RUN = "c9e2de5fd82d4057a63fb42147390b2d"
 HTTP_ONLY = """HTTP-only validation environment override: no browser is launched.
 For target observations use action=run_python with synchronous Python code in
