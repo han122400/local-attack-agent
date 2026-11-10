@@ -85,7 +85,8 @@ def normalize_command_inputs(answer: object) -> tuple[object, list[str]]:
     """Remove only unambiguous payload noise before applying the strict contract.
 
     Never choose between conflicting payloads or move text into a required field.
-    Paths retain their exact semantics and are not repaired here.
+    A path used by its action keeps its exact semantics; a stray path on an action
+    that has none (run_python/run_command/finish) is dropped as unambiguous noise.
     """
     if not isinstance(answer, dict):
         return answer, []
@@ -100,6 +101,11 @@ def normalize_command_inputs(answer: object) -> tuple[object, list[str]]:
         if not value.strip() or (isinstance(chosen, str) and chosen and value == chosen):
             normalized[key] = ""
             fields.append(key)
+    if answer.get("action") not in ("read_file", "write_file"):
+        path = answer.get("path")
+        if isinstance(path, str) and path:
+            normalized["path"] = ""
+            fields.append("path")
     return normalized, fields
 
 

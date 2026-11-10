@@ -5,7 +5,7 @@ from pathlib import Path
 
 from harness import Harness, ModelFailure
 from model_providers import OpenRouterError
-from planning import Command, validate_command
+from planning import Command, normalize_command_inputs, validate_command
 from session_log import SessionLog
 
 
@@ -34,6 +34,19 @@ class CommandContractTests(unittest.TestCase):
         for field in ("plan", "reason"):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 validate_command(dict(finish, **{field: ""}))
+
+    def test_stray_path_on_non_file_action_is_dropped_but_file_paths_kept(self):
+        run = {"action": "run_python", "plan": "Inspect", "reason": "Observe",
+               "path": "work/node-results/A0001.json", "content": "", "command": "", "code": "print(1)"}
+        normalized, fields = normalize_command_inputs(run)
+        self.assertEqual(normalized["path"], "")
+        self.assertIn("path", fields)
+        self.assertEqual(validate_command(normalized).code, "print(1)")
+        write = {"action": "write_file", "plan": "Save", "reason": "reuse",
+                 "path": "tools/probe.py", "content": "print(1)", "command": "", "code": ""}
+        kept, kept_fields = normalize_command_inputs(write)
+        self.assertEqual(kept["path"], "tools/probe.py")
+        self.assertNotIn("path", kept_fields)
 
 
 class HarnessTests(unittest.TestCase):

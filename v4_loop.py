@@ -431,8 +431,15 @@ class V4Runner:
                     "Keep every template field. evidence_refs may refer only to separately written observation files, "
                     "never a node-results JSON or an absolute path. Do not run another target request in this response.")
                 def validate_correction(candidate):
-                    if candidate.action != "write_file" or candidate.path != attempt["result_path"]:
-                        raise ValueError("Use write_file at the exact pending attempt.result_path")
+                    expected = attempt["result_path"]
+                    try:
+                        same_file = (candidate.action == "write_file"
+                                     and _safe_path(self.runtime.runtime_dir, candidate.path)
+                                     == _safe_path(self.runtime.runtime_dir, expected))
+                    except (ValueError, OSError):
+                        same_file = False
+                    if not same_file:
+                        raise ValueError(f"Use action=write_file with path exactly {expected!r} and no other action")
                     value = json.loads(candidate.content)
                     if isinstance(value, dict) and "next_observation" not in value:
                         raise ValueError("Result JSON is missing next_observation")
