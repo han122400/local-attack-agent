@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import copy
+import hashlib
 import os
 import queue
 import re
@@ -17,6 +19,8 @@ from command_runtime import CommandRuntime, bounded_preview
 from harness import Harness, ModelFailure
 from j1_policy import J1Policy, pack_j1_context
 from j2_policy import J2Policy, MEMORY_PATH, pack_j2_context
+from j2_progress import public_path
+from j25_oracle import capture_j25_lab_oracle, evaluate_j25_lab_run
 from lab import reset_lab
 from model_settings import default_model_settings, validate_model_settings
 from planning import SYSTEM_PROMPT, SYSTEM_PROMPT_VERSION, available_prompt_versions, load_prompt
@@ -40,6 +44,36 @@ _PROMPT_FRACTION = 0.65       # share of num_ctx used for the prompt (rest reser
 def context_char_budget(num_ctx: int, system_prompt: str = SYSTEM_PROMPT) -> int:
     total_prompt_chars = int(max(1024, num_ctx) * _CHARS_PER_TOKEN * _PROMPT_FRACTION)
     return max(2000, total_prompt_chars - len(system_prompt))
+
+
+def _pack_model_context(context: dict, budget: int) -> dict:
+    """Preview execution detail without changing executable commands, goals or stored findings."""
+    fields = {"plan", "reason", "claim", "observed", "error", "stdout", "stderr", "exception", "command", "code", "content"}
+    def preview(value, limit, field=""):
+        if isinstance(value, str) and field in fields and len(value) > limit:
+            marker = "\n[preview; full value in run log]\n"
+            head = (limit - len(marker)) * 2 // 3
+            return value[:head] + marker + value[-(limit - len(marker) - head):]
+        if isinstance(value, dict):
+            return {key: preview(child, limit, key) for key, child in value.items()}
+        if isinstance(value, list):
+            return [preview(child, limit, field) for child in value]
+        return value
+    def size():
+        return len(json.dumps(result, ensure_ascii=False))
+    for limit in (1200, 600, 240, 80):
+        result = {**context, **{key: preview(context[key], limit) for key in ("history", "recent", "feedback") if key in context}}
+        while size() > budget and len(result.get("history", [])) > 1:
+            result["history"].pop(0)
+        if size() <= budget:
+            return result
+    while size() > budget and len(result.get("recent", [])) > 1:
+        result["recent"].pop(0)
+    if size() > budget:
+        result["history"] = []
+    if size() > budget:
+        raise ModelFailure("context", "Required model context exceeds the input budget; shorten the goal or increase num_ctx")
+    return result
 
 
 def _digest(text: str, limit: int = 240) -> str:
@@ -102,6 +136,9 @@ def compose_report(findings: list[dict], run_result: str, model_reason: str, *, 
         if j1_state.get("unlinked_steps"):
             lines.append(f"추적 정보가 부족한 실행 단계: {j1_state['unlinked_steps']}")
     if j2_state is not None:
+        memory_state = j2_state.get("memory_state", {})
+        if memory_state and not memory_state.get("non_memory_executions"):
+            lines.append("대상 작업 기록 없음: 내부 메모리 읽기·거절 이력은 대상 관찰이 아니며, 공격 표면 부재의 근거가 아님. 이전 실행의 정찰 결과는 자동으로 불러오지 않음.")
         lines.append("실행 기록 대조(HTTP 응답 메타데이터는 기존 도우미에 한정되며 보안 영향의 검증이 아님):")
         by_step = {item["step"]: item for item in findings}
         cited = {int(value) for value in re.findall(r"\[step:(\d{1,6})\]", model_reason or "")}
@@ -120,7 +157,7 @@ def compose_report(findings: list[dict], run_result: str, model_reason: str, *, 
             for error in item.get("helper_errors", []):
                 lines.append(f"    도우미 오류: {error['helper']} · {error['error_type']} · {error['url']} · 코드 종료 상태와 별개이며 해당 관찰의 성공을 뜻하지 않음")
         for item in j2_state.get("rejected_actions", []):
-            lines.append(f"  - 미시행 {item['call_id']}: 사전 검사 거절 · {item['plan']} · {item['source_path']}")
+            lines.append(f"  - 미시행 {item['call_id']}: 사전 검사 거절 · {item['plan']} · {item.get('path') or item['source_path'] or item['artifact_path']}")
         lines.append("실패·미시행의 계획은 수행 결과가 아님. HTTP 기록 부재만으로 미시행을 단정하지 않으며 원시 클라이언트·브라우저 요청은 이 기록에 모두 포함되지 않음.")
         lines.append(f"전체 조사 이력: {MEMORY_PATH} (런타임 내 경로; 종료 후 보존된 work 산출물 참조)")
         pipeline = j2_state.get("pipeline", {})
@@ -198,6 +235,66 @@ def uses_juice_lab(target: str) -> bool:
     return (parsed.scheme, parsed.hostname, parsed.port) == ("http", "127.0.0.1", 3000)
 
 
+def validate_j25_test_scope(scope: dict | None, target: str, prompt_version: str) -> dict | None:
+    if scope is None:
+        return None
+    required = {"isolation", "allowed_methods", "allowed_paths", "identities"}
+    if (prompt_version != "J2.5" or not isinstance(scope, dict) or
+            not required <= set(scope) or set(scope) - required - {"proof_canaries"}):
+        raise ValueError("J2.5 test scope has invalid keys or prompt version")
+    if (not isinstance(scope["isolation"], str) or scope["isolation"] not in {"lab", "recoverable"}
+            or (scope["isolation"] == "lab" and not uses_juice_lab(target))):
+        raise ValueError("Test scope requires an isolated local lab or explicitly recoverable data")
+    methods, paths, identities = scope["allowed_methods"], scope["allowed_paths"], scope["identities"]
+    if (not isinstance(methods, list) or not methods or len(methods) > 4
+            or any(not isinstance(method, str) or method not in {"POST", "PUT", "PATCH", "DELETE"} for method in methods)
+            or len(set(methods)) != len(methods)):
+        raise ValueError("Test scope methods must be explicit state-changing HTTP methods")
+    if (not isinstance(paths, list) or not paths or len(paths) > 32
+            or any(not isinstance(path, str) or not path.startswith("/") or path.startswith("//")
+                   or len(path) > 200 or any(part in path for part in ("?", "#", "\\", "..")) for path in paths)
+            or len(set(paths)) != len(paths)):
+        raise ValueError("Test scope paths must be exact absolute paths")
+    if not isinstance(identities, list) or not 1 <= len(identities) <= 3:
+        raise ValueError("Test scope requires one to three isolated test identities")
+    names = set()
+    origin = urlsplit(target)
+    for identity in identities:
+        if not isinstance(identity, dict) or set(identity) != {"name", "cookies"}:
+            raise ValueError("Test identity must contain a name and cookies")
+        name, cookies = identity["name"], identity["cookies"]
+        if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", name)
+                or name == "public" or name in names or not isinstance(cookies, list) or len(cookies) > 20):
+            raise ValueError("Test identity name or cookie list is invalid")
+        names.add(name)
+        for cookie in cookies:
+            if not isinstance(cookie, dict) or set(cookie) != {"name", "value", "url"}:
+                raise ValueError("Test identity cookie must contain name, value and URL")
+            parsed = urlsplit(cookie["url"]) if isinstance(cookie["url"], str) else None
+            if (not isinstance(cookie["name"], str) or not re.fullmatch(r"[^;\s=]{1,100}", cookie["name"])
+                    or not isinstance(cookie["value"], str) or len(cookie["value"]) > 4096
+                    or parsed is None or (parsed.scheme, parsed.hostname, parsed.port) !=
+                        (origin.scheme, origin.hostname, origin.port) or parsed.query or parsed.fragment):
+                raise ValueError("Test identity cookie is invalid or outside the target origin")
+    canaries = scope.get("proof_canaries", [])
+    if not isinstance(canaries, list) or len(canaries) > 16:
+        raise ValueError("Invalid proof canaries")
+    labels, values = set(), set()
+    for item in canaries:
+        if not isinstance(item, dict) or set(item) != {"label", "value", "protected", "authorized_identities"}:
+            raise ValueError("Invalid proof canary entry")
+        label, value, allowed = item["label"], item["value"], item["authorized_identities"]
+        if (not isinstance(label, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", label) or label in labels
+                or not isinstance(value, str) or not 8 <= len(value) <= 256 or value in values
+                or type(item["protected"]) is not bool or not isinstance(allowed, list)
+                or not allowed or any(not isinstance(name, str) or name not in names | {"public"} for name in allowed)
+                or len(set(allowed)) != len(allowed)):
+            raise ValueError("Proof canary label, value or authorized identities are invalid")
+        labels.add(label)
+        values.add(value)
+    return copy.deepcopy(scope)
+
+
 def validate_budgets(raw: dict | None) -> dict:
     values = {**DEFAULT_BUDGETS, **(raw or {})}
     if set(values) != set(DEFAULT_BUDGETS) or any(
@@ -223,6 +320,7 @@ class ExplorerV3:
         self.worker: threading.Thread | None = None
         self.active_run_id: str | None = None
         self._runtime: CommandRuntime | None = None
+        self._private_target: str | None = None
         self._subscribers: set[queue.Queue] = set()
         self._event_subscribers: set[queue.Queue] = set()
         self._recent_state: dict = {"status": "idle", "run_id": None, "console": "", "model": MODEL,
@@ -241,7 +339,8 @@ class ExplorerV3:
 
     def start(self, target: str = TARGET, model: str = MODEL, *, goal: str = "Explore the local lab",
               model_settings: dict | None = None, scenario_source: str = "manual", chain_mode: str = "none",
-              budgets: dict | None = None, prompt_version: str | None = None) -> str | bool:
+              budgets: dict | None = None, prompt_version: str | None = None,
+              j25_test_scope: dict | None = None) -> str | bool:
         if scenario_source != "manual" or chain_mode != "none":
             raise ValueError("Only manual scenario with none chain is implemented")
         if not isinstance(goal, str) or not goal.strip() or len(goal) > 2000:
@@ -252,6 +351,7 @@ class ExplorerV3:
         prompt_version = prompt_version or SYSTEM_PROMPT_VERSION
         if prompt_version not in available_prompt_versions():
             raise ValueError("Unknown system prompt version")
+        j25_test_scope = validate_j25_test_scope(j25_test_scope, target, prompt_version)
         selected = default_model_settings() if model_settings is None else validate_model_settings(model_settings)
         selected_budgets = validate_budgets(budgets)
         with self.lock:
@@ -265,14 +365,18 @@ class ExplorerV3:
                 raise RuntimeError(reason)
             self.stop_event.clear()
             run_id = uuid.uuid4().hex
+            stored_target = public_path(target) if prompt_version == "J2.5" else target
             metadata = {"owner_instance_id": self.instance_id, "controller_pid": os.getpid(),
                         "runtime_path": str(self.store.root / run_id / "runtime"),
-                        "runtime_creation_intent": False, "goal": goal.strip(), "target": target,
+                        "runtime_creation_intent": False, "goal": goal.strip(), "target": stored_target,
                         "lab_reset_status": "pending" if uses_juice_lab(target) else "not_applicable",
                         "initial_lab_status": "pending" if uses_juice_lab(target) else "not_applicable",
                         "model": model, "model_settings": selected, "budgets": selected_budgets,
                         "scenario_source": scenario_source, "chain_mode": chain_mode,
                         "prompt_version": prompt_version,
+                        "j25_identity_names": ["public", *[item["name"] for item in j25_test_scope["identities"]]]
+                            if j25_test_scope else ["public"],
+                        "j25_mutation_allowed": bool(j25_test_scope),
                         "started_at": time.time(), "finished_at": None, "finish_reason": "",
                         "managed_processes": []}
             try:
@@ -282,6 +386,8 @@ class ExplorerV3:
                 self.lease.release()
                 raise
             self.active_run_id = run_id
+            self._private_target = target if prompt_version == "J2.5" else None
+            self._private_j25_scope = j25_test_scope
             self._recent_state = {**metadata, "run_id": run_id, "status": "running", "phase": "preparing",
                                   "console": "", "events": []}
             log.listen(self._broadcast)
@@ -317,6 +423,7 @@ class ExplorerV3:
         runtime = CommandRuntime(self.store.root, log)
         with self.lock:
             self._runtime = runtime
+            target = self._private_target or log.metadata.get("target", TARGET)
         try:
             if uses_juice_lab(log.metadata.get("target", TARGET)) and not any(
                        uses_juice_lab(item.get("target", TARGET))
@@ -329,7 +436,8 @@ class ExplorerV3:
                 log.append("initial_lab_reset", {"probe": initial_probe})
                 log.update(initial_lab_status="succeeded", initial_lab_probe=initial_probe)
             log.update(phase="running")
-            runtime.start_session(run_id, target=log.metadata["target"], browser=self.browser_enabled)
+            runtime.start_session(run_id, target=target, browser=self.browser_enabled,
+                                  j25_test_scope=self._private_j25_scope)
             result, reason = self._loop(run_id, log, runtime)
         except LogFailure as exc:
             result, reason = "error", f"Log failure: {exc}"
@@ -352,16 +460,22 @@ class ExplorerV3:
             with self.lock:
                 self._runtime = None
                 self.active_run_id = None
+                self._private_target = None
+                self._private_j25_scope = None
             self.lease.release()
 
     def _loop(self, run_id: str, log: SessionLog, runtime: CommandRuntime) -> tuple[str, str]:
         metadata = log.metadata
+        if metadata.get("prompt_version") == "J2.5":
+            from j25_runner import J25Runner
+            return J25Runner(run_id, log, runtime, transport=self.transport,
+                             stop_requested=self.stop_event.is_set, recent_state=self._recent_state).run()
         budgets = metadata["budgets"]
         deadline = time.monotonic() + budgets["seconds"]
         prompt_version = metadata.get("prompt_version", SYSTEM_PROMPT_VERSION)
         system_prompt, system_prompt_sha256 = load_prompt(prompt_version)
         policy = J1Policy(metadata["target"]) if prompt_version == "J1" else None
-        notebook = J2Policy() if prompt_version == "J2" else None
+        notebook = J2Policy(memory_file=runtime.runtime_dir / MEMORY_PATH) if prompt_version == "J2" else None
         report_reserve = 1
         harness = Harness(log, transport=self.transport, max_calls=budgets["model_calls"],
                           stop_requested=self.stop_event.is_set, system_prompt=system_prompt,
@@ -372,7 +486,9 @@ class ExplorerV3:
         recent: list[dict] = []
         request_templates: list[dict] = []
         history: list[dict] = []       # structured memory of every step; survives recent trimming
-        seen: dict[str, int] = {}      # observation digest -> step that first produced it (repetition)
+        seen: dict[str, int] = {}      # tracked prompts: observation digest -> first matching step
+        last_signature = None          # generic prompts: exact command and outcome repetition
+        repeat_start_step = None
         durations: list[float] = []    # recent decide() wall times, to reserve time for a final summary
         tool_index, report_required = 0, False
         if policy:
@@ -393,14 +509,19 @@ class ExplorerV3:
                 problems = notebook.command_problems(command)
                 if not problems:
                     return
-                source = f"tools/preflight-{command.call_id}.py"
-                runtime._file_path(source, writing=True).write_text(command.code, encoding="utf-8")
-                artifact = log.preserve_bytes(f"preflight/{command.call_id}.py", command.code.encode("utf-8"))
+                source = ""
+                if command.action == "run_python":
+                    source = f"tools/preflight-{command.call_id}.py"
+                    runtime._file_path(source, writing=True).write_text(command.code, encoding="utf-8")
+                    artifact = log.preserve_bytes(f"preflight/{command.call_id}.py", command.code.encode("utf-8"))
+                else:
+                    artifact = log.preserve_bytes(f"preflight/{command.call_id}.json", json.dumps(asdict(command), ensure_ascii=False).encode("utf-8"))
                 notebook.record_rejection(command, problems, source, artifact["path"])
                 log.append("preflight_rejected", {"call_id": command.call_id, "problems": problems,
                                                   "source_path": source, "artifact_path": artifact["path"]})
                 save_notebook()
-                raise ValueError(f"Preflight failed. Read {source}. " + "; ".join(problems[:2]))
+                hint = f" Read {source}." if source else ""
+                raise ValueError(f"Preflight failed.{hint} " + "; ".join(problems[:2]))
             harness.command_guard = validate_j2_command
         while True:
             if self.stop_event.is_set():
@@ -438,7 +559,7 @@ class ExplorerV3:
                 if notebook:
                     ctx["j2"] = notebook.context()
                     ctx["browser_api"] = {
-                        "imports": "page/context/browser and helpers are already provided. tools exports helpers; browser exports page/context/browser. Individual helpers are functions, not modules.",
+                        "imports": "page/context/browser and helpers are already provided. tools exports helpers; browser exports page/context/browser; browser_api exports both for compatibility. Individual helpers are functions, not modules.",
                         "unavailable_modules": sorted(notebook.unavailable_modules),
                         "http_get": {"call": "await http_get(url)", "returns": "dictionary: status, headers, body, body_truncated, binary, json?",
                                      "body_limit": 2_000_000},
@@ -478,8 +599,13 @@ class ExplorerV3:
                 context["note"] = ("An observation digest repeated. This may be an intentional baseline/control/recheck; "
                                    "compare the actual candidate, input and response before deciding to change course. "
                                    "Reuse a working request instead of reconstructing it without new information." if policy or notebook else
-                                   "Your last step repeated an earlier observation with no new evidence. "
-                                   "Try a different route, feature, or approach — do not repeat it.")
+                                   "The last command and outcome match the preceding attempt. "
+                                   "If this is an intentional control, state its purpose; otherwise revise the command or approach.")
+            if history and history[-1]["status"] in {"error", "timeout"}:
+                last = history[-1]
+                context["feedback"] = {"step": last["step"], "action": last["action"], "error": last["error"],
+                    "repeat_of": last.get("repeat_of"),
+                    "instruction": "Use the recent command and error to fix the cause. Preserve useful prior observations; failed execution is not a finding."}
             if finish_soon:
                 context["instruction"] = ("The reporting phase is active. Call finish now with the actual result: the "
                                           "confirmed facts (each with its evidence), the failures, and what "
@@ -489,8 +615,10 @@ class ExplorerV3:
                     context = (pack_j2_context if notebook else pack_j1_context)(context, budget)
                 except ValueError as exc:
                     raise ModelFailure("context", str(exc)) from exc
-                log.update(context_chars=len(json.dumps(context, ensure_ascii=False)))
-                self._recent_state["context_chars"] = log.metadata["context_chars"]
+            else:
+                context = _pack_model_context(context, budget)
+            log.update(context_chars=len(json.dumps(context, ensure_ascii=False)))
+            self._recent_state["context_chars"] = log.metadata["context_chars"]
             started = time.monotonic()
             try:
                 command = harness.decide(run_id, context, model=metadata["model"],
@@ -502,7 +630,7 @@ class ExplorerV3:
                         report_required = True
                         log.append("report_requested", {"reason": str(exc)[:240], "calls_used": harness.calls})
                         continue
-                    return "error", f"Model report unavailable ({exc.kind}); see the preserved observations and deterministic report."
+                    return "error", f"Model {exc.kind}: report unavailable; see the preserved observations and deterministic report."
                 raise
             finally:
                 log.update(findings=history, cost_usd=round(harness.total_cost, 6))
@@ -567,9 +695,20 @@ class ExplorerV3:
                 status, observed, error = "ok", _digest(execution.stdout), ""
             else:
                 status, observed, error = "error", _digest(execution.stdout), _digest(execution.exception or execution.stderr, 200)
-            repeat_of = seen.get(observed) if observed and status == "ok" else None
-            if observed and status == "ok" and repeat_of is None:
-                seen[observed] = tool_index + 1
+            if policy or notebook:
+                repeat_of = seen.get(observed) if observed and status == "ok" else None
+                if observed and status == "ok" and repeat_of is None:
+                    seen[observed] = tool_index + 1
+            else:
+                error_lines = (execution.exception or execution.stderr).strip().splitlines()
+                outcome = {"stdout": execution.stdout, "exit_code": execution.exit_code,
+                           "timed_out": execution.timed_out, "error": error_lines[-1] if error_lines else ""}
+                signature = hashlib.sha256(json.dumps(
+                    [command.runtime_payload(), outcome], sort_keys=True).encode()).hexdigest()
+                repeat_of = repeat_start_step if signature == last_signature and (observed or error) else None
+                if repeat_of is None:
+                    repeat_start_step = tool_index + 1
+                last_signature = signature
             entry = {"step": tool_index + 1, "action": command.action, "plan": command.plan[:140],
                      "claim": command.reason[:200], "status": status,
                      "observed": observed or "(no evidence)", "error": error,
@@ -607,8 +746,12 @@ class ExplorerV3:
         # Deterministic report from the preserved findings, so a timed-out/stopped run still ends with an
         # actual result instead of only a deadline message. Best-effort; the full record stays on disk.
         try:
-            report = compose_report(log.metadata.get("findings") or [], run_result, reason,
-                                    j1_state=log.metadata.get("j1_state"), j2_state=log.metadata.get("j2_state"))
+            if log.metadata.get("prompt_version") == "J2.5":
+                from j25_runner import compose_j25_report
+                report = compose_j25_report(log.metadata.get("j25_state") or {}, run_result, reason)
+            else:
+                report = compose_report(log.metadata.get("findings") or [], run_result, reason,
+                                        j1_state=log.metadata.get("j1_state"), j2_state=log.metadata.get("j2_state"))
             log.update(report=report)
             self._recent_state.update(report=report)
         except LogFailure:
@@ -640,6 +783,18 @@ class ExplorerV3:
                     raise RuntimeError("Runtime folder remains after destroy")
                 log.update(cleanup_status="succeeded")
                 log.append("cleanup_step", {"step": "destroy", "status": "succeeded"})
+            if (log.metadata.get("prompt_version") == "J2.5"
+                    and uses_juice_lab(log.metadata.get("target", TARGET))
+                    and "j25_lab_oracle" not in log.metadata):
+                try:
+                    oracle = capture_j25_lab_oracle(log.metadata["target"])
+                except Exception as exc:
+                    oracle = {"status": "unavailable", "error_type": type(exc).__name__}
+                evaluation = evaluate_j25_lab_run(
+                    (log.metadata.get("j25_state") or {}).get("evidence") or {"cases": []}, oracle)
+                log.update(j25_lab_oracle=oracle, j25_lab_evaluation=evaluation)
+                log.append("j25_oracle_captured", {"status": oracle["status"],
+                    "confirmed_count": evaluation["confirmed_count"]})
             if (uses_juice_lab(log.metadata.get("target", TARGET))
                     and log.metadata.get("lab_reset_status") != "succeeded"):
                 log.update(phase="resetting", lab_reset_status="running")

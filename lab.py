@@ -95,6 +95,28 @@ def _probe_initial_state() -> dict:
                                                    for item in product_rows if isinstance(item, dict))}
 
 
+def read_j25_challenge_state() -> dict:
+    """Read only challenge IDs and solved flags; never retain descriptions or hints."""
+    inspected = _docker("inspect", CONTAINER, timeout=10)
+    if inspected.returncode:
+        raise RuntimeError("Juice Shop container version unavailable")
+    try:
+        image = json.loads(inspected.stdout)[0]["Config"]["Image"]
+        with urlopen(TARGET + "api/Challenges/", timeout=5) as response:
+            rows = json.load(response)
+        if rows.get("status") != "success" or not isinstance(rows.get("data"), list):
+            raise ValueError("invalid challenge state")
+        ids = [item["id"] for item in rows["data"] if isinstance(item, dict)
+               and type(item.get("id")) is int and type(item.get("solved")) is bool]
+        if len(ids) != len(rows["data"]) or len(set(ids)) != len(ids):
+            raise ValueError("incomplete challenge state")
+        solved = sorted(item["id"] for item in rows["data"] if item["solved"])
+        return {"status": "available", "image": image, "challenge_count": len(ids), "solved_ids": solved,
+                "captured_at": time.time()}
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise RuntimeError("Juice Shop challenge state unavailable") from exc
+
+
 def reset_lab(*, wait_seconds: float = 45) -> dict:
     """Restart the existing fixed container and verify its reseeded data."""
     with _start_lock:

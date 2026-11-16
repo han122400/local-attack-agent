@@ -60,7 +60,10 @@ Reporting and limits:
 
 Runtime reference:
 - browser/context/page persist; Python variables reset. Use top-level await or async def main(page, context,
-  browser); never asyncio.run() or an undefined main. Await async helpers; do not launch another browser.
+  browser); the runtime supplies those objects. Never drive another event loop with asyncio.run(),
+  run_until_complete() or run_forever(). If calling main explicitly, use await main(page, context, browser),
+  never main(None, None, None). Await async helpers; do not launch another browser.
+- read_file opens saved runtime-relative files, not website URLs. Use an awaited HTTP/browser helper for URLs.
 - http_get returns status/headers/body/body_truncated/binary/json?; body is a preview up to 2000 characters.
   get_text reads full text; get_json reads JSON. goto_and_render returns a Page, not a dictionary.
   context.request is provided, not an async context manager. Native responses have status/headers

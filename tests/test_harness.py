@@ -2,8 +2,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from harness import Harness, ModelFailure
+from harness import Harness, ModelFailure, repeating_explanation
 from model_providers import OpenRouterError
 from planning import Command, validate_command
 from session_log import SessionLog
@@ -37,6 +38,129 @@ class CommandContractTests(unittest.TestCase):
 
 
 class HarnessTests(unittest.TestCase):
+    def test_python_await_is_not_accepted_as_a_shell_command(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            self.addCleanup(log.close)
+            sent = []
+            bad = {"action": "run_command", "plan": "Observe", "reason": "Fetch page",
+                   "path": "", "content": "", "command": "await http_get('https://fixture.invalid/')", "code": ""}
+            good = {**bad, "action": "run_python", "command": "", "code": bad["command"]}
+            def transport(payload):
+                sent.append(payload)
+                yield {"message": {"content": json.dumps(bad if len(sent) == 1 else good)}, "done": True}
+            result = Harness(log, transport=transport).decide(RUN_ID, {}, model="fixture", settings={})
+            self.assertEqual(result.action, "run_python")
+            self.assertEqual(len(sent), 2)
+
+    def test_slow_internal_repairs_leave_time_for_the_reporting_call(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            self.addCleanup(log.close)
+            clock, sent = [100.0], []
+            finish = {"action": "finish", "plan": "Report", "reason": "No target observations",
+                      "path": "", "content": "", "command": "", "code": ""}
+            def transport(payload):
+                sent.append(payload)
+                reporting = len(sent) > 1 and '"finish_soon": true' in payload["messages"][1]["content"]
+                clock[0] += 10 if reporting else 80
+                yield {"message": {"content": json.dumps(finish) if reporting else "{"}, "done": True}
+            harness = Harness(log, transport=transport, max_calls=40, report_reserve=1)
+            with patch("harness.time.monotonic", side_effect=lambda: clock[0]):
+                with self.assertRaises(ModelFailure) as caught:
+                    harness.decide(RUN_ID, {"remaining": {"finish_soon": False}}, model="fixture", settings={}, deadline=240)
+                self.assertEqual(caught.exception.kind, "budget")
+                result = harness.decide(RUN_ID, {"remaining": {"finish_soon": True}}, model="fixture", settings={}, deadline=240)
+            self.assertEqual(result.action, "finish")
+            self.assertEqual(len(sent), 2)
+            self.assertLess(clock[0], 240)
+
+    def test_j1_wrong_runtime_actions_are_repaired_before_command_acceptance(self):
+        for invalid in (
+                {"action": "read_file", "path": "https://fixture.invalid/", "code": ""},
+                {"action": "read_file", "path": "/runtime/index.html", "code": ""},
+                {"action": "run_python", "path": "", "code": "asyncio.get_event_loop().run_until_complete(task())"}):
+            with self.subTest(action=invalid["action"]), tempfile.TemporaryDirectory() as temp:
+                log = SessionLog(Path(temp), RUN_ID, {})
+                self.addCleanup(log.close)
+                sent = []
+                bad = {"plan": "Observe", "reason": "Inspect target", "content": "", "command": "", **invalid}
+                good = {"action": "run_python", "plan": "Observe", "reason": "Use supplied runtime",
+                        "path": "", "content": "", "command": "", "code": "print(await page.title())"}
+                def transport(payload):
+                    sent.append(payload)
+                    yield {"message": {"content": json.dumps(bad if len(sent) == 1 else good)}, "done": True}
+                command = Harness(log, transport=transport, system_prompt_version="J1").decide(RUN_ID, {}, model="fixture", settings={})
+                self.assertEqual(command.code, good["code"])
+                self.assertEqual(len(sent), 2)
+                self.assertEqual(sum(e["kind"] == "command_decoded" for e in log.read_events()), 1)
+
+    def test_j2_truncated_code_still_grows_budget_when_a_completed_reason_contains_repeated_test_data(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            self.addCleanup(log.close)
+            sent = []
+            cut = json.dumps({"action": "run_python", "plan": "Inspect length handling", "reason": "Use a bounded test value: " + "A" * 160,
+                              "path": "", "content": "", "command": "", "code": "print('fixture')\n" * 500})[:-20]
+            good = json.dumps({"action": "finish", "plan": "Report", "reason": "No verified effect",
+                               "path": "", "content": "", "command": "", "code": ""})
+            def transport(payload):
+                sent.append(payload)
+                first = len(sent) == 1
+                yield {"message": {"content": cut if first else good}, "done": True, "done_reason": "length" if first else "stop"}
+            Harness(log, transport=transport, system_prompt_version="J2").decide(
+                RUN_ID, {}, model="fixture", settings={"options": {"num_predict": 4096}})
+            self.assertEqual([item["options"]["num_predict"] for item in sent], [4096, 8192])
+            self.assertFalse(any(item["kind"] == "output_repetition_detected" for item in log.read_events()))
+
+    def test_repeated_explanation_is_detected_before_a_different_truncated_tail(self):
+        repeated = '{"reason":"' + ("Inspecting the same empty notes is described repeatedly without any new observation. " * 60)
+        self.assertTrue(repeating_explanation(repeated + "A different incomplete final sentence"))
+        code = json.dumps({"reason": "Read an actual source", "code": "print('same')\n" * 500})
+        self.assertFalse(repeating_explanation(code))
+
+    def test_j2_repeated_explanation_does_not_raise_the_output_budget(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            self.addCleanup(log.close)
+            sent = []
+            repeated = '{"action":"read_file","plan":"Inspect notes","reason":"' + ("This is the beginning of the current investigation and the same rationale is repeated. " * 100)
+            good = json.dumps({"action": "finish", "plan": "Report limits", "reason": "No target observations yet",
+                               "path": "", "content": "", "command": "", "code": ""})
+            def transport(payload):
+                sent.append(payload)
+                first = len(sent) == 1
+                yield {"message": {"content": repeated if first else good}, "done": True,
+                       "done_reason": "length" if first else "stop"}
+            harness = Harness(log, transport=transport, system_prompt_version="J2")
+            harness.decide(RUN_ID, {}, model="fixture", settings={"options": {"num_predict": 4096}})
+            harness.decide(RUN_ID, {}, model="fixture", settings={"options": {"num_predict": 4096}})
+            self.assertEqual([item["options"]["num_predict"] for item in sent], [4096, 4096, 4096])
+            events = log.read_events()
+            self.assertTrue(any(item["kind"] == "output_repetition_detected" for item in events))
+            self.assertFalse(any(item["kind"] == "output_budget_raised" for item in events))
+
+    def test_j2_ignoring_short_explanation_schema_is_repaired_without_limiting_the_report(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = SessionLog(Path(temp), RUN_ID, {})
+            self.addCleanup(log.close)
+            sent = []
+            long = {"action": "read_file", "plan": "Inspect notes", "reason": "x" * 801,
+                    "path": "work/notes.json", "content": "", "command": "", "code": ""}
+            report = {**long, "action": "finish", "path": "", "reason": "r" * 5000}
+            def transport(payload):
+                sent.append(payload)
+                yield {"message": {"content": json.dumps(long if len(sent) == 1 else report)}, "done": True}
+            result = Harness(log, transport=transport, system_prompt_version="J2").decide(RUN_ID, {}, model="fixture", settings={})
+            self.assertEqual(len(sent), 2)
+            self.assertEqual(result.action, "finish")
+            self.assertEqual(result.reason, "r" * 5000)
+            branches = sent[0]["format"]["oneOf"]
+            read = next(branch for branch in branches if branch["properties"]["action"]["const"] == "read_file")
+            finish = next(branch for branch in branches if branch["properties"]["action"]["const"] == "finish")
+            self.assertEqual(read["properties"]["reason"]["maxLength"], 800)
+            self.assertNotIn("maxLength", finish["properties"]["reason"])
+
     def test_logs_actual_model_transport_and_separates_thinking(self):
         with tempfile.TemporaryDirectory() as temp:
             log = SessionLog(Path(temp), RUN_ID, {})

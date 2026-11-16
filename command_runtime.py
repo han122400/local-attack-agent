@@ -26,6 +26,7 @@ from urllib.parse import urlsplit
 import psutil
 
 from code_checks import check_generated_code
+from j2_progress import public_path
 from session_log import LogFailure, SessionLog, safe_relative_path, validate_run_id
 
 
@@ -115,6 +116,8 @@ sys.path.insert(0, str(project / ".deps"))
 from playwright.async_api import async_playwright
 from browser_http import BrowserHTTP
 from j2_policy import CandidateNotebook, bounded_discovery
+from j25_actions import J25Actions
+from j25_verifiers import verify_candidate
 from web_discovery import analyze_response
 
 def send(sock, item):
@@ -131,9 +134,17 @@ def recv(sock, buffer):
 
 async def main():
     host, port, token, target, project_root, executable = sys.argv[1:7]
+    is_j25 = len(sys.argv) > 7 and sys.argv[7] == "J2.5"
+    test_scope = None
     sock = socket.create_connection((host, int(port)), timeout=20)
     sock.settimeout(None)
     send(sock, {"type": "hello", "token": token})
+    if is_j25:
+        setup, _ = recv(sock, b"")
+        if setup.get("type") != "j25_target" or not isinstance(setup.get("target"), str):
+            raise ValueError("J2.5 target setup failed")
+        target = setup["target"]
+        test_scope = setup.get("test_scope")
     target_parts = urlsplit(target)
     async with async_playwright() as playwright:
         options = {"headless": True}
@@ -142,10 +153,16 @@ async def main():
         browser = await playwright.chromium.launch(**options)
         context = await browser.new_context(service_workers="block", accept_downloads=False)
         is_j2 = len(sys.argv) > 7 and sys.argv[7] == "J2"
-        http = BrowserHTTP(context, target, body_limit=2_000_000 if is_j2 else 2000)
+        http = BrowserHTTP(context, target, body_limit=2_000_000 if is_j2 or is_j25 else 2000,
+                           capture_gets=is_j25,
+                           allowed_methods=({"GET", "HEAD", "OPTIONS"} | set(test_scope["allowed_methods"])
+                               if is_j25 and test_scope else {"GET", "HEAD", "OPTIONS"} if is_j25 else None),
+                           allowed_mutation_paths=set(test_scope["allowed_paths"]) if is_j25 and test_scope else
+                               set() if is_j25 else None)
         await context.route("**/*", http.guard)
         await context.route_web_socket("**/*", http.guard_web_socket)
         page = await context.new_page()
+        await http._ensure_browser_scope(page)
         target_origin = target_parts.scheme + "://" + target_parts.netloc
         async def get_text(url):
             """GET a URL within the target origin and return its response text."""
@@ -177,7 +194,9 @@ async def main():
             """
             try:
                 http._check(url, "GET")
-                await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                if is_j25:
+                    http.last_navigation_status = response.status if response is not None else None
                 await page.wait_for_timeout(settle_ms)
             except Exception as exc:
                 if is_j2 and len(helper_errors) < 16:
@@ -279,6 +298,79 @@ async def main():
                    "goto_and_render": goto_and_render, "list_inputs": list_inputs,
                    "submit_input": submit_input, "compare_inputs": compare_inputs, "target_origin": target_origin,
                    "captured_requests": http.captured_requests, "replay_request": http.replay_request}
+        proof_canaries = {item["label"]: item for item in test_scope.get("proof_canaries", [])} if test_scope else {}
+        def make_j25_actions(identity):
+            return J25Actions(target, page, http, goto_and_render, list_inputs,
+                progress=lambda value: send(sock, {"type": "j25_progress", "exec_id": http.step,
+                    "j25_result": {**value, "request_count": value.get("request_count", 0) + http.page_request_count}}),
+                stop_requested=lambda: Path("tmp/j25-cancel").exists(),
+                proof_canaries=proof_canaries, identity=identity)
+        j25 = make_j25_actions("public") if is_j25 else None
+        sessions = {"public": (context, page, http, j25)} if is_j25 else {}
+        identity_specs = {item["name"]: item for item in test_scope["identities"]} if test_scope else {}
+        current_identity = "public"
+        async def select_identity(name, exec_id):
+            nonlocal context, page, http, j25, current_identity
+            if name != "public" and name not in identity_specs:
+                raise ValueError("unknown test identity")
+            if name not in sessions:
+                spec = identity_specs[name]
+                next_context = await browser.new_context(service_workers="block", accept_downloads=False)
+                try:
+                    if spec["cookies"]:
+                        await next_context.add_cookies(spec["cookies"])
+                    next_http = BrowserHTTP(next_context, target, body_limit=2_000_000, capture_gets=True,
+                        allowed_methods={"GET", "HEAD", "OPTIONS"} | set(test_scope["allowed_methods"]),
+                        allowed_mutation_paths=set(test_scope["allowed_paths"]))
+                    for cookie in spec["cookies"]:
+                        next_http._remember_get_secrets(target, {"cookie": cookie["name"] + "=" + cookie["value"]})
+                    await next_context.route("**/*", next_http.guard)
+                    await next_context.route_web_socket("**/*", next_http.guard_web_socket)
+                    next_page = await next_context.new_page()
+                    await next_http._ensure_browser_scope(next_page)
+                    context, page, http = next_context, next_page, next_http
+                    sessions[name] = (context, page, http, make_j25_actions(name))
+                except Exception:
+                    await next_context.close()
+                    raise
+            context, page, http, j25 = sessions[name]
+            current_identity = name
+            http.begin_step(exec_id)
+            return {"action": "identity", "identity": name, "ref": "", "status": "ok",
+                    "request_count": 0, "references": j25.references(), "omitted": dict(j25.omitted)}
+        async def verify_access(decision, exec_id):
+            nonlocal context, page, http, j25, current_identity
+            ref, owner_name = decision.get("ref"), decision.get("value")
+            item = j25.items["pages"].get(ref)
+            if (item is None or not j25._allowed(item["url"]) or owner_name == current_identity
+                    or owner_name not in identity_specs):
+                raise ValueError("unknown page or owner identity")
+            url, unauthorized_name = item["url"], current_identity
+            result = {"action": "verify_access", "identity": unauthorized_name, "ref": ref,
+                      "status": "incomplete", "request_count": 0, "access_samples": []}
+            j25.current = result
+            previous = (context, page, http, j25, current_identity)
+            try:
+                for stage in ("unauthorized", "owner", "recheck"):
+                    if stage == "owner":
+                        await select_identity(owner_name, exec_id)
+                    elif stage == "recheck":
+                        context, page, http, j25, current_identity = previous
+                    result["request_count"] += 1
+                    sample = j25._sample(await http.http_get(url), stage)
+                    result["access_samples"].append(sample)
+            finally:
+                context, page, http, j25, current_identity = previous
+                j25.current = result
+            proof_scope = {"canaries": {label: {"protected": spec["protected"],
+                "authorized_identities": spec["authorized_identities"]} for label, spec in proof_canaries.items()}}
+            result["verification"] = verify_candidate("authorization", {
+                "identity": unauthorized_name, "owner_identity": owner_name,
+                "access_samples": result["access_samples"],
+                "request_contains_canary": any(spec["value"] in url for spec in proof_canaries.values())},
+                scope=proof_scope)
+            result.update(status="ok", references=j25.references(), omitted=dict(j25.omitted))
+            return result
         send(sock, {"type": "ready"})
         buffer = b""
         try:
@@ -286,6 +378,34 @@ async def main():
                 message, buffer = await asyncio.to_thread(recv, sock, buffer)
                 if message.get("type") == "stop":
                     break
+                if message.get("type") == "j25_execute":
+                    exec_id = message["exec_id"]
+                    http.begin_step(exec_id)
+                    timed_out = False
+                    with open(message["stdout_path"], "w", encoding="utf-8", buffering=1) as out, \
+                         open(message["stderr_path"], "w", encoding="utf-8", buffering=1) as err:
+                        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                            try:
+                                if j25 is None:
+                                    raise ValueError("J2.5 worker is unavailable")
+                                decision = message["decision"]
+                                task = (select_identity(decision.get("value"), exec_id)
+                                        if decision.get("action") == "identity" else
+                                        verify_access(decision, exec_id) if decision.get("action") == "verify_access"
+                                        else j25.perform(decision))
+                                value = await asyncio.wait_for(task, message["timeout"])
+                            except asyncio.TimeoutError:
+                                timed_out = True
+                                value = {**j25.current, "status": "incomplete", "error": "TimeoutError",
+                                         "references": j25.references(), "omitted": dict(j25.omitted)}
+                            except Exception as exc:
+                                value = {"status": "incomplete", "error": type(exc).__name__}
+                    value["request_count"] = value.get("request_count", 0) + http.page_request_count
+                    send(sock, {"type": "result", "exec_id": exec_id, "exit_code": 0 if value.get("status") == "ok" else 1,
+                                "timed_out": timed_out, "j25_result": value,
+                                "blocked_requests": [{**x, "url": http.redact_get_secrets(x["url"])} for x in http.blocked_requests],
+                                "http_observations": [{**x, "url": http.redact_get_secrets(x["url"])} for x in http.http_observations]})
+                    continue
                 if message.get("type") != "execute":
                     continue
                 exec_id = message["exec_id"]
@@ -306,6 +426,8 @@ async def main():
                                          "asyncio": asyncio, **helpers}
                             modules = {}
                             for name, bindings in (("tools", {**helpers, "note_candidate": notebook.note_candidate}),
+                                                   ("browser_api", {**helpers, "note_candidate": notebook.note_candidate,
+                                                                    "page": page, "context": context, "browser": browser}),
                                                    ("browser", {"page": page, "context": context, "browser": browser})):
                                 module = types.ModuleType(name)
                                 module.__dict__.update(bindings)
@@ -364,7 +486,11 @@ async def main():
                             "helper_outcomes": helper_outcomes,
                             "request_templates": http.captured_requests()})
         finally:
-            await context.close()
+            if is_j25:
+                for active_context, *_ in sessions.values():
+                    await active_context.close()
+            else:
+                await context.close()
             await browser.close()
             sock.close()
 
@@ -398,6 +524,7 @@ class ExecutionResult:
     discovery_summaries: list[dict] = field(default_factory=list)
     helper_errors: list[dict] = field(default_factory=list)
     helper_outcomes: list[dict] = field(default_factory=list)
+    j25_result: dict | None = None
 
 
 class CommandRuntime:
@@ -437,12 +564,14 @@ class CommandRuntime:
                     "npm_config_cache": str(temporary / "npm-cache")})
         return env
 
-    def start_session(self, run_id: str, *, target: str = "http://127.0.0.1:3000/", browser: bool = True) -> None:
+    def start_session(self, run_id: str, *, target: str = "http://127.0.0.1:3000/", browser: bool = True,
+                      j25_test_scope: dict | None = None) -> None:
         self._check_run(run_id)
         with self._lock:
             if self.runtime_dir.exists():
                 raise RuntimeError("Runtime already exists")
             self.target = target
+            self._j25_test_scope = j25_test_scope if self.log.metadata.get("prompt_version") == "J2.5" else None
             self.log.update(runtime_path=str(self.runtime_dir), runtime_creation_intent=True)
             for folder in ("tools", "work", "tmp", "deps", "browser"):
                 (self.runtime_dir / folder).mkdir(parents=True, exist_ok=True)
@@ -468,6 +597,8 @@ class CommandRuntime:
             raise
         record = {"pid": process.pid, "created_at": created, "role": role, "exec_id": exec_id,
                   "run_id": self.run_id}
+        if os.name != "nt" and role == "command":
+            record["process_group"] = process.pid
         self._owned[process.pid] = record
         if job is not None:
             self._jobs[process.pid] = job
@@ -484,6 +615,9 @@ class CommandRuntime:
         if process.pid in self._jobs:
             # A descendant can outlive CMD. Keep the job and ownership record
             # until stop() terminates the whole group.
+            return
+        record = self._owned.get(process.pid)
+        if record and self._process_group_members(record):
             return
         record = self._owned.pop(process.pid, None)
         self.log.update(managed_processes=list(self._owned.values()))
@@ -504,6 +638,19 @@ class CommandRuntime:
     def _kill_tree(self, process: subprocess.Popen, record: dict) -> None:
         if process.pid in self._jobs:
             self._close_job(process.pid, terminate=True)
+        group = self._process_group_members(record)
+        if group:
+            for item in reversed(group):
+                try:
+                    item.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+            _, alive = psutil.wait_procs(group, timeout=2)
+            for item in alive:
+                item.kill()
+            psutil.wait_procs(alive, timeout=2)
+            process.wait(timeout=5)
+            return
         try:
             current = psutil.Process(record["pid"])
             if abs(current.create_time() - record["created_at"]) > 0.01:
@@ -522,6 +669,23 @@ class CommandRuntime:
         except psutil.NoSuchProcess:
             pass
         process.wait(timeout=5)
+
+    @staticmethod
+    def _process_group_members(record: dict) -> list[psutil.Process]:
+        group = record.get("process_group")
+        if os.name == "nt" or type(group) is not int:
+            return []
+        members = []
+        for process in psutil.process_iter(["pid", "create_time"]):
+            try:
+                if os.getpgid(process.pid) != group:
+                    continue
+                if process.create_time() + 0.01 < record["created_at"]:
+                    raise RuntimeError("Process group was reused; refusing to kill unrelated process")
+                members.append(process)
+            except (ProcessLookupError, psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return members
 
     def _capture_browser_tree(self) -> None:
         """Record the live worker's Chromium descendants by PID and creation time.
@@ -578,7 +742,7 @@ class CommandRuntime:
         worker_path = self.runtime_dir / "tools" / "_browser_worker.py"
         worker_path.write_text(WORKER_SOURCE, encoding="utf-8")
         shutil.copyfile(Path(__file__).with_name("browser_http.py"), worker_path.with_name("browser_http.py"))
-        for name in ("j2_policy.py", "j2_progress.py", "web_discovery.py"):
+        for name in ("j2_policy.py", "j2_progress.py", "web_discovery.py", "j25_actions.py", "j25_verifiers.py"):
             shutil.copyfile(Path(__file__).with_name(name), worker_path.with_name(name))
         token = uuid.uuid4().hex
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -586,8 +750,9 @@ class CommandRuntime:
         server.listen(1)
         server.settimeout(20)
         executable = installed_chromium() or ""
+        is_j25 = self.log.metadata.get("prompt_version") == "J2.5"
         args = [self.python, "-u", str(worker_path), "127.0.0.1", str(server.getsockname()[1]),
-                token, self.target, str(Path(__file__).resolve().parent), executable,
+                token, public_path(self.target) if is_j25 else self.target, str(Path(__file__).resolve().parent), executable,
                 self.log.metadata.get("prompt_version", "")]
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         process = subprocess.Popen(args, cwd=self.runtime_dir, env=self._environment(),
@@ -602,10 +767,13 @@ class CommandRuntime:
             hello = self._wait_control(5)
             if hello.get("type") != "hello" or hello.get("token") != token:
                 raise RuntimeError("Browser worker handshake failed")
+            if is_j25:
+                self._send_control({"type": "j25_target", "target": self.target,
+                                    "test_scope": self._j25_test_scope})
             ready = self._wait_control(30)
             if ready.get("type") != "ready":
                 raise RuntimeError("Browser worker did not become ready")
-            self.log.append("browser_ready", {"pid": process.pid, "target": self.target})
+            self.log.append("browser_ready", {"pid": process.pid, "target": public_path(self.target) if is_j25 else self.target})
             self._capture_browser_tree()
         except Exception:
             self._kill_tree(process, self._owned[process.pid])
@@ -620,7 +788,7 @@ class CommandRuntime:
             raise RuntimeError("Browser worker is unavailable")
         self._conn.sendall((json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8"))
 
-    def _wait_control(self, timeout: float, on_poll=None) -> dict:
+    def _wait_control(self, timeout: float, on_poll=None, on_progress=None) -> dict:
         if self._conn is None:
             raise RuntimeError("Browser worker is unavailable")
         deadline = time.monotonic() + timeout
@@ -629,8 +797,17 @@ class CommandRuntime:
                 on_poll()
             if b"\n" in self._control_buffer:
                 line, self._control_buffer = self._control_buffer.split(b"\n", 1)
-                return json.loads(line)
+                message = json.loads(line)
+                if on_progress is not None and message.get("type") == "j25_progress":
+                    on_progress(message)
+                    continue
+                return message
             if self._cancel.is_set():
+                if on_progress is not None and select.select([self._conn], [], [], 0)[0]:
+                    chunk = self._conn.recv(65536)
+                    if chunk:
+                        self._control_buffer += chunk
+                        continue
                 raise InterruptedError("Execution cancelled")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -713,7 +890,8 @@ class CommandRuntime:
         shell = ["cmd.exe", "/D", "/S", "/C", command] if os.name == "nt" else ["/bin/sh", "-c", command]
         process = subprocess.Popen(shell, cwd=self.runtime_dir, env=self._environment(),
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), bufsize=0)
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), bufsize=0,
+                                   start_new_session=os.name != "nt")
         self._register(process, "command", exec_id)
         owner = self._owned[process.pid]
         threads = self._start_output_readers(process, exec_id)
@@ -785,6 +963,51 @@ class CommandRuntime:
                 if result.exit_code != 0:
                     result.failure_source, result.cause_code = "command", "command_exit_nonzero"
                     result.retryable = True
+            elif action == "j25":
+                if not self._browser_enabled:
+                    raise RuntimeError("Browser worker is unavailable")
+                if self._worker is None or self._worker.poll() is not None:
+                    if self._worker is not None:
+                        self._unregister(self._worker)
+                        self._worker = None
+                    if self._conn is not None:
+                        self._conn.close()
+                        self._conn = None
+                    self._control_buffer = b""
+                    self.log.append("browser_respawn", {"exec_id": exec_id, "reason": "worker_unavailable"})
+                    self._start_browser_worker()
+                decision = command.get("decision")
+                if not isinstance(decision, dict):
+                    raise ValueError("Typed decision required")
+                stage = "executor"
+                paths = {name: self.runtime_dir / "tmp" / f"{exec_id}.{name}" for name in ("stdout", "stderr")}
+                for path in paths.values():
+                    path.touch()
+                offsets = {name: 0 for name in paths}
+                decoders = {name: codecs.getincrementaldecoder("utf-8")("replace") for name in paths}
+                def poll_j25():
+                    self._tail_python_output(paths, offsets, decoders, exec_id)
+                def progress_j25(message):
+                    if message.get("exec_id") != exec_id or not isinstance(message.get("j25_result"), dict):
+                        raise RuntimeError("Browser worker progress mismatch")
+                    result.j25_result = message["j25_result"]
+                    self.log.append("j25_progress", {"exec_id": exec_id, "call_id": call_id,
+                                                     "result": result.j25_result})
+                self._send_control({"type": "j25_execute", "exec_id": exec_id, "decision": decision,
+                                    "stdout_path": str(paths["stdout"]), "stderr_path": str(paths["stderr"]),
+                                    "timeout": timeout})
+                reply = self._wait_control(timeout + 10, on_poll=poll_j25, on_progress=progress_j25)
+                self._tail_python_output(paths, offsets, decoders, exec_id, final=True)
+                if reply.get("type") != "result" or reply.get("exec_id") != exec_id:
+                    raise RuntimeError("Browser worker response mismatch")
+                result.exit_code = reply.get("exit_code")
+                result.timed_out = bool(reply.get("timed_out"))
+                result.j25_result = reply.get("j25_result")
+                result.blocked_requests = reply.get("blocked_requests", [])
+                result.http_observations = reply.get("http_observations", [])
+                if result.exit_code != 0:
+                    result.failure_source, result.cause_code, result.retryable = "execution", "fixed_action_failed", True
+                self._capture_browser_tree()
             elif action == "run_python":
                 stage = "executor"
                 if not self._browser_enabled:
@@ -869,12 +1092,12 @@ class CommandRuntime:
             result.timed_out = True
             result.exception = str(exc)
             result.exit_code = None
-            result.failure_source = "system" if action == "run_python" else "execution"
-            result.cause_code = "browser_worker_unresponsive" if action == "run_python" else "execution_timeout"
+            result.failure_source = "system" if action in {"run_python", "j25"} else "execution"
+            result.cause_code = "browser_worker_unresponsive" if action in {"run_python", "j25"} else "execution_timeout"
             result.retryable = True
             if action == "run_python":
                 result.request_templates = []
-            if action == "run_python" and self._worker is not None:
+            if action in {"run_python", "j25"} and self._worker is not None:
                 self._kill_tree(self._worker, self._owned[self._worker.pid])
                 self._unregister(self._worker)
                 self._worker = None
@@ -883,6 +1106,14 @@ class CommandRuntime:
             result.exception = str(exc)
             result.exit_code = None
             result.failure_source, result.cause_code, result.retryable = "control", "execution_cancelled", False
+            if action == "j25" and self._worker is not None:
+                try:
+                    self._kill_tree(self._worker, self._owned[self._worker.pid])
+                except Exception as error:
+                    self.log.append("browser_stop_failed", {"exec_id": exec_id, "error_type": type(error).__name__})
+                else:
+                    self._unregister(self._worker)
+                    self._worker = None
         except LogFailure:
             self._cancel.set()
             raise
@@ -934,14 +1165,17 @@ class CommandRuntime:
             try:
                 if pid in self._jobs:
                     self._close_job(pid, terminate=True)
-                current = psutil.Process(pid)
-                if abs(current.create_time() - record["created_at"]) > 0.01:
-                    raise RuntimeError("Owned process PID was reused")
-                descendants = current.children(recursive=True)
-                for item in reversed(descendants):
+                group = self._process_group_members(record)
+                if group:
+                    targets = group
+                else:
+                    current = psutil.Process(pid)
+                    if abs(current.create_time() - record["created_at"]) > 0.01:
+                        raise RuntimeError("Owned process PID was reused")
+                    targets = current.children(recursive=True) + [current]
+                for item in reversed(targets):
                     item.terminate()
-                current.terminate()
-                _, alive = psutil.wait_procs(descendants + [current], timeout=max(0.1, min(2, deadline - time.monotonic())))
+                _, alive = psutil.wait_procs(targets, timeout=max(0.1, min(2, deadline - time.monotonic())))
                 for item in alive:
                     item.kill()
                 if psutil.wait_procs(alive, timeout=max(0.1, deadline - time.monotonic()))[1]:
@@ -989,6 +1223,11 @@ class CommandRuntime:
 
     def cancel(self) -> None:
         """Signal in-flight work; finalization performs the owned-process stop."""
+        if self.log.metadata.get("prompt_version") == "J2.5":
+            try:
+                (self.runtime_dir / "tmp" / "j25-cancel").touch()
+            except OSError:
+                pass
         self._cancel.set()
 
     def restore_owned(self, run_id: str, records: list[dict]) -> None:

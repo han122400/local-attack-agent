@@ -1,0 +1,354 @@
+{
+  "version": "fixture-v2",
+  "cases": [
+    {
+      "id": "case-00",
+      "category": "authorization",
+      "split": "development",
+      "surface": "/case/00",
+      "field": "",
+      "kind": "authorization",
+      "information_label": "canary-00",
+      "oracle_id": 0,
+      "eligible": true
+    },
+    {
+      "id": "case-01",
+      "category": "injection",
+      "split": "development",
+      "surface": "/case/01",
+      "field": "q",
+      "kind": "injection",
+      "information_label": "canary-01",
+      "oracle_id": 1,
+      "eligible": true
+    },
+    {
+      "id": "case-02",
+      "category": "browser_input",
+      "split": "development",
+      "surface": "/case/02",
+      "field": "q",
+      "kind": "browser_input",
+      "information_label": "canary-02",
+      "oracle_id": 2,
+      "eligible": true
+    },
+    {
+      "id": "case-03",
+      "category": "disclosure",
+      "split": "development",
+      "surface": "/case/03",
+      "field": "q",
+      "kind": "disclosure",
+      "information_label": "canary-03",
+      "oracle_id": 3,
+      "eligible": true
+    },
+    {
+      "id": "case-04",
+      "category": "authorization",
+      "split": "development",
+      "surface": "/case/04",
+      "field": "",
+      "kind": "authorization",
+      "information_label": "canary-04",
+      "oracle_id": 4,
+      "eligible": true
+    },
+    {
+      "id": "case-05",
+      "category": "injection",
+      "split": "development",
+      "surface": "/case/05",
+      "field": "q",
+      "kind": "injection",
+      "information_label": "canary-05",
+      "oracle_id": 5,
+      "eligible": true
+    },
+    {
+      "id": "case-06",
+      "category": "browser_input",
+      "split": "development",
+      "surface": "/case/06",
+      "field": "q",
+      "kind": "browser_input",
+      "information_label": "canary-06",
+      "oracle_id": 6,
+      "eligible": true
+    },
+    {
+      "id": "case-07",
+      "category": "disclosure",
+      "split": "development",
+      "surface": "/case/07",
+      "field": "q",
+      "kind": "disclosure",
+      "information_label": "canary-07",
+      "oracle_id": 7,
+      "eligible": true
+    },
+    {
+      "id": "case-08",
+      "category": "authorization",
+      "split": "development",
+      "surface": "/case/08",
+      "field": "",
+      "kind": "authorization",
+      "information_label": "canary-08",
+      "oracle_id": 8,
+      "eligible": true
+    },
+    {
+      "id": "case-09",
+      "category": "injection",
+      "split": "development",
+      "surface": "/case/09",
+      "field": "q",
+      "kind": "injection",
+      "information_label": "canary-09",
+      "oracle_id": 9,
+      "eligible": true
+    },
+    {
+      "id": "case-10",
+      "category": "browser_input",
+      "split": "development",
+      "surface": "/case/10",
+      "field": "q",
+      "kind": "browser_input",
+      "information_label": "canary-10",
+      "oracle_id": 10,
+      "eligible": true
+    },
+    {
+      "id": "case-11",
+      "category": "disclosure",
+      "split": "development",
+      "surface": "/case/11",
+      "field": "q",
+      "kind": "disclosure",
+      "information_label": "canary-11",
+      "oracle_id": 11,
+      "eligible": true
+    },
+    {
+      "id": "case-12",
+      "category": "authorization",
+      "split": "development",
+      "surface": "/case/12",
+      "field": "",
+      "kind": "authorization",
+      "information_label": "canary-12",
+      "oracle_id": 12,
+      "eligible": true
+    },
+    {
+      "id": "case-13",
+      "category": "injection",
+      "split": "development",
+      "surface": "/case/13",
+      "field": "q",
+      "kind": "injection",
+      "information_label": "canary-13",
+      "oracle_id": 13,
+      "eligible": true
+    },
+    {
+      "id": "case-14",
+      "category": "browser_input",
+      "split": "development",
+      "surface": "/case/14",
+      "field": "q",
+      "kind": "browser_input",
+      "information_label": "canary-14",
+      "oracle_id": 14,
+      "eligible": true
+    },
+    {
+      "id": "case-15",
+      "category": "disclosure",
+      "split": "development",
+      "surface": "/case/15",
+      "field": "q",
+      "kind": "disclosure",
+      "information_label": "canary-15",
+      "oracle_id": 15,
+      "eligible": true
+    },
+    {
+      "id": "case-16",
+      "category": "authorization",
+      "split": "development",
+      "surface": "/case/16",
+      "field": "",
+      "kind": "authorization",
+      "information_label": "canary-16",
+      "oracle_id": 16,
+      "eligible": true
+    },
+    {
+      "id": "case-17",
+      "category": "injection",
+      "split": "development",
+      "surface": "/case/17",
+      "field": "q",
+      "kind": "injection",
+      "information_label": "canary-17",
+      "oracle_id": 17,
+      "eligible": true
+    },
+    {
+      "id": "case-18",
+      "category": "browser_input",
+      "split": "development",
+      "surface": "/case/18",
+      "field": "q",
+      "kind": "browser_input",
+      "information_label": "canary-18",
+      "oracle_id": 18,
+      "eligible": true
+    },
+    {
+      "id": "case-19",
+      "category": "disclosure",
+      "split": "development",
+      "surface": "/case/19",
+      "field": "q",
+      "kind": "disclosure",
+      "information_label": "canary-19",
+      "oracle_id": 19,
+      "eligible": true
+    },
+    {
+      "id": "final-amber",
+      "category": "authorization",
+      "split": "holdout",
+      "surface": "/records/amber",
+      "field": "",
+      "kind": "authorization",
+      "information_label": "proof-amber",
+      "oracle_id": 20,
+      "eligible": true
+    },
+    {
+      "id": "final-birch",
+      "category": "disclosure",
+      "split": "holdout",
+      "surface": "/records/birch",
+      "field": "path",
+      "kind": "disclosure",
+      "information_label": "proof-birch",
+      "oracle_id": 21,
+      "eligible": true
+    },
+    {
+      "id": "final-cobalt",
+      "category": "injection",
+      "split": "holdout",
+      "surface": "/records/cobalt",
+      "field": "query",
+      "kind": "injection",
+      "information_label": "proof-cobalt",
+      "oracle_id": 22,
+      "eligible": true
+    },
+    {
+      "id": "final-delta",
+      "category": "browser_input",
+      "split": "holdout",
+      "surface": "/records/delta",
+      "field": "message",
+      "kind": "browser_input",
+      "information_label": "proof-delta",
+      "oracle_id": 23,
+      "eligible": true
+    },
+    {
+      "id": "final-ember",
+      "category": "injection",
+      "split": "holdout",
+      "surface": "/records/ember",
+      "field": "search",
+      "kind": "injection",
+      "information_label": "proof-ember",
+      "oracle_id": 24,
+      "eligible": true
+    },
+    {
+      "id": "final-frost",
+      "category": "authorization",
+      "split": "holdout",
+      "surface": "/records/frost",
+      "field": "",
+      "kind": "authorization",
+      "information_label": "proof-frost",
+      "oracle_id": 25,
+      "eligible": true
+    },
+    {
+      "id": "final-grove",
+      "category": "browser_input",
+      "split": "holdout",
+      "surface": "/records/grove",
+      "field": "note",
+      "kind": "browser_input",
+      "information_label": "proof-grove",
+      "oracle_id": 26,
+      "eligible": true
+    },
+    {
+      "id": "final-harbor",
+      "category": "disclosure",
+      "split": "holdout",
+      "surface": "/records/harbor",
+      "field": "file",
+      "kind": "disclosure",
+      "information_label": "proof-harbor",
+      "oracle_id": 27,
+      "eligible": true
+    },
+    {
+      "id": "final-iris",
+      "category": "authorization",
+      "split": "holdout",
+      "surface": "/records/iris",
+      "field": "",
+      "kind": "authorization",
+      "information_label": "proof-iris",
+      "oracle_id": 28,
+      "eligible": true
+    },
+    {
+      "id": "final-jade",
+      "category": "injection",
+      "split": "holdout",
+      "surface": "/records/jade",
+      "field": "term",
+      "kind": "injection",
+      "information_label": "proof-jade",
+      "oracle_id": 29,
+      "eligible": true
+    }
+  ],
+  "controls": [
+    {
+      "id": "safe-0",
+      "surface": "/safe/0"
+    },
+    {
+      "id": "safe-1",
+      "surface": "/safe/1"
+    },
+    {
+      "id": "safe-2",
+      "surface": "/safe/2"
+    },
+    {
+      "id": "safe-3",
+      "surface": "/safe/3"
+    }
+  ],
+  "calibration_manifest_sha256": "c7c6309b97ed805e8329516d720ea5a17c6f780eb13ccd05a08a6e7e289bb2b9"
+}

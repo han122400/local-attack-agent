@@ -99,6 +99,19 @@ def score_run(session: dict, run_dir: Path) -> dict:
                 or bool(item.get("unavailable_observation_steps")) or bool(item.get("partial")) for item in claims),
             "helper_error_count": sum(len(item.get("helper_errors", [])) for item in j2.get("executions", [])),
             "verified_findings": None, "verification": "model_claims_and_execution_references_only"}
+    j25 = session.get("j25_state") or {}
+    j25_metrics = None
+    if j25:
+        attempts = [item for item in j25.get("steps", []) if item.get("action") in {"compare", "verify", "verify_browser"}]
+        ledger = j25.get("evidence") if isinstance(j25.get("evidence"), dict) else None
+        j25_metrics = {"comparisons": len(attempts),
+                       "stable_comparisons": sum(item.get("status") == "ok" for item in attempts),
+                       "pending": len(j25.get("pending", [])), "request_count": j25.get("request_count", 0),
+                       **(j25.get("metrics") or {}),
+                       "verified_findings": (ledger.get("counts", {}).get("independently_verified", 0)
+                                             if ledger is not None else None),
+                       "case_count": ledger.get("case_count") if ledger is not None else None,
+                       "verification_rate": ledger.get("rate") if ledger is not None else None}
 
     return {
         "run_id": session.get("run_id", run_dir.name),
@@ -112,6 +125,7 @@ def score_run(session: dict, run_dir: Path) -> dict:
         "evidence": evidence,
         "execution_output_steps": evidence,
         "pipeline_metrics": pipeline_metrics,
+        "j25_metrics": j25_metrics,
         "inconclusive": inconclusive,
         "failed": failed,
         "repeats": repeats,

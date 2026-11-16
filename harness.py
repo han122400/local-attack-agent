@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import json
+import copy
+import re
 import time
 from dataclasses import replace
 
 import httpx2 as httpx
 
 from j1_policy import pack_j1_context
+from code_checks import check_generated_code
 from j2_policy import pack_j2_context
+from j25_policy import j25_schema_for_context, pack_j25_context, validate_j25_decision
 from model_settings import validate_model_settings
 from model_providers import OpenRouterError, is_openrouter, openrouter_stream, strip_tool_call_framing
 from planning import (COMMAND_SCHEMA, SYSTEM_PROMPT, SYSTEM_PROMPT_SHA256, SYSTEM_PROMPT_VERSION,
                       Command, normalize_command_inputs, validate_command)
-from session_log import SessionLog
+from session_log import SessionLog, safe_relative_path
 
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
@@ -41,6 +45,17 @@ def decode_first_command(raw: str) -> tuple[object, str]:
     """
     value, end = json.JSONDecoder().raw_decode(raw.strip())
     return value, raw.strip()[end:].strip()
+
+
+def repeating_explanation(raw: str) -> bool:
+    """Detect a sustained loop in explanation text, not code or hidden reasoning."""
+    for match in re.finditer(r'(?<!\\)"(?:plan|reason)"\s*:\s*"((?:[^"\\]|\\.)*)', raw):
+        if match.end() < len(raw) and raw[match.end()] == '"':
+            continue
+        tail = match.group(1)[-4096:]
+        if re.search(r'(.{40,800})\1{3}', tail, re.S):
+            return True
+    return False
 
 
 def _ollama_stream(payload: dict):
@@ -76,6 +91,7 @@ class Harness:
         self.last_prompt_tokens = None   # prompt_eval_count of the most recent model call (real num_ctx usage)
         self.total_cost = 0.0            # summed OpenRouter billed cost (USD) across this run's calls
         self.output_num_predict_floor = None   # raised, persisted output budget after a length-truncation
+        self.recent_call_seconds = []
 
     def decide(self, run_id: str, context: dict, *, model: str, settings: dict,
                deadline: float | None = None) -> Command:
@@ -83,17 +99,26 @@ class Harness:
             raise ValueError("Harness belongs to another run")
         selected = validate_model_settings(settings)
         j1_budget = int(selected["options"].get("num_ctx", 8192) * 3.3 * 0.65) - len(self.system_prompt)
-        pack_context = pack_j2_context if self.system_prompt_version == "J2" else pack_j1_context
-        if self.system_prompt_version in {"J1", "J2"}:
-            try:
-                context = pack_context(context, j1_budget)
-            except ValueError as exc:
-                raise ModelFailure("context", str(exc)) from exc
+        is_j25 = self.system_prompt_version == "J2.5"
+        pack_context = pack_j25_context if is_j25 else pack_j2_context if self.system_prompt_version == "J2" else pack_j1_context
+        try:
+            context = pack_context(context, j1_budget)
+        except ValueError as exc:
+            raise ModelFailure("context", str(exc)) from exc
         report_only = self.report_reserve > 0 and bool(context.get("remaining", {}).get("finish_soon"))
         call_limit = (min(self.max_calls, self.calls + self.report_reserve) if report_only
                       else self.max_calls - self.report_reserve)
         schema = (next(branch for branch in COMMAND_SCHEMA["oneOf"]
                        if branch["properties"]["action"]["const"] == "finish") if report_only else COMMAND_SCHEMA)
+        if is_j25:
+            schema = j25_schema_for_context(context, report_only=report_only)
+        explanation_limits = {"plan": 240, "reason": 800} if self.system_prompt_version == "J2" else {}
+        if explanation_limits:
+            schema = copy.deepcopy(schema)
+            for branch in schema.get("oneOf", [schema]):
+                if branch["properties"]["action"]["const"] != "finish":
+                    for field, limit in explanation_limits.items():
+                        branch["properties"][field]["maxLength"] = limit
         options = dict(selected["options"])
         # Persist a raised output budget across steps: once a length-truncation forced num_predict up,
         # keep at least that floor so later steps do not truncate at the original cap again.
@@ -118,6 +143,13 @@ class Harness:
                 raise ModelFailure("cancelled", "Run stopped")
             if deadline is not None and time.monotonic() >= deadline:
                 raise ModelFailure("timed_out", "Run deadline reached")
+            if deadline is not None and self.report_reserve and not report_only:
+                average = sum(self.recent_call_seconds) / len(self.recent_call_seconds) if self.recent_call_seconds else 45.0
+                reserve = max(45.0, average * 1.5)
+                remaining = deadline - time.monotonic()
+                if remaining <= reserve:
+                    self.log.append("report_time_reserved", {"remaining_seconds": round(remaining, 2), "estimated_seconds": round(reserve, 2)})
+                    raise ModelFailure("budget", "Stop exploration repairs to leave time for the final report")
             self.calls += 1
             call_id = f"CALL-{self.calls:04d}"
             started = time.monotonic()
@@ -178,11 +210,32 @@ class Harness:
                     if sanitized_fields:
                         self.log.append("command_sanitized", {"call_id": call_id, "fields": sanitized_fields})
                 try:
-                    answer, normalized_fields = normalize_command_inputs(answer)
+                    answer, normalized_fields = (answer, []) if is_j25 else normalize_command_inputs(answer)
                     if normalized_fields:
                         self.log.append("command_normalized", {"call_id": call_id, "action": answer.get("action"),
                                                                "fields": normalized_fields})
-                    command = replace(validate_command(answer), call_id=call_id)
+                    command = replace(validate_j25_decision(answer, report_only=report_only,
+                        references=context.get("references") or {}, identities=context.get("identities"),
+                        current_identity=context.get("current_identity"),
+                        mutation_allowed=bool(context.get("mutation_allowed"))) if is_j25
+                                      else validate_command(answer), call_id=call_id)
+                    if command.action == "run_command" and re.match(r"^\s*(?:[A-Za-z_]\w*\s*=\s*)?await\s+[A-Za-z_]\w*(?:\.\w+)*\s*\(", command.command):
+                        raise ValueError("Python await calls belong in run_python.code, not run_command shell text. Provided helpers need no separate Python executable or import.")
+                    if command.action == "read_file" and command.path.lower().startswith(("http://", "https://")):
+                        raise ValueError("read_file opens runtime-local files, not website URLs. Use run_python with an awaited provided HTTP/browser helper for a permitted target observation.")
+                    if command.action in {"read_file", "write_file"}:
+                        try:
+                            safe_relative_path(command.path)
+                        except ValueError as exc:
+                            raise ValueError(f"Invalid runtime-relative file path: {exc}. Use a real saved relative path. Website content requires an HTTP/browser helper, not an invented local HTML file.") from exc
+                    if command.action == "run_python" and (self.system_prompt_version != "J2" or self.command_guard is None):
+                        problems = check_generated_code(command.code)
+                        if problems:
+                            raise ValueError("Code preflight failed: " + "; ".join(problems[:2]))
+                    if command.action != "finish":
+                        for field, limit in explanation_limits.items():
+                            if len(getattr(command, field)) > limit:
+                                raise ValueError(f"{field} exceeds {limit} characters. State the next action briefly; do not repeat its rationale.")
                     if report_only and command.action != "finish":
                         raise ValueError("Report reserve is active: return action finish; do not execute more tools")
                     if self.command_guard is not None:
@@ -202,7 +255,13 @@ class Harness:
                 # response to consume the entire context. The full raw response is logged.
                 previous = raw if len(raw) <= 6000 else raw[:4000] + "\n[response middle omitted]\n" + raw[-2000:]
                 retry_options = dict(payload["options"])
-                if exc.kind == "output_limit":
+                repetitive = self.system_prompt_version == "J2" and repeating_explanation(raw)
+                if exc.kind == "output_limit" and repetitive:
+                    self.log.append("output_repetition_detected", {"call_id": call_id, "field": "plan_or_reason"})
+                    feedback = ("The explanation repeated until the output limit. The output budget is unchanged. "
+                                "Use one brief plan (<=240 characters) and reason (<=800); do not repeat the rationale. "
+                                "Return one complete JSON Command. Internal memory is current-run bookkeeping, not prior reconnaissance.")
+                elif exc.kind == "output_limit":
                     # Reasoning models can spend the whole output budget thinking and never emit the
                     # command; re-sending the same cap just truncates again. Raise num_predict and keep
                     # the higher floor for the rest of the run so later steps have room too.
@@ -223,21 +282,21 @@ class Harness:
                                   "read_file uses path. Every action including finish requires nonempty plan and reason. "
                                   "Unused path/content/command/code fields must be empty strings. "
                                   "Produce one small step with concise code, without explanatory comments.")
-                if self.system_prompt_version in {"J1", "J2"}:
-                    previous = raw[:500] + ("\n[invalid output preview]" if len(raw) > 500 else "")
-                    if self.system_prompt_version == "J2" and command is not None and command.code:
-                        code = command.code
-                        previous = json.dumps({"action": command.action, "code_preview":
-                            code if len(code) <= 400 else code[:200] + "\n[middle omitted; source saved]\n" + code[-200:]},
-                            ensure_ascii=False)
-                    retry_feedback = [{"role": "assistant", "content": previous}, {"role": "user", "content": feedback}]
-                    try:
-                        context = pack_context(context, j1_budget - sum(len(m["content"]) for m in retry_feedback))
-                    except ValueError as error:
-                        raise ModelFailure("context", str(error), call_id) from error
-                    messages = [payload["messages"][0], {"role": "user", "content": json.dumps(context, ensure_ascii=False)}, *retry_feedback]
-                else:
-                    messages = [*payload["messages"], {"role": "assistant", "content": previous}, {"role": "user", "content": feedback}]
+                if is_j25:
+                    feedback = ("The previous decision was invalid: " + str(exc)[:220]
+                                + ". Return one JSON object matching the action schema; use only listed reference IDs.")
+                previous = raw[:500] + ("\n[invalid output preview]" if len(raw) > 500 else "")
+                if self.system_prompt_version == "J2" and command is not None and command.code:
+                    code = command.code
+                    previous = json.dumps({"action": command.action, "code_preview":
+                        code if len(code) <= 400 else code[:200] + "\n[middle omitted; source saved]\n" + code[-200:]},
+                        ensure_ascii=False)
+                retry_feedback = [{"role": "assistant", "content": previous}, {"role": "user", "content": feedback}]
+                try:
+                    context = pack_context(context, j1_budget - sum(len(m["content"]) for m in retry_feedback))
+                except ValueError as error:
+                    raise ModelFailure("context", str(error), call_id) from error
+                messages = [payload["messages"][0], {"role": "user", "content": json.dumps(context, ensure_ascii=False)}, *retry_feedback]
                 payload = {**payload, "options": retry_options, "messages": messages}
             except (OpenRouterError, httpx.HTTPError, OSError, TimeoutError, json.JSONDecodeError) as exc:
                 failure = ModelFailure("transport", str(exc)[:300], call_id,
@@ -257,6 +316,8 @@ class Harness:
                     raise failure from exc
                 self.log.append("transport_retry", {"call_id": call_id, "attempt": transport_retries})
                 time.sleep(min(self.transport_retry_backoff * 2 ** (transport_retries - 1), 4.0))
+            finally:
+                self.recent_call_seconds = (self.recent_call_seconds + [max(0.0, time.monotonic() - started)])[-3:]
         assert last_error is not None
         raise last_error
 

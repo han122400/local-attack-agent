@@ -27,10 +27,32 @@ def route(body=b"csrfToken=secret&q=normal&q=second", content_type="application/
                               post_data_buffer=body, all_headers=AsyncMock(return_value={
                                   "content-type": content_type, "cookie": "session=private", "authorization": "Bearer private",
                                   "content-length": str(len(body)), "next-action": "observed-action"}))
-    return SimpleNamespace(request=request, continue_=AsyncMock(), abort=AsyncMock())
+    return SimpleNamespace(request=request, continue_=AsyncMock(), abort=AsyncMock(),
+                           fetch=AsyncMock(return_value=SimpleNamespace(status=200)), fulfill=AsyncMock())
 
 
 class BrowserHTTPTests(unittest.IsolatedAsyncioTestCase):
+    async def test_j25_read_only_method_scope_blocks_page_post_before_network(self):
+        http = BrowserHTTP(self.context, TARGET, allowed_methods={"GET", "HEAD", "OPTIONS"})
+        posted = route()
+        await http.guard(posted)
+        posted.abort.assert_awaited_once()
+        posted.continue_.assert_not_awaited()
+        self.assertEqual(http.blocked_requests[0]["reason"], "method_not_in_test_scope")
+
+    async def test_mutation_scope_allows_only_named_paths(self):
+        http = BrowserHTTP(self.context, TARGET, allowed_methods={"GET", "HEAD", "OPTIONS", "POST"},
+                           allowed_mutation_paths={"/login"})
+        http._ensure_browser_scope = AsyncMock()
+        safe = route(url=TARGET + "login")
+        outside = route(url=TARGET + "delete-account")
+        await http.guard(safe)
+        await http.guard(outside)
+        safe.fetch.assert_awaited_once_with(max_redirects=0)
+        safe.fulfill.assert_awaited_once()
+        outside.abort.assert_awaited_once()
+        self.assertEqual(http.blocked_requests[-1]["reason"], "path_not_in_test_scope")
+
     async def test_long_response_metadata_is_marked_so_prefixes_are_not_exact_matches(self):
         http = BrowserHTTP(self.context, TARGET)
         reply = response()
@@ -259,8 +281,9 @@ class BrowserHTTPTests(unittest.IsolatedAsyncioTestCase):
         context = self.context
         context.allowed_route = route()
         context.denied_route = route(url="https://outside.invalid/")
-        context.new_page = AsyncMock(return_value=SimpleNamespace(
-            goto=AsyncMock(side_effect=[TimeoutError("navigation timeout"), None]), wait_for_timeout=AsyncMock()))
+        page = Mock(goto=AsyncMock(side_effect=[TimeoutError("navigation timeout"), None]),
+                    wait_for_timeout=AsyncMock(), on=Mock(), once=Mock())
+        context.new_page = AsyncMock(return_value=page)
         context.close = AsyncMock()
         async def register(pattern, guard):
             context.guard = guard
@@ -278,8 +301,10 @@ class BrowserHTTPTests(unittest.IsolatedAsyncioTestCase):
             source, stdout, stderr = (root / name for name in ("probe.py", "stdout", "stderr"))
             source.write_text("await context.guard(context.allowed_route)\n"
                               "from tools import http_get as imported_get\n"
+                              "from browser_api import http_get as api_get, page as api_page\n"
                               "from browser import page as imported_page\n"
                               "assert imported_get is http_get and imported_page is page\n"
+                              "assert api_get is http_get and api_page is page\n"
                               "await context.guard(context.denied_route)\n"
                               "print(await replay_request(captured_requests()[0]['id'], {'q':'changed'}))\n"
                               "summary = discover_inputs('<form><input name=term></form>', target_origin, 'text/html')\n"

@@ -79,7 +79,7 @@ const goalSuggestions={
 };
 const goalScope=' 탐색 범위는 설정된 대상 안으로 제한하고, 경로와 탐색 순서는 관찰 결과에 따라 스스로 결정해줘. 계정·데이터를 변경하는 동작은 수행하지 말고, 확인된 사실과 추정을 구분해줘.';
 
-const actionLabel=action=>({read_file:'파일 읽기',write_file:'파일 작성',run_command:'CMD 실행',run_python:'브라우저 코드 실행',finish:'탐색 종료'})[action]||'다음 행동 생성';
+const actionLabel=action=>({read_file:'파일 읽기',write_file:'파일 작성',run_command:'CMD 실행',run_python:'브라우저 코드 실행',j25:'고정 조사 실행',start:'시작 페이지 관찰',observe:'페이지 관찰',analyze:'스크립트 분석',compare:'입력 비교',verify:'입력 검증',verify_browser:'브라우저 입력 검증',verify_access:'신원별 접근 검증',interact:'화면 입력',submit:'폼 제출',replay:'요청 재현',identity:'시험 신원 선택',finish:'탐색 종료'})[action]||'다음 행동 생성';
 const eventLabel=kind=>({run_created:'실험 시작',model_request:'모델 판단 시작',model_response:'모델 응답 완료',command_decoded:'실행 명령 확인',command_normalized:'중복 입력 정리',model_error:'모델 응답 오류',exec_started:'작업 실행',exec_finished:'작업 결과',file_changed:'파일 변경',process_started:'프로세스 시작',process_stopped:'프로세스 종료',runtime_created:'런타임 준비',runtime_destroyed:'런타임 삭제',run_finished_by_model:'모델 종료 판단',finalize_started:'실험 정리 시작',cleanup_step:'정리 진행',evidence_exported:'증거 보존',lab_reset:'실습환경 초기화',initial_lab_reset:'초기 상태 확인',run_finalized:'실험 종료',finalize_failed:'정리 실패',run_error:'실행기 오류',context_compacted:'컨텍스트 압축'})[kind]||kind;
 
 // Decode string fields for display while the JSON is still arriving. These
@@ -112,7 +112,7 @@ function readModelFields(raw){
     whitespace();if(raw[i++]!==':')break;whitespace();
     if(raw[i]!=='"')break;
     const value=string();
-    if(['action','plan','reason','path','content','command','code'].includes(key.value))fields[key.value]=value.value;
+    if(['action','plan','reason','path','content','command','code','ref','hypothesis'].includes(key.value))fields[key.value]=value.value;
     if(!value.complete)break;
   }
   return fields;
@@ -170,6 +170,8 @@ function readableCall(call){
   if(fields.action)lines.push(`행동: ${actionLabel(fields.action)}`);
   if(fields.plan)lines.push(`계획: ${fields.plan}`);
   if(fields.reason)lines.push(`이유: ${fields.reason}`);
+  if(fields.ref)lines.push(`대상 참조: ${fields.ref}`);
+  if(fields.hypothesis)lines.push(`가설(미검증): ${fields.hypothesis}`);
   if(fields.path)lines.push(`파일: ${fields.path}`);
   if(fields.code)lines.push(`\nPython 코드\n${fields.code}`);
   else if(fields.command)lines.push(`\nCMD 명령\n${fields.command}`);
@@ -214,6 +216,8 @@ function renderAgentStatus(){
       const heading=textNode('div','','decision-head');heading.append(textNode('strong',`${call.id} · ${actionLabel(fields.action)}`),textNode('span',callStatus(call),call.error?'error-text':'subtle'));
       row.append(heading,textNode('p',fields.plan||'계획 생성 중','decision-plan'));
       if(fields.reason)row.append(textNode('p',fields.reason,'reason-text'));
+      if(fields.ref)row.append(textNode('p',`대상 참조: ${fields.ref}`,'field-note'));
+      if(fields.hypothesis)row.append(textNode('p',`가설(미검증): ${fields.hypothesis}`,'field-note'));
       if(call.error)row.append(textNode('p',call.done_reason==='length'?`${call.eval_count||call.limit}토큰 한도로 응답이 잘렸습니다. 실행 0회.`:call.error,'decision-error'));
       const code=fields.code||fields.command||fields.content;
       if(code){const detail=document.createElement('details');detail.dataset.call=call.id;detail.open=opened.has(call.id);detail.append(textNode('summary',`${call.exec_id||'실행 전'} · ${fields.code?'Python 코드':fields.command?'CMD 명령':'파일 내용'} 보기`),textNode('pre',code,'code-preview'));row.append(detail);}
@@ -225,7 +229,8 @@ function renderAgentStatus(){
     setText('observationStatus',`${result.exec_id} · ${executionLabel(result)} · ${result.elapsed??'—'}초`);
     const failure=result.exception?.trim().split('\n').at(-1);
     const blocks=(result.blocked_requests||[]).map(item=>`하네스 요청 차단: ${item.method} ${item.url} · ${{outside_target_origin:'대상 범위 밖',unsupported_method:'지원하지 않는 HTTP 메서드',invalid_url:'올바르지 않은 URL',websocket_not_supported:'WebSocket 연결 미지원',scope_guard_unavailable:'범위 검사 준비 실패',browser_scope_policy_blocked:'브라우저 범위 제한'}[item.reason]||item.reason}`).join('\n');
-    setText('latestObservation',[failure,blocks,result.stdout,result.stderr].filter(Boolean).join('\n').slice(0,2400)||`${actionLabel(result.action)} 완료${result.path?'\n'+result.path:''} · 출력 없음`);
+    const fixed=result.j25_result?JSON.stringify({action:result.j25_result.action,status:result.j25_result.status,comparison:result.j25_result.comparison,error:result.j25_result.error},null,2):'';
+    setText('latestObservation',[failure,blocks,fixed,result.stdout,result.stderr].filter(Boolean).join('\n').slice(0,2400)||`${actionLabel(result.action)} 완료${result.path?'\n'+result.path:''} · 출력 없음`);
     $('observationStatus').classList.toggle('error-text',result.exit_code!==0);
   }
 }
@@ -558,7 +563,13 @@ async function loadScore(state){
       cards.append(card);
     }
     const p=s.pipeline_metrics;
-    setText('scorePipelineNote',p
+    const j=s.j25_metrics;
+    setText('scorePipelineNote',j
+      ?`입력 비교 ${j.comparisons}회 · 기준 응답이 안정적인 비교 ${j.stable_comparisons}회 · 미완료 ${j.pending}건.`+
+        (j.model_calls==null?'':` 모델 호출 ${j.model_calls}회 · 판단 ${j.model_decision_seconds}초 · 첫 성공 비교 ${j.first_comparison_step==null?'없음':`${j.first_comparison_step}단계`} · 반복 차단 ${j.repeat_blocks}회.`)+
+        (j.verified_findings==null?' 고유 사례 검증 기록 없음.':` 검증된 고유 사례 ${j.verified_findings}건 · 전체 취약점 대비 비율 ${j.verification_rate==null?'측정 불가':j.verification_rate}.`)+
+        ' 차이는 취약점 확정이 아닙니다.'
+      :p
       ?`선언 리소스 ${p.declared_resources} · 제공 텍스트 분석 기록 ${p.analyzed_resources} · 분석 기록 없음 ${p.unreviewed_resources} · 보안 영향 주장 ${p.claim_counts.security_effect}건(미검증). 본문 전체 확보·실제 발견의 독립 검증을 뜻하지 않습니다.`
       :'진행·검증 수준 기록 없음. 기존 점수로 취약점 발견 여부를 판단할 수 없습니다.');
     panel.hidden=false; scoreShownKey=key;
@@ -587,8 +598,16 @@ function renderRunHeader(state){
   if(ctxPct!==null){$('contextBar').hidden=false;const fill=$('contextBarFill');fill.style.width=ctxPct+'%';fill.className='context-bar-fill'+(ctxPct>=90?' bad':ctxPct>=70?' warn':'');setText('contextBarText',ctxText);}
   else $('contextBar').hidden=true;
   const summary=$('resultSummary'); summary.replaceChildren();
-  for(const [key,value] of [['실험 결과',state.run_result||'진행 중'],['종료 이유',state.finish_reason||'—'],
-    ['로그',state.log_status],['런타임 정리',state.cleanup_status],['대상 초기화',statusText(state.lab_reset_status)]]){
+  const resultRows=[['실험 결과',state.run_result||'진행 중'],['종료 이유',state.finish_reason||'—'],
+    ['로그',state.log_status],['런타임 정리',state.cleanup_status],['대상 초기화',statusText(state.lab_reset_status)]];
+  if(state.prompt_version==='J2.5'&&state.coverage_status){
+    resultRows.splice(1,0,['목표(모델 판단·미검증)',({completed:'완료로 판단',partial:'일부 수행으로 판단',unknown:'판단 없음'})[state.goal_status]||'판단 없음'],
+      ['발견 참조 범위',({complete:'기록된 참조 검토됨',partial:'일부 미검토 또는 제한',unknown:'확인 전'})[state.coverage_status]||'확인 전']);
+    const ledger=state.j25_state?.evidence;
+    if(ledger)resultRows.splice(1,0,['검증된 고유 사례',String(ledger.counts?.independently_verified??0)],
+      ['전체 취약점 대비 비율',ledger.rate==null?'측정 불가':String(ledger.rate)]);
+  }
+  for(const [key,value] of resultRows){
     summary.append(textNode('dt',key),textNode('dd',value||'—'));
   }
   setText('reportText',state.report||'보고서가 아직 생성되지 않았습니다.');

@@ -3,6 +3,18 @@ content, command, code. Every action needs nonempty plan/reason. Use only the ac
 read_file -> path; write_file -> path/content; run_command -> command; run_python -> code;
 finish -> none. Unused payload fields are empty strings. Explanations/report follow the user's
 requested language, otherwise the goal's language. Keep JSON keys, code and URLs unchanged.
+For non-finish actions, plan is one brief sentence (<=240 characters), reason <=800 characters.
+Do not repeat rationale or narrate hypothetical results. These limits do not shorten code or reports.
+
+Starting state:
+- j2 memory belongs ONLY to this run, is created empty, and does not import earlier experiments.
+  Empty memory means no retained observations yet, NOT that reconnaissance found no surfaces.
+  Reading memory is internal bookkeeping. When investigation is authorized and observations are absent,
+  choose a useful first observation from the supplied target/goal; an existing memory file is not a prerequisite.
+  Use memory_path for omitted details after useful work exists, not to repeatedly look for prior-run findings.
+  memory_state.read_allowed is false initially and after an internal-memory read until other work occurs.
+  Such reads are rejected before execution: changing plan/reason or auto-saved bookkeeping is not new work.
+  A read_file action opens a local file; it cannot load a target page, regardless of its plan wording.
 
 Scope and trust:
 - Follow the goal, permission and limits. Requests stay within the target origin; files stay in the
@@ -42,7 +54,7 @@ Choose useful work:
   paths and check recorded/error. Notes/files are not mandatory per step. Update useful remaining work.
   evidence_level: hypothesis, normal_behavior, controlled_comparison or security_effect (all claims).
   observation_steps: up to eight prior step numbers. Available references prove output exists, not its
-  meaning or security impact; failed/current/missing/no-output references are unavailable. Omitted
+  meaning or security impact; failed/current/missing/no-output/internal-memory references are unavailable. Omitted
   level/references retain previous values; hypothesis and [] explicitly reset them.
 
 Evidence and recovery:
@@ -73,6 +85,7 @@ Reporting and limits:
   pending resources; state meaningful deferred work and scope limits. must_visit_all is false. Do not
   generalize sampled text with no fields or failed rendering to site-wide "no inputs/backend" or
   "attack impossible". Open notes leave investigation incomplete; closed notes never establish coverage.
+  If only internal memory was read, report the target as unassessed; do not call memory absence a site finding.
 - Report tested features, concrete candidates, actual tests/results, demonstrated impact and limits.
   Mention attack types only when plausible from observations or actually attempted; no untouched-category
   filler. Separate reproducible effects from ordinary observations and unverified claims. If nothing was
@@ -84,8 +97,13 @@ Runtime reference:
 - J2 preflight rejects known bad code as not_run. Read its saved source when repairing. Known missing
   initial imports must change or use a guarded fallback. Automatic execution records are not hypotheses.
 - page/context/browser persist. Use top-level await or async def main(page, context, browser), not
-  asyncio.run(), undefined main or another browser launch. Helpers are provided functions; tools exports
-  them and browser exports page/context/browser. Do not import http_get as a module. Other libraries may
+  asyncio.run(), run_until_complete(), run_forever(), undefined main or another browser launch.
+  The runtime supplies these objects; explicit calls use await main(page, context, browser), never None.
+  Helpers are provided functions; tools exports
+  them and browser exports page/context/browser; browser_api is a compatibility alias exporting both.
+  run_command is shell text, never Python await. Use run_python directly, without an interpreter path.
+  JSON code must decode to real newlines, not literal backslash-n separators; a single-line command is valid.
+  Do not import http_get as a module. Other libraries may
   be unavailable; use provided APIs/standard library and heed unavailable_modules.
 - Await get_text/get_json/http_get/goto_and_render/list_inputs/submit_input/replay_request/compare_inputs.
   discover_inputs, note_candidate and captured_requests are sync. http_get returns a dictionary: status,

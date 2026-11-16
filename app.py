@@ -648,8 +648,13 @@ async def start(request: Request) -> dict:
                 raise ValueError(f"선택한 모델의 컨텍스트 한도는 {info['context_length']} 토큰입니다.")
             if info.get("max_completion_tokens") and options.get("num_predict", -1) > info["max_completion_tokens"]:
                 raise ValueError(f"선택한 모델의 출력 한도는 {info['max_completion_tokens']} 토큰입니다.")
-        started = EXPLORER.start(target, model, goal=goal, model_settings=settings, scenario_source=scenario_source,
-                                 chain_mode=chain_mode, budgets=body.get("budgets"), prompt_version=body.get("prompt_version"),)
+        start_options = {"goal": goal, "model_settings": settings, "scenario_source": scenario_source,
+                         "chain_mode": chain_mode, "budgets": body.get("budgets")}
+        if body.get("prompt_version") is not None:
+            start_options["prompt_version"] = body["prompt_version"]
+        if body.get("j25_test_scope") is not None:
+            start_options["j25_test_scope"] = body["j25_test_scope"]
+        started = EXPLORER.start(target, model, **start_options)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:

@@ -4,13 +4,27 @@ import copy
 import ast
 import json
 import re
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
 from j2_progress import pipeline_view, public_path
 
 
 MEMORY_PATH = "work/j2-memory.json"
 EVIDENCE_LEVELS = {"hypothesis", "normal_behavior", "controlled_comparison", "security_effect"}
+
+
+def is_memory_read(command, memory_file=None):
+    if not command or command.action != "read_file":
+        return False
+    path = PurePosixPath(command.path.replace("\\", "/"))
+    if path.as_posix() == MEMORY_PATH:
+        return True
+    if memory_file is not None and not path.is_absolute() and ".." not in path.parts:
+        try:
+            return (memory_file.parent.parent / path).samefile(memory_file)
+        except OSError:
+            pass
+    return False
 
 
 def bounded_discovery(summary):
@@ -92,7 +106,8 @@ class CandidateNotebook:
 
 
 class J2Policy:
-    def __init__(self):
+    def __init__(self, *, memory_file=None):
+        self.memory_file = Path(memory_file) if memory_file is not None else None
         self.candidates = {}
         self.advisories = []
         self.omitted_notes = 0
@@ -103,6 +118,11 @@ class J2Policy:
         self.omitted_discovery = 0
 
     def command_problems(self, command):
+        if is_memory_read(command, self.memory_file):
+            if not self.memory_state()["non_memory_executions"]:
+                return ["Current-run memory has no target observations. read_file cannot open the website. Choose authorized observation work; no prior-memory read is needed."]
+            if self.executions[-1]["bookkeeping_only"]:
+                return ["No new work since the last internal-memory read. Auto-saved read/rejection logs are not new observations. Relevant state is already in context; choose another useful action or report the actual limits."]
         if command.action != "run_python":
             return []
         from code_checks import check_generated_code
@@ -127,6 +147,7 @@ class J2Policy:
     def record_rejection(self, command, problems, source_path, artifact_path):
         self.rejected_actions.append({"call_id": command.call_id, "action": command.action,
             "plan": command.plan[:160], "outcome": "not_run", "problems": problems[:3],
+            "path": command.path,
             "source_path": source_path, "artifact_path": artifact_path})
 
     def record(self, execution, step, command=None):
@@ -140,6 +161,7 @@ class J2Policy:
                   if execution.action == "run_python" and path.endswith(".py") else "")
         outcome = ("not_run" if execution.cause_code == "static_check" else "cancelled" if execution.cancelled
                    else "timed_out" if execution.timed_out else "failed" if partial else "executed")
+        bookkeeping = is_memory_read(command, self.memory_file)
         responses = []
         for item in (execution.http_observations if isinstance(execution.http_observations, list) else [])[:16]:
             if (not isinstance(item, dict) or not isinstance(item.get("url"), str)
@@ -207,6 +229,7 @@ class J2Policy:
                 else "code" if partial and (execution.exception_type or not helper_errors) else None),
             "plan": command.plan[:160] if command else "", "partial": bool(partial and (execution.stdout.strip() or responses)),
             "output_present": bool(execution.stdout.strip()), "verification": "execution_only",
+            "bookkeeping_only": bookkeeping,
             "http_observations": responses,
             "helper_errors": helper_errors,
             "helper_outcomes": helper_outcomes,
@@ -243,7 +266,8 @@ class J2Policy:
             item["evidence_level"] = item.get("evidence_level", previous.get("evidence_level", "hypothesis"))
             item["observation_steps"] = item.get("observation_steps", previous.get("observation_steps", []))
             available = {entry["step"] for entry in self.executions if entry["step"] < step
-                         and entry["outcome"] == "executed" and entry["output_present"] and not entry["helper_errors"]}
+                         and entry["outcome"] == "executed" and entry["output_present"] and not entry["helper_errors"]
+                         and not entry["bookkeeping_only"]}
             item["available_observation_steps"] = [value for value in item["observation_steps"] if value in available]
             item["unavailable_observation_steps"] = [value for value in item["observation_steps"] if value not in available]
             item["evidence_paths"] = list(dict.fromkeys(previous.get("evidence_paths", []) + item["evidence_paths"]))[-4:]
@@ -264,12 +288,21 @@ class J2Policy:
     def investigation_status(self):
         if self.omitted_notes:
             return "incomplete"
+        if self.executions and all(item["bookkeeping_only"] for item in self.executions):
+            return "incomplete"
         if not self.candidates:
             return "untracked"
         return "incomplete" if any(item["state"] != "closed" for item in self.candidates.values()) else "recorded_work_closed"
 
+    def memory_state(self):
+        reads = sum(item["bookkeeping_only"] for item in self.executions)
+        return {"scope": "current_run_only", "prior_runs_loaded": False,
+                "memory_reads": reads, "non_memory_executions": len(self.executions) - reads,
+                "read_allowed": bool(self.executions and not self.executions[-1]["bookkeeping_only"])}
+
     def snapshot(self):
         return copy.deepcopy({"candidates": list(self.candidates.values()), "advisories": self.advisories,
+                              "memory_state": self.memory_state(),
                               "pipeline": pipeline_view(list(self.discovery_summaries.values()), self.executions, self.rejected_actions),
                               "executions": self.executions, "rejected_actions": self.rejected_actions,
                               "unavailable_modules": sorted(self.unavailable_modules),
@@ -295,6 +328,7 @@ class J2Policy:
             discovery[key] = entries[:24]
             discovery["omitted_" + key] = max(0, len(entries) - 24)
         return copy.deepcopy({"candidates": items[:8], "omitted_candidates": max(0, len(items) - 8),
+            "memory_state": self.memory_state(),
             "finish_review": pipeline["review"], "pending_resources": pipeline["pending_resources"],
             "omitted_pending": pipeline["omitted_pending"], "recovery": pipeline["failures"][-4:],
             "omitted_recovery": max(0, len(pipeline["failures"]) - 4) + pipeline["omitted_failures"],
@@ -303,7 +337,7 @@ class J2Policy:
             "rejected_actions": self.rejected_actions[-2:], "omitted_rejections": max(0, len(self.rejected_actions) - 2),
             "omitted_notes": self.omitted_notes,
             "memory_path": MEMORY_PATH, "advisories": self.advisories,
-            "instruction": "Optional model-authored notes, not a checklist or verified findings. Discovery holds untrusted declarations, not confirmed endpoints or completed analysis. Choose any useful in-scope next step. Read memory_path for retained notes and discovery summaries. Closed means work stopped, never that the site is safe."})
+            "instruction": "Memory is initialized empty for THIS run; no prior runs are loaded. Empty records mean no retained observations, not absent surfaces or blocked access. Reading memory is bookkeeping. Choose a useful authorized observation when none exists. Use memory_path only for omitted details, not as a prerequisite. Notes/declarations remain unverified; closed is not safe."})
 
 
 def pack_j2_context(context, budget):

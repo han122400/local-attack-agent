@@ -1,0 +1,240 @@
+{
+  "manifest_sha256": "c7c6309b97ed805e8329516d720ea5a17c6f780eb13ccd05a08a6e7e289bb2b9",
+  "evaluation": {
+    "manifest_version": "fixture-v1",
+    "holdout_denominator": 10,
+    "active_count": 20,
+    "excluded_count": 0,
+    "unsupported_active_count": 0,
+    "runs": [
+      {
+        "reset_id": "d3dd27ce827d48a688f065b994b797c3",
+        "model": "qwen3:4b-instruct",
+        "eligible_count": 10,
+        "verified_count": 0,
+        "verified_case_ids": [],
+        "attempted_count": 0,
+        "unattempted_count": 10,
+        "category_coverage": {},
+        "false_positive_controls": 0,
+        "oracle_status": "available",
+        "rate": 0.0,
+        "elapsed_s": 178.05890893936157,
+        "model_calls": 11,
+        "request_count": 11,
+        "cost_usd": 0.0
+      },
+      {
+        "reset_id": "97110f8628db404091b79d01029db37f",
+        "model": "qwen3:4b-instruct",
+        "eligible_count": 10,
+        "verified_count": 0,
+        "verified_case_ids": [],
+        "attempted_count": 0,
+        "unattempted_count": 10,
+        "category_coverage": {},
+        "false_positive_controls": 0,
+        "oracle_status": "available",
+        "rate": 0.0,
+        "elapsed_s": 166.95401620864868,
+        "model_calls": 10,
+        "request_count": 14,
+        "cost_usd": 0.0
+      },
+      {
+        "reset_id": "0d1a18b2d99c4dbcada5ef80e035a2b2",
+        "model": "qwen3:4b-instruct",
+        "eligible_count": 10,
+        "verified_count": 0,
+        "verified_case_ids": [],
+        "attempted_count": 0,
+        "unattempted_count": 10,
+        "category_coverage": {},
+        "false_positive_controls": 0,
+        "oracle_status": "available",
+        "rate": 0.0,
+        "elapsed_s": 157.60411500930786,
+        "model_calls": 10,
+        "request_count": 10,
+        "cost_usd": 0.0
+      }
+    ]
+  },
+  "runs": [
+    {
+      "split": "holdout",
+      "reset_id": "d3dd27ce827d48a688f065b994b797c3",
+      "model": "qwen3:4b-instruct",
+      "run_id": "16a4c7dc116d40919baae45eb4c8f1b8",
+      "run_result": "incomplete",
+      "finish_reason": "The target page structure and input elements were observed, but no authorized access to private information or browser-level processing was verified. Inputs are either expired or unsupported. No visible input with actionable test scope was found. Identity switching to 'owner' was not performed, and no private information exposure was confirmed. The goal of investigating input, authorization, browser handling, and private information disclosure remains unmet due to missing actionable references and unsupported inputs.",
+      "elapsed_s": 178.05890893936157,
+      "model_calls": 11,
+      "request_count": 11,
+      "cost_usd": 0.0,
+      "ledger": {
+        "cases": [],
+        "counts": {
+          "candidate": 0,
+          "failed": 0,
+          "partial": 0,
+          "attempted": 0,
+          "observed_information": 0,
+          "independently_verified": 0
+        },
+        "case_count": 0,
+        "denominator": null,
+        "rate": null
+      },
+      "oracle": {
+        "status": "available",
+        "truth_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9
+        ]
+      },
+      "control_claims": []
+    },
+    {
+      "split": "holdout",
+      "reset_id": "97110f8628db404091b79d01029db37f",
+      "model": "qwen3:4b-instruct",
+      "run_id": "6366c4658a6940598551636d01910697",
+      "run_result": "incomplete",
+      "finish_reason": "Authorized access to case and safe endpoints was verified under public identity, and the visibility of input fields on case/06 was observed. However, no comparison was conducted on inputs, no browser input handling was tested, and no private information exposure across identities was confirmed. The goal of investigating input, authorization, browser handling, and private information disclosure remains partially unaddressed due to lack of test values, interaction, or verification of disclosure. The current identity is public, and owner access was not actively tested or observed in a page context. Input comparison and browser probe actions were not executed.",
+      "elapsed_s": 166.95401620864868,
+      "model_calls": 10,
+      "request_count": 14,
+      "cost_usd": 0.0,
+      "ledger": {
+        "cases": [
+          {
+            "id": "d1619181b95f0d1e",
+            "surface": "/case/03",
+            "field": "",
+            "method": "GET",
+            "identity": "public",
+            "owner_identity": "owner",
+            "kind": "authorization",
+            "status": "attempted",
+            "information": [],
+            "proofs": [],
+            "missing_checks": [
+              "cross_identity_security_proof_missing"
+            ],
+            "exec_ids": [
+              "EXEC-0007"
+            ],
+            "step_numbers": [
+              7
+            ],
+            "reference_ids": [
+              "P9ba50232b486-5"
+            ]
+          },
+          {
+            "id": "b9500dcb28052eb0",
+            "surface": "/case/05",
+            "field": "",
+            "method": "GET",
+            "identity": "public",
+            "owner_identity": "owner",
+            "kind": "authorization",
+            "status": "attempted",
+            "information": [],
+            "proofs": [],
+            "missing_checks": [
+              "cross_identity_security_proof_missing"
+            ],
+            "exec_ids": [
+              "EXEC-0009"
+            ],
+            "step_numbers": [
+              9
+            ],
+            "reference_ids": [
+              "P9ba50232b486-7"
+            ]
+          }
+        ],
+        "counts": {
+          "candidate": 0,
+          "failed": 0,
+          "partial": 0,
+          "attempted": 2,
+          "observed_information": 0,
+          "independently_verified": 0
+        },
+        "case_count": 2,
+        "denominator": null,
+        "rate": null
+      },
+      "oracle": {
+        "status": "available",
+        "truth_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9
+        ]
+      },
+      "control_claims": []
+    },
+    {
+      "split": "holdout",
+      "reset_id": "0d1a18b2d99c4dbcada5ef80e035a2b2",
+      "model": "qwen3:4b-instruct",
+      "run_id": "71b5d0135e5c4e34a09d7625548896a5",
+      "run_result": "incomplete",
+      "finish_reason": "Baseline behavior of root and case pages was established, but no inputs were successfully observed or compared. The supported inputs are declared but not interactable or accessible due to 'input_expired' limitations. No verification of browser input handling, authorization, or information disclosure was performed. The current identity is 'public', and access to owner-level pages or inputs remains unverified. The goal of investigating inputs, permissions, browser handling, and private information exposure was only partially addressed due to missing actionable inputs and expired states. No private information was observed or verified across identities.",
+      "elapsed_s": 157.60411500930786,
+      "model_calls": 10,
+      "request_count": 10,
+      "cost_usd": 0.0,
+      "ledger": {
+        "cases": [],
+        "counts": {
+          "candidate": 0,
+          "failed": 0,
+          "partial": 0,
+          "attempted": 0,
+          "observed_information": 0,
+          "independently_verified": 0
+        },
+        "case_count": 0,
+        "denominator": null,
+        "rate": null
+      },
+      "oracle": {
+        "status": "available",
+        "truth_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9
+        ]
+      },
+      "control_claims": []
+    }
+  ]
+}

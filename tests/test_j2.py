@@ -42,6 +42,57 @@ class NotebookTests(unittest.TestCase):
 
 
 class PolicyTests(unittest.TestCase):
+    def test_memory_guard_uses_filesystem_identity_without_case_folding_other_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "work").mkdir()
+            memory_file = root / "work/j2-memory.json"
+            memory_file.write_text("{}")
+            policy = J2Policy(memory_file=memory_file)
+            alias_file = root / "work/J2-MEMORY.JSON"
+            alias = Command("read_file", "Read alias", "Inspect notes", path="work/J2-MEMORY.JSON")
+            if alias_file.exists():
+                self.assertTrue(policy.command_problems(alias))
+                policy.record(ExecutionResult("E1", "read_file", exit_code=0, stdout="{}"), 1, alias)
+                self.assertTrue(policy.snapshot()["executions"][0]["bookkeeping_only"])
+                self.assertEqual(policy.memory_state()["non_memory_executions"], 0)
+            else:
+                alias_file.write_text("a genuinely separate file")
+                self.assertEqual(policy.command_problems(alias), [])
+
+    def test_empty_and_self_updating_memory_reads_are_rejected_until_other_work_changes(self):
+        policy = J2Policy()
+        read = Command("read_file", "Read notes", "Inspect notes", path="work/j2-memory.json")
+        self.assertTrue(policy.command_problems(read))
+        policy.record(ExecutionResult("E1", "run_python", exit_code=0, stdout="observation"), 1)
+        self.assertEqual(policy.command_problems(read), [])
+        policy.record(ExecutionResult("E2", "read_file", exit_code=0, stdout="snapshot version one"), 2, read)
+        self.assertTrue(policy.command_problems(read))
+        alias = Command("read_file", "Read notes", "Another spelling", path="./work//j2-memory.json")
+        self.assertTrue(policy.command_problems(alias))
+        policy.record_rejection(read, ["same memory"], "", "artifacts/rejected.json")
+        self.assertTrue(policy.command_problems(read))
+        policy.record(ExecutionResult("E3", "run_python", exit_code=1, exception="repair needed"), 3)
+        self.assertEqual(policy.command_problems(read), [])
+        self.assertEqual(policy.command_problems(Command("read_file", "Read source", "Inspect saved source", path="work/page.html")), [])
+
+    def test_new_memory_is_explicitly_current_run_bookkeeping_not_prior_recon(self):
+        policy = J2Policy()
+        for view in (policy.snapshot(), policy.context()):
+            self.assertEqual(view["memory_state"]["scope"], "current_run_only")
+            self.assertFalse(view["memory_state"]["prior_runs_loaded"])
+            self.assertEqual(view["memory_state"]["non_memory_executions"], 0)
+
+    def test_memory_reads_are_not_observation_references_for_security_claims(self):
+        policy = J2Policy()
+        policy.record(ExecutionResult("E1", "read_file", exit_code=0, stdout='{"candidates":[]}'), 1,
+                      Command("read_file", "inspect memory", "bookkeeping", path="./work/j2-memory.json"))
+        notes = CandidateNotebook()
+        notes.note_candidate("widget", evidence_level="security_effect", observation_steps=[1])
+        policy.record(ExecutionResult("E2", "run_python", exit_code=0, investigation_notes=notes.notes), 2)
+        self.assertEqual(policy.snapshot()["candidates"][0]["available_observation_steps"], [])
+        self.assertEqual(policy.snapshot()["candidates"][0]["unavailable_observation_steps"], [1])
+
     def test_discovery_references_survive_later_steps_without_stdout_parsing(self):
         policy = J2Policy()
         summary = {"source_url": "https://example.test/", "assets": [{"url": "https://example.test/exact-hash.js", "kind": "script"}],
@@ -287,6 +338,50 @@ def answer(action="finish"):
 
 
 class LoopTests(unittest.TestCase):
+    def test_empty_memory_read_requests_are_rejected_without_executing_a_tool(self):
+        read = answer("read_file")
+        command = json.loads(read["message"]["content"])
+        command["path"] = "work/j2-memory.json"
+        read["message"]["content"] = json.dumps(command)
+        outputs = [ExecutionResult(f"E{i}", "read_file", exit_code=0, stdout='{"candidates": []}') for i in (1, 2)]
+        result, sent, executed, state, memory = self.run_loop([read, read, answer()], outputs)
+        self.assertEqual(result[0], "incomplete")
+        self.assertEqual(len(executed), 0)
+        self.assertEqual(len(sent), 3)
+        context = json.loads(sent[-1]["messages"][1]["content"])
+        self.assertEqual(context["j2"]["memory_state"]["memory_reads"], 0)
+        self.assertEqual(memory["memory_state"]["non_memory_executions"], 0)
+        self.assertEqual(len(memory["rejected_actions"]), 2)
+        self.assertTrue(all(not item["source_path"] for item in memory["rejected_actions"]))
+        report = compose_report(state["findings"], *result, j2_state=state["j2_state"])
+        self.assertIn("미시행", report)
+        self.assertIn("work/j2-memory.json", report)
+
+    def test_empty_memory_requests_can_be_repaired_to_real_work_without_extra_tool_calls(self):
+        read = answer("read_file")
+        command = json.loads(read["message"]["content"])
+        command["path"] = "work/j2-memory.json"
+        read["message"]["content"] = json.dumps(command)
+        output = ExecutionResult("E1", "run_python", exit_code=0, stdout="fixture observation")
+        result, sent, executed, _, memory = self.run_loop([read, answer("run_python"), answer()], [output])
+        self.assertEqual(len(executed), 1)
+        self.assertEqual(executed[0]["action"], "run_python")
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(len(memory["rejected_actions"]), 1)
+        self.assertEqual(memory["rejected_actions"][0]["action"], "read_file")
+
+    def test_persistent_empty_memory_requests_reach_reporting_without_a_read_loop(self):
+        read = answer("read_file")
+        command = json.loads(read["message"]["content"])
+        command["path"] = "work/j2-memory.json"
+        read["message"]["content"] = json.dumps(command)
+        result, sent, executed, _, memory = self.run_loop([read] * 6 + [answer()], calls=40)
+        self.assertEqual(executed, [])
+        self.assertEqual(len(sent), 7)
+        self.assertTrue(json.loads(sent[-1]["messages"][1]["content"])["remaining"]["finish_soon"])
+        self.assertEqual(result[0], "incomplete")
+        self.assertEqual(len(memory["rejected_actions"]), 6)
+
     def test_large_helper_metadata_does_not_consume_the_reporting_call(self):
         for field in ("helper_outcomes", "helper_errors"):
             with self.subTest(field=field):

@@ -65,7 +65,8 @@ class BrowserUiScenarios(unittest.TestCase):
                 if goal == "UI start": cls.release_start.wait(15)
                 if goal == "UI B": cls.release_b.wait(15)
                 if goal == "UI D":
-                    command = "for /L %i in (1,1,300) do @echo LINE-%i" if os.name == "nt" else "seq 1 300"
+                    command = ("for /L %i in (1,1,300) do @echo LINE-%i" if os.name == "nt"
+                               else "seq 1 300 | sed 's/^/LINE-/'")
                 else:
                     command = "type work\\note.txt" if os.name == "nt" else "cat work/note.txt"
                 response = answer("run_command", command=command)
@@ -461,6 +462,23 @@ class BrowserUiScenarios(unittest.TestCase):
         self.assertTrue(page.locator("#newOutputButton").is_visible())
         page.locator("#newOutputButton").click()
         self.assertTrue(page.locator("#autoScrollToggle").is_checked())
+        self.assertFalse(self.page_errors)
+
+    def test_j25_goal_assessment_and_discovered_coverage_are_shown_separately(self):
+        run_id = "d" * 32
+        log = self.explorer.store.create(run_id, {"goal": "compare search", "model": "mock:model",
+            "prompt_version": "J2.5", "phase": "finished", "run_result": "incomplete",
+            "goal_status": "completed", "goal_status_source": "model_unverified", "coverage_status": "partial",
+            "cleanup_status": "succeeded", "log_status": "finalized", "lab_reset_status": "succeeded",
+            "started_at": 1, "finished_at": 2})
+        log.close()
+        self.page.goto(f"{self.base}/runs/{run_id}")
+        self.page.locator("#evidenceTab").click()
+        summary = self.page.locator("#resultSummary")
+        summary.locator("dt", has_text="목표(모델 판단·미검증)").wait_for(timeout=10000)
+        self.assertIn("완료", summary.inner_text())
+        self.assertIn("발견 참조 범위", summary.inner_text())
+        self.assertIn("일부 미검토", summary.inner_text())
         self.assertFalse(self.page_errors)
 
     def test_05_model_output_is_readable_and_failed_generation_is_not_execution(self):

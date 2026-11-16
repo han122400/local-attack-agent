@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from explorer import ExplorerV3, safe_target, validate_budgets
-from session_log import SessionStore
+from session_log import SessionLog, SessionStore
 
 
 def reply(action, **values):
@@ -18,6 +18,42 @@ def reply(action, **values):
 
 
 class V3ExplorerTests(unittest.TestCase):
+    def test_j25_oracle_is_captured_after_stop_and_before_reset_even_when_unavailable(self):
+        for snapshot_fails in (False, True):
+            with self.subTest(snapshot_fails=snapshot_fails), tempfile.TemporaryDirectory() as temp:
+                order = []
+                class Runtime:
+                    def inspect(self, _run_id):
+                        return {"runtime_exists": False, "managed_processes": []}
+                    def stop(self, *_args):
+                        order.append("stop")
+                    def export_evidence(self, *_args):
+                        order.append("export")
+                    def destroy(self, *_args):
+                        order.append("destroy")
+                def capture(_target):
+                    order.append("oracle")
+                    if snapshot_fails:
+                        raise OSError("oracle offline")
+                    return {"status": "available", "solved_ids": [1], "challenge_count": 1}
+                def reset():
+                    order.append("reset")
+                    return {"verified": True}
+                root = Path(temp)
+                run_id = "a" * 32
+                log = SessionLog(root, run_id, {"prompt_version": "J2.5",
+                    "target": "http://127.0.0.1:3000/", "j25_state": {"evidence": {"cases": []}},
+                    "budgets": {"finalize_seconds": 120}})
+                explorer = ExplorerV3(root, browser_enabled=False, lab_reset=reset)
+                with patch("explorer.capture_j25_lab_oracle", side_effect=capture):
+                    explorer._finalize(run_id, log, Runtime(), "incomplete", "done")
+                saved = SessionStore(root).read(run_id)
+                self.assertLess(order.index("stop"), order.index("oracle"))
+                self.assertLess(order.index("oracle"), order.index("reset"))
+                self.assertEqual(saved["lab_reset_status"], "succeeded")
+                self.assertEqual(saved["j25_lab_oracle"]["status"],
+                                 "unavailable" if snapshot_fails else "available")
+
     def test_target_and_budgets_are_scoped(self):
         self.assertEqual(safe_target("http://127.0.0.1:3000/#/"), "http://127.0.0.1:3000/#/")
         self.assertEqual(safe_target("https://my-site.example:8443/app"), "https://my-site.example:8443/app")

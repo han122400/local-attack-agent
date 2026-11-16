@@ -6,14 +6,16 @@ import asyncio
 import json
 import re
 import uuid
+from html import escape
 from email.message import Message
 from email.parser import BytesParser
 from email.policy import default
-from urllib.parse import quote_plus, unquote_plus, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, quote_plus, unquote_plus, urlsplit, urlunsplit
 
 
 class BrowserHTTP:
-    def __init__(self, context, target, *, body_limit=2000):
+    def __init__(self, context, target, *, body_limit=2000, capture_gets=False,
+                 allowed_methods=None, allowed_mutation_paths=None):
         if type(body_limit) is not int or not 1 <= body_limit <= 2_000_000:
             raise ValueError("body_limit must be between 1 and 2000000 characters")
         self.body_limit = body_limit
@@ -22,6 +24,23 @@ class BrowserHTTP:
         self.blocked_requests = []
         self.http_observations = []
         self._requests = {}
+        self._get_requests = {}
+        self._get_secrets = set()
+        self._get_secret_bytes = 0
+        self._get_secrets_saturated = False
+        self._capture_gets = capture_gets
+        permitted = {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}
+        if allowed_methods is not None and (not isinstance(allowed_methods, (set, frozenset))
+                                             or not allowed_methods or not allowed_methods <= permitted):
+            raise ValueError("allowed_methods must be a nonempty subset of HTTP methods")
+        self.allowed_methods = allowed_methods or permitted
+        if allowed_mutation_paths is not None and (not isinstance(allowed_mutation_paths, (set, frozenset))
+            or any(not isinstance(path, str) or not path.startswith("/") or path.startswith("//")
+                   or any(part in path for part in ("?", "#", "\\", "..")) for path in allowed_mutation_paths)):
+            raise ValueError("allowed_mutation_paths must contain exact absolute paths")
+        self.allowed_mutation_paths = allowed_mutation_paths
+        self.page_request_count = 0
+        self.last_navigation_status = None
         self._counter = 0
         self._request_prefix = uuid.uuid4().hex[:12]
         self._scoped_pages = {}
@@ -48,6 +67,8 @@ class BrowserHTTP:
         self.step = step
         self.blocked_requests = []
         self.http_observations = []
+        self.page_request_count = 0
+        self.last_navigation_status = None
 
     def record_response(self, response, method="GET"):
         url = self._public_url(response.url)
@@ -69,6 +90,11 @@ class BrowserHTTP:
             return "invalid_url"
         if method not in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}:
             return "unsupported_method"
+        if method not in self.allowed_methods:
+            return "method_not_in_test_scope"
+        if (method not in {"GET", "HEAD", "OPTIONS"} and self.allowed_mutation_paths is not None
+                and parts.path not in self.allowed_mutation_paths):
+            return "path_not_in_test_scope"
         return None
 
     def _check(self, url, method):
@@ -121,6 +147,34 @@ class BrowserHTTP:
             print("HARNESS_SCOPE_SETUP_FAILED:", type(exc).__name__, str(exc)[:160])
             await route.abort()
             return
+        if self._capture_gets and request.method == "GET":
+            try:
+                parts = urlsplit(request.url)
+                raw = parts.query.encode("ascii")
+                names = [name for _, name in self._urlencoded_parts(raw, "")[1] if name]
+                if raw and names and len(raw) <= 8192 and len(names) <= 64:
+                    self._remember_get_secrets(request.url, {})
+                    headers = {k.lower(): v for k, v in (await request.all_headers()).items()}
+                    if sum(len(k) + len(v) for k, v in headers.items()) > 32768:
+                        self._get_secrets_saturated = True
+                        raise ValueError("GET headers exceed capture limit")
+                    self._remember_get_secrets(request.url, headers)
+                    identity = (request.url, tuple(sorted(headers.items())))
+                    request_id = next((key for key, item in self._get_requests.items()
+                                       if item["identity"] == identity), None)
+                    if request_id is None:
+                        self._counter += 1
+                        request_id = f"GET-{self._request_prefix}-{self._counter:04d}"
+                    else:
+                        del self._get_requests[request_id]
+                    self._get_requests[request_id] = {"url": request.url, "fields": names,
+                        "headers": headers, "identity": identity, "step": self.step}
+                    while len(self._get_requests) > 32:
+                        del self._get_requests[next(iter(self._get_requests))]
+                elif raw:
+                    self._get_secrets_saturated = True
+            except Exception:
+                self._get_secrets_saturated = True
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             try:
                 headers = {k.lower(): v for k, v in (await request.all_headers()).items()}
@@ -132,11 +186,27 @@ class BrowserHTTP:
                 request_id = f"REQ-{self._request_prefix}-{self._counter:04d}"
                 self._requests[request_id] = {"id": request_id, "url": request.url, "method": request.method,
                     "headers": headers, "body": body, "step": self.step}
+                if self._capture_gets:
+                    self._remember_get_secrets(request.url, headers)
+                    self._remember_body_secrets(body or b"", headers.get("content-type", ""))
                 # shortcut: eight in-memory form requests; add persistence only if longer replay history is needed.
                 while len(self._requests) > 8:
                     del self._requests[next(iter(self._requests))]
             except Exception as exc:
                 print("HARNESS_REQUEST_CAPTURE_WARNING:", type(exc).__name__, str(exc)[:160])
+        self.page_request_count += 1
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and self.allowed_mutation_paths is not None:
+            try:
+                response = await route.fetch(max_redirects=0)
+                if 300 <= response.status < 400:
+                    self._record_block(request.url, request.method, "mutation_redirect_blocked")
+                    await route.fulfill(status=409, body="Mutation redirect blocked")
+                else:
+                    await route.fulfill(response=response)
+            except Exception:
+                self._record_block(request.url, request.method, "mutation_transport_error")
+                await route.abort()
+            return
         await route.continue_()
 
     async def guard_web_socket(self, route):
@@ -249,6 +319,99 @@ class BrowserHTTP:
                 if len(json.dumps(cards, ensure_ascii=False)) > 2800:
                     card["fields"] = None
         return cards
+
+    def captured_gets(self):
+        return [{"id": key, "url": self._public_url(item["url"]),
+                 "fields": sorted(set(item["fields"])),
+                 "ambiguous": sorted({name for name in item["fields"] if item["fields"].count(name) > 1}),
+                 "step": item["step"]}
+                for key, item in self._get_requests.items()]
+
+    def _remember_get_secrets(self, url, headers):
+        query = urlsplit(url).query
+        values = {value for _, value in parse_qsl(query, keep_blank_values=True) if value}
+        values.update(part.partition("=")[2] for part in query.split("&") if "=" in part)
+        for name, value in headers.items():
+            if name not in {"host", "user-agent", "accept", "accept-language", "accept-encoding",
+                            "connection", "cache-control", "referer"} and not name.startswith("sec-"):
+                values.add(value)
+                if name == "cookie":
+                    values.update(part.partition("=")[2].strip() for part in value.split(";") if "=" in part)
+                elif value.lower().startswith("bearer "):
+                    values.add(value[7:])
+        self._remember_values(values)
+
+    def _remember_body_secrets(self, body, content_type):
+        if not body:
+            return
+        if len(body) > 262144:
+            self._get_secrets_saturated = True
+            return
+        try:
+            if "application/x-www-form-urlencoded" in content_type.lower():
+                self._remember_get_secrets("https://redaction.invalid/?" + body.decode("ascii"), {})
+                return
+            if "json" in content_type.lower():
+                payload = json.loads(body)
+                values = set()
+                def collect(value, depth=0):
+                    if depth > 8:
+                        raise ValueError("nested body exceeds redaction limit")
+                    if isinstance(value, str):
+                        values.add(value)
+                    elif isinstance(value, dict):
+                        for child in value.values():
+                            collect(child, depth + 1)
+                    elif isinstance(value, list):
+                        for child in value:
+                            collect(child, depth + 1)
+                collect(payload)
+                self._remember_values(values)
+                return
+            self._get_secrets_saturated = True
+        except (UnicodeError, ValueError, RecursionError):
+            self._get_secrets_saturated = True
+
+    def _remember_values(self, values):
+        for value in values - self._get_secrets:
+            if not value:
+                continue
+            if len(self._get_secrets) >= 512 or self._get_secret_bytes + len(value) > 262144:
+                self._get_secrets_saturated = True
+                break
+            self._get_secrets.add(value)
+            self._get_secret_bytes += len(value)
+
+    def redact_get_secrets(self, text):
+        if self._get_secrets_saturated:
+            return "[redacted: capture limit]" if text else text
+        variants = {variant for secret in self._get_secrets if secret for variant in
+                    (secret, quote(secret, safe=""), quote_plus(secret), escape(secret)) if variant}
+        if not variants:
+            return text
+        pattern = "|".join(re.escape(value) for value in sorted(variants, key=len, reverse=True))
+        return re.sub(pattern, "[redacted]", text)
+
+    async def replay_get(self, request_id, field, value):
+        item = self._get_requests.get(request_id)
+        if item is None:
+            raise ValueError("unknown or expired GET request")
+        if not isinstance(field, str) or not isinstance(value, str) or len(value) > 500:
+            raise ValueError("invalid GET field or value")
+        url = urlsplit(item["url"])
+        self._check(item["url"], "GET")
+        parts, names, _ = self._urlencoded_parts(url.query.encode("ascii"), "")
+        indices = [index for index, name in names if name == field]
+        if len(indices) != 1:
+            raise ValueError("GET field is missing or ambiguous")
+        index = indices[0]
+        parts[index] = parts[index].partition(b"=")[0] + b"=" + quote_plus(value).encode("ascii")
+        replay_url = urlunsplit((url.scheme, url.netloc, url.path, b"&".join(parts).decode("ascii"), ""))
+        headers = {k: v for k, v in item["headers"].items()
+                   if k not in {"cookie", "host", "content-length", "connection", "transfer-encoding", "accept-encoding"}
+                   and not k.startswith(":")}
+        response = await self.context.request.fetch(replay_url, method="GET", headers=headers, max_redirects=0)
+        return await self._observation(response)
 
     async def replay_request(self, request_id, fields=None):
         if not isinstance(request_id, str) or request_id not in self._requests:

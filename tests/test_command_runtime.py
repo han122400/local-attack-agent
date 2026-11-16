@@ -3,6 +3,8 @@ import unittest
 import sys
 import time
 import os
+import shlex
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
@@ -33,7 +35,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(written.exit_code, 0)
         read = self.runtime.run(RUN_ID, {"action": "read_file", "path": "work/note.txt"}, call_id="CALL-2")
         self.assertEqual(read.stdout, "hello")
-        command = self.runtime.run(RUN_ID, {"action": "run_command", "command": "cd"}, call_id="CALL-3")
+        command = self.runtime.run(RUN_ID, {"action": "run_command", "command": "cd" if os.name == "nt" else "pwd"}, call_id="CALL-3")
         self.assertEqual(command.exit_code, 0)
         self.assertIn(str(self.runtime.runtime_dir), command.stdout.strip())
         events = self.log.read_events()
@@ -79,7 +81,9 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual("".join(logged), "".join(chunks))
 
     def test_timeout_stops_command_and_children(self):
-        result = self.runtime.run(RUN_ID, {"action": "run_command", "command": "ping -n 10 127.0.0.1 > NUL"}, timeout=0.2)
+        arguments = [sys.executable, "-c", "import time; time.sleep(10)"]
+        sleeper = subprocess.list2cmdline(arguments) if os.name == "nt" else shlex.join(arguments)
+        result = self.runtime.run(RUN_ID, {"action": "run_command", "command": sleeper}, timeout=0.2)
         self.assertTrue(result.timed_out)
         self.assertEqual(result.cause_code, "execution_timeout")
         self.assertFalse(self.runtime.inspect(RUN_ID)["managed_processes"])
@@ -103,8 +107,9 @@ class RuntimeTests(unittest.TestCase):
                   "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
                   "pathlib.Path('work/child.pid').write_text(str(p.pid))\n")
         self.runtime.run(RUN_ID, {"action": "write_file", "path": "work/spawn.py", "content": source})
+        arguments = [sys.executable, "work/spawn.py"]
         result = self.runtime.run(RUN_ID, {"action": "run_command",
-                                           "command": f'{sys.executable} work\\spawn.py'})
+                                           "command": subprocess.list2cmdline(arguments) if os.name == "nt" else shlex.join(arguments)})
         self.assertEqual(result.exit_code, 0, result.stderr)
         child_pid = int((self.runtime.runtime_dir / "work" / "child.pid").read_text())
         self.assertTrue(psutil.pid_exists(child_pid))

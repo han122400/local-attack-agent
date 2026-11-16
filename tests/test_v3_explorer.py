@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from explorer import ExplorerV3
+from explorer import ExplorerV3, validate_j25_test_scope
 from session_log import SessionStore
 
 
@@ -16,6 +16,60 @@ def model_reply(action, **fields):
 
 
 class ExplorerLoopTests(unittest.TestCase):
+    def test_j25_test_scope_requires_explicit_recoverable_identity_and_exact_paths(self):
+        scope = {"isolation": "recoverable", "allowed_methods": ["POST"], "allowed_paths": ["/login"],
+                 "identities": [{"name": "test-user", "cookies": [{"name": "sid", "value": "private",
+                                                                  "url": "https://fixture.invalid/"}]}]}
+        result = validate_j25_test_scope(scope, "https://fixture.invalid/", "J2.5")
+        self.assertEqual(result["identities"][0]["name"], "test-user")
+        for invalid in (dict(scope, isolation=""), dict(scope, allowed_paths=["/login/../delete"]),
+                        dict(scope, allowed_methods=["DELETE", "GET"]),
+                        dict(scope, identities=[{"name": "test-user", "cookies": [{"name": "sid",
+                            "value": "private", "url": "https://other.invalid/"}]}])):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                validate_j25_test_scope(invalid, "https://fixture.invalid/", "J2.5")
+        with self.assertRaises(ValueError):
+            validate_j25_test_scope(scope, "https://fixture.invalid/", "J2")
+        for malformed in (dict(scope, isolation=[]), dict(scope, allowed_methods=[{}]),
+                          dict(scope, identities=[{"name": "test-user", "cookies": [
+                              {"name": "sid", "value": "private", "url": "https://[invalid"}]}])):
+            with self.subTest(malformed=malformed), self.assertRaises(ValueError):
+                validate_j25_test_scope(malformed, "https://fixture.invalid/", "J2.5")
+
+    def test_j25_scope_credentials_remain_out_of_run_metadata_and_model_input(self):
+        with tempfile.TemporaryDirectory() as temp:
+            prompts = []
+            def transport(payload):
+                prompts.append(payload)
+                yield {"message": {"content": json.dumps({"action": "finish", "reason": "no browser"})},
+                       "done": True}
+            explorer = ExplorerV3(Path(temp), transport=transport, browser_enabled=False)
+            scope = {"isolation": "recoverable", "allowed_methods": ["POST"], "allowed_paths": ["/login"],
+                     "identities": [{"name": "alice", "cookies": [{"name": "sid", "value": "cookie-private",
+                                                                 "url": "https://fixture.invalid/"}]}]}
+            run_id = explorer.start("https://fixture.invalid/", "mock:model", goal="inspect",
+                                    prompt_version="J2.5", j25_test_scope=scope,
+                                    budgets={"seconds": 30, "model_calls": 1, "tool_calls": 2,
+                                             "command_seconds": 5, "finalize_seconds": 10})
+            explorer.worker.join(10)
+            self.assertFalse(explorer.worker.is_alive())
+            metadata = SessionStore(Path(temp)).read(run_id)
+            self.assertEqual(metadata["j25_identity_names"], ["public", "alice"])
+            self.assertNotIn("cookie-private", json.dumps(metadata))
+            self.assertNotIn("cookie-private", json.dumps(prompts))
+
+    def test_private_proof_canary_is_validated_and_not_saved_in_metadata(self):
+        scope = {"isolation": "recoverable", "allowed_methods": ["POST"], "allowed_paths": ["/login"],
+                 "identities": [{"name": "owner", "cookies": []}],
+                 "proof_canaries": [{"label": "note", "value": "CANARY-PRIVATE-12345",
+                                     "protected": True, "authorized_identities": ["owner"]}]}
+        self.assertEqual(validate_j25_test_scope(scope, "https://fixture.invalid/", "J2.5"), scope)
+        for altered in (dict(scope, proof_canaries=[{**scope["proof_canaries"][0], "value": "x"}]),
+                        dict(scope, proof_canaries=[{**scope["proof_canaries"][0],
+                            "authorized_identities": ["outsider"]}])):
+            with self.subTest(altered=altered), self.assertRaises(ValueError):
+                validate_j25_test_scope(altered, "https://fixture.invalid/", "J2.5")
+
     def setUp(self):
         def command(runtime, text, exec_id, timeout):
             output = ((runtime.runtime_dir / 'work/note.txt').read_text() if text == 'cat work/note.txt'

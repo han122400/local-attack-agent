@@ -1,0 +1,846 @@
+{
+  "run_id": "85d204cad51e44b5bb0f960e36559325",
+  "created_at": 1794648699.827669,
+  "phase": "finished",
+  "run_result": "incomplete",
+  "log_status": "finalized",
+  "cleanup_status": "succeeded",
+  "lab_reset_status": "not_applicable",
+  "owner_instance_id": "215cb53524974b17b5ce8275066480d9",
+  "controller_pid": 50485,
+  "runtime_path": "/Users/jihun/Downloads/정보보호응용/local-attack-agent/benchmarks/results/j25-600aa9f7108e4a48ba924124fef8ff01/trial-2/85d204cad51e44b5bb0f960e36559325/runtime",
+  "runtime_creation_intent": true,
+  "goal": "허가된 로컬 웹앱의 입력, 권한, 브라우저 처리와 정보 노출을 조사하고 비공개 정보 획득을 검증하라",
+  "target": "http://127.0.0.1:49541/",
+  "initial_lab_status": "not_applicable",
+  "model": "qwen3:4b-instruct",
+  "model_settings": {
+    "think": false,
+    "options": {
+      "temperature": 0,
+      "num_ctx": 8192,
+      "num_predict": 4096
+    }
+  },
+  "budgets": {
+    "seconds": 180,
+    "model_calls": 24,
+    "tool_calls": 36,
+    "command_seconds": 30,
+    "finalize_seconds": 120
+  },
+  "scenario_source": "manual",
+  "chain_mode": "none",
+  "prompt_version": "J2.5",
+  "j25_identity_names": [
+    "public",
+    "owner"
+  ],
+  "j25_mutation_allowed": true,
+  "started_at": 1794648699.82689,
+  "finished_at": 1794648879.566514,
+  "finish_reason": "The goal of investigating authorized local web app inputs, permissions, browser handling, and private information exposure was not fully addressed due to the absence of observable or verified private information disclosure across identities or inputs. While baseline behavior and a declared GET endpoint were observed, no actual information exposure or unauthorized access was confirmed. The input field 'q' on case/05 showed no response difference between normal and test values, and no browser input handling or identity-specific information exposure was verified. The current identity remains 'public', and no transition to 'owner' was performed or observed. All inputs with 'supported' status were checked, but no disclosure or injection was detected. The test scope was limited to declared endpoints, and visible inputs with expired or non-interactable states were not actionable. No private test markers were observed or independently confirmed. Therefore, the assessment remains uncertain without further evidence or a successful identity switch and verification.",
+  "managed_processes": [],
+  "last_exec_id": "EXEC-0011",
+  "j25_state": {
+    "references": {
+      "pages": [
+        {
+          "id": "Pa9e9676c21b5-1",
+          "url": "http://127.0.0.1:49541/",
+          "source": "target"
+        },
+        {
+          "id": "Pa9e9676c21b5-2",
+          "url": "http://127.0.0.1:49541/case/00",
+          "source": "Pa9e9676c21b5-1"
+        },
+        {
+          "id": "Pa9e9676c21b5-3",
+          "url": "http://127.0.0.1:49541/case/01",
+          "source": "Pa9e9676c21b5-1"
+        },
+        {
+          "id": "Pa9e9676c21b5-4",
+          "url": "http://127.0.0.1:49541/case/02",
+          "source": "Pa9e9676c21b5-1"
+        },
+        {
+          "id": "Pa9e9676c21b5-5",
+          "url": "http://127.0.0.1:49541/case/03",
+          "source": "Pa9e9676c21b5-1"
+        },
+        {
+          "id": "Pa9e9676c21b5-6",
+          "url": "http://127.0.0.1:49541/case/04",
+          "source": "Pa9e9676c21b5-1"
+        },
+        {
+          "id": "Pa9e9676c21b5-7",
+          "url": "http://127.0.0.1:49541/case/05",
+          "source": "Pa9e9676c21b5-1"
+        },
+        {
+          "id": "Pa9e9676c21b5-8",
+          "url": "http://127.0.0.1:49541/case/06",
+          "source": "Pa9e9676c21b5-1"
+        },
+        {
+          "id": "Pa9e9676c21b5-9",
+          "url": "http://127.0.0.1:49541/case/07",
+          "source": "Pa9e9676c21b5-1"
+        },
+        {
+          "id": "Pa9e9676c21b5-10",
+          "url": "http://127.0.0.1:49541/case/08",
+          "source": "Pa9e9676c21b5-1"
+        },
+        {
+          "id": "Pa9e9676c21b5-11",
+          "url": "http://127.0.0.1:49541/case/09",
+          "source": "Pa9e9676c21b5-1"
+        },
+        {
+          "id": "Pa9e9676c21b5-12",
+          "url": "http://127.0.0.1:49541/safe/0",
+          "source": "Pa9e9676c21b5-1"
+        },
+        {
+          "id": "Pa9e9676c21b5-13",
+          "url": "http://127.0.0.1:49541/safe/1",
+          "source": "Pa9e9676c21b5-1"
+        },
+        {
+          "id": "Pa9e9676c21b5-14",
+          "url": "http://127.0.0.1:49541/safe/2",
+          "source": "Pa9e9676c21b5-1"
+        },
+        {
+          "id": "Pa9e9676c21b5-15",
+          "url": "http://127.0.0.1:49541/safe/3",
+          "source": "Pa9e9676c21b5-1"
+        }
+      ],
+      "assets": [],
+      "inputs": [
+        {
+          "id": "Ia9e9676c21b5-1",
+          "url": "http://127.0.0.1:49541/case/09",
+          "field": "q",
+          "method": "GET",
+          "supported": true,
+          "limitation": "",
+          "basis": "declared",
+          "source": "Pa9e9676c21b5-11"
+        },
+        {
+          "id": "Ia9e9676c21b5-2",
+          "url": "http://127.0.0.1:49541/case/09",
+          "field": "q",
+          "index": 0,
+          "name": "q",
+          "element_id": "",
+          "type": "",
+          "method": "unknown",
+          "supported": false,
+          "interactable": false,
+          "limitation": "input_expired",
+          "basis": "visible",
+          "source": "Pa9e9676c21b5-11"
+        },
+        {
+          "id": "Ia9e9676c21b5-3",
+          "url": "http://127.0.0.1:49541/case/07",
+          "field": "q",
+          "method": "GET",
+          "supported": true,
+          "limitation": "",
+          "basis": "declared",
+          "source": "Pa9e9676c21b5-9"
+        },
+        {
+          "id": "Ia9e9676c21b5-4",
+          "url": "http://127.0.0.1:49541/case/07",
+          "field": "q",
+          "index": 0,
+          "name": "q",
+          "element_id": "",
+          "type": "",
+          "method": "unknown",
+          "supported": false,
+          "interactable": false,
+          "limitation": "input_expired",
+          "basis": "visible",
+          "source": "Pa9e9676c21b5-9"
+        },
+        {
+          "id": "Ia9e9676c21b5-5",
+          "url": "http://127.0.0.1:49541/case/06",
+          "field": "q",
+          "index": 0,
+          "name": "",
+          "element_id": "q",
+          "type": "",
+          "method": "unknown",
+          "supported": false,
+          "interactable": false,
+          "limitation": "input_expired",
+          "basis": "visible",
+          "source": "Pa9e9676c21b5-8"
+        },
+        {
+          "id": "Ia9e9676c21b5-6",
+          "url": "http://127.0.0.1:49541/case/05",
+          "field": "q",
+          "method": "GET",
+          "supported": true,
+          "limitation": "",
+          "basis": "declared",
+          "source": "Pa9e9676c21b5-7"
+        },
+        {
+          "id": "Ia9e9676c21b5-7",
+          "url": "http://127.0.0.1:49541/case/05",
+          "field": "q",
+          "index": 0,
+          "name": "q",
+          "element_id": "",
+          "type": "",
+          "method": "unknown",
+          "supported": false,
+          "interactable": true,
+          "limitation": "unresolved_visible_input",
+          "basis": "visible",
+          "source": "Pa9e9676c21b5-7"
+        }
+      ]
+    },
+    "steps": [
+      {
+        "step": 1,
+        "exec_id": "EXEC-0001",
+        "call_id": "",
+        "action": "start",
+        "ref": "Pa9e9676c21b5-1",
+        "status": "ok",
+        "identity": "public",
+        "reason": "",
+        "hypothesis": "",
+        "verification_kind": "",
+        "verification": null,
+        "owner_identity": "",
+        "access_samples": null,
+        "comparison": null,
+        "error": "",
+        "request_count": 1,
+        "truncated": false,
+        "visible_inputs": [],
+        "response": null,
+        "navigation": {
+          "status": 200,
+          "blocked_requests": 0
+        },
+        "interaction": null,
+        "reference": {
+          "id": "Pa9e9676c21b5-1",
+          "url": "http://127.0.0.1:49541/",
+          "source": "target"
+        },
+        "blocked_requests": []
+      },
+      {
+        "step": 2,
+        "exec_id": "EXEC-0002",
+        "call_id": "CALL-0001",
+        "action": "observe",
+        "ref": "Pa9e9676c21b5-15",
+        "status": "ok",
+        "identity": "public",
+        "reason": "Initial observation of the root page to establish baseline behavior",
+        "hypothesis": "",
+        "verification_kind": "",
+        "verification": null,
+        "owner_identity": "",
+        "access_samples": null,
+        "comparison": null,
+        "error": "",
+        "request_count": 1,
+        "truncated": false,
+        "visible_inputs": [],
+        "response": null,
+        "navigation": {
+          "status": 200,
+          "blocked_requests": 0
+        },
+        "interaction": null,
+        "reference": {
+          "id": "Pa9e9676c21b5-15",
+          "url": "http://127.0.0.1:49541/safe/3",
+          "source": "Pa9e9676c21b5-1"
+        },
+        "blocked_requests": []
+      },
+      {
+        "step": 3,
+        "exec_id": "EXEC-0003",
+        "call_id": "CALL-0002",
+        "action": "observe",
+        "ref": "Pa9e9676c21b5-14",
+        "status": "ok",
+        "identity": "public",
+        "reason": "Establish baseline behavior of the root page to understand initial state and structure before proceeding with targeted observations.",
+        "hypothesis": "",
+        "verification_kind": "",
+        "verification": null,
+        "owner_identity": "",
+        "access_samples": null,
+        "comparison": null,
+        "error": "",
+        "request_count": 1,
+        "truncated": false,
+        "visible_inputs": [],
+        "response": null,
+        "navigation": {
+          "status": 200,
+          "blocked_requests": 0
+        },
+        "interaction": null,
+        "reference": {
+          "id": "Pa9e9676c21b5-14",
+          "url": "http://127.0.0.1:49541/safe/2",
+          "source": "Pa9e9676c21b5-1"
+        },
+        "blocked_requests": []
+      },
+      {
+        "step": 4,
+        "exec_id": "EXEC-0004",
+        "call_id": "CALL-0003",
+        "action": "observe",
+        "ref": "Pa9e9676c21b5-13",
+        "status": "ok",
+        "identity": "public",
+        "reason": "Establish baseline behavior of the root page to understand initial state and structure before proceeding with targeted observations.",
+        "hypothesis": "",
+        "verification_kind": "",
+        "verification": null,
+        "owner_identity": "",
+        "access_samples": null,
+        "comparison": null,
+        "error": "",
+        "request_count": 1,
+        "truncated": false,
+        "visible_inputs": [],
+        "response": null,
+        "navigation": {
+          "status": 200,
+          "blocked_requests": 0
+        },
+        "interaction": null,
+        "reference": {
+          "id": "Pa9e9676c21b5-13",
+          "url": "http://127.0.0.1:49541/safe/1",
+          "source": "Pa9e9676c21b5-1"
+        },
+        "blocked_requests": []
+      },
+      {
+        "step": 5,
+        "exec_id": "EXEC-0005",
+        "call_id": "CALL-0004",
+        "action": "observe",
+        "ref": "Pa9e9676c21b5-12",
+        "status": "ok",
+        "identity": "public",
+        "reason": "Establish baseline behavior of the root page to understand initial state and structure before proceeding with targeted observations.",
+        "hypothesis": "",
+        "verification_kind": "",
+        "verification": null,
+        "owner_identity": "",
+        "access_samples": null,
+        "comparison": null,
+        "error": "",
+        "request_count": 1,
+        "truncated": false,
+        "visible_inputs": [],
+        "response": null,
+        "navigation": {
+          "status": 200,
+          "blocked_requests": 0
+        },
+        "interaction": null,
+        "reference": {
+          "id": "Pa9e9676c21b5-12",
+          "url": "http://127.0.0.1:49541/safe/0",
+          "source": "Pa9e9676c21b5-1"
+        },
+        "blocked_requests": []
+      },
+      {
+        "step": 6,
+        "exec_id": "EXEC-0006",
+        "call_id": "CALL-0005",
+        "action": "observe",
+        "ref": "Pa9e9676c21b5-11",
+        "status": "ok",
+        "identity": "public",
+        "reason": "Establish baseline behavior of the root page to understand initial state and structure before proceeding with targeted observations.",
+        "hypothesis": "",
+        "verification_kind": "",
+        "verification": null,
+        "owner_identity": "",
+        "access_samples": null,
+        "comparison": null,
+        "error": "",
+        "request_count": 1,
+        "truncated": false,
+        "visible_inputs": [
+          {
+            "tag": "input",
+            "type": "",
+            "name": "q",
+            "id": "",
+            "label": "q"
+          }
+        ],
+        "response": null,
+        "navigation": {
+          "status": 200,
+          "blocked_requests": 0
+        },
+        "interaction": null,
+        "reference": {
+          "id": "Pa9e9676c21b5-11",
+          "url": "http://127.0.0.1:49541/case/09",
+          "source": "Pa9e9676c21b5-1"
+        },
+        "blocked_requests": []
+      },
+      {
+        "step": 7,
+        "exec_id": "EXEC-0007",
+        "call_id": "CALL-0006",
+        "action": "observe",
+        "ref": "Pa9e9676c21b5-10",
+        "status": "ok",
+        "identity": "public",
+        "reason": "Establish baseline behavior of the root page to understand initial state and structure before proceeding with targeted observations.",
+        "hypothesis": "",
+        "verification_kind": "",
+        "verification": null,
+        "owner_identity": "",
+        "access_samples": null,
+        "comparison": null,
+        "error": "",
+        "request_count": 1,
+        "truncated": false,
+        "visible_inputs": [],
+        "response": null,
+        "navigation": {
+          "status": 200,
+          "blocked_requests": 0
+        },
+        "interaction": null,
+        "reference": {
+          "id": "Pa9e9676c21b5-10",
+          "url": "http://127.0.0.1:49541/case/08",
+          "source": "Pa9e9676c21b5-1"
+        },
+        "blocked_requests": []
+      },
+      {
+        "step": 8,
+        "exec_id": "EXEC-0008",
+        "call_id": "CALL-0007",
+        "action": "observe",
+        "ref": "Pa9e9676c21b5-9",
+        "status": "ok",
+        "identity": "public",
+        "reason": "Establish baseline behavior of the root page to understand initial state and structure before proceeding with targeted observations.",
+        "hypothesis": "",
+        "verification_kind": "",
+        "verification": null,
+        "owner_identity": "",
+        "access_samples": null,
+        "comparison": null,
+        "error": "",
+        "request_count": 1,
+        "truncated": false,
+        "visible_inputs": [
+          {
+            "tag": "input",
+            "type": "",
+            "name": "q",
+            "id": "",
+            "label": "q"
+          }
+        ],
+        "response": null,
+        "navigation": {
+          "status": 200,
+          "blocked_requests": 0
+        },
+        "interaction": null,
+        "reference": {
+          "id": "Pa9e9676c21b5-9",
+          "url": "http://127.0.0.1:49541/case/07",
+          "source": "Pa9e9676c21b5-1"
+        },
+        "blocked_requests": []
+      },
+      {
+        "step": 9,
+        "exec_id": "EXEC-0009",
+        "call_id": "CALL-0008",
+        "action": "observe",
+        "ref": "Pa9e9676c21b5-8",
+        "status": "ok",
+        "identity": "public",
+        "reason": "Establish baseline behavior of the root page to understand initial state and structure before proceeding with targeted observations.",
+        "hypothesis": "",
+        "verification_kind": "",
+        "verification": null,
+        "owner_identity": "",
+        "access_samples": null,
+        "comparison": null,
+        "error": "",
+        "request_count": 1,
+        "truncated": false,
+        "visible_inputs": [
+          {
+            "tag": "input",
+            "type": "",
+            "name": "",
+            "id": "q",
+            "label": ""
+          }
+        ],
+        "response": null,
+        "navigation": {
+          "status": 200,
+          "blocked_requests": 0
+        },
+        "interaction": null,
+        "reference": {
+          "id": "Pa9e9676c21b5-8",
+          "url": "http://127.0.0.1:49541/case/06",
+          "source": "Pa9e9676c21b5-1"
+        },
+        "blocked_requests": []
+      },
+      {
+        "step": 10,
+        "exec_id": "EXEC-0010",
+        "call_id": "CALL-0009",
+        "action": "observe",
+        "ref": "Pa9e9676c21b5-7",
+        "status": "ok",
+        "identity": "public",
+        "reason": "Establish baseline behavior of the root page to understand initial state and structure before proceeding with targeted observations.",
+        "hypothesis": "",
+        "verification_kind": "",
+        "verification": null,
+        "owner_identity": "",
+        "access_samples": null,
+        "comparison": null,
+        "error": "",
+        "request_count": 1,
+        "truncated": false,
+        "visible_inputs": [
+          {
+            "tag": "input",
+            "type": "",
+            "name": "q",
+            "id": "",
+            "label": "q"
+          }
+        ],
+        "response": null,
+        "navigation": {
+          "status": 200,
+          "blocked_requests": 0
+        },
+        "interaction": null,
+        "reference": {
+          "id": "Pa9e9676c21b5-7",
+          "url": "http://127.0.0.1:49541/case/05",
+          "source": "Pa9e9676c21b5-1"
+        },
+        "blocked_requests": []
+      },
+      {
+        "step": 11,
+        "exec_id": "EXEC-0011",
+        "call_id": "CALL-0010",
+        "action": "verify",
+        "ref": "Ia9e9676c21b5-6",
+        "status": "ok",
+        "identity": "public",
+        "reason": "Check if the input field 'q' on case/05, declared as supported via GET, exposes information when accessed with a normal value.",
+        "hypothesis": "The input field 'q' on case/05 is a declared GET endpoint that may allow parameter-based information disclosure when accessed with a test value.",
+        "verification_kind": "disclosure",
+        "verification": {
+          "kind": "disclosure",
+          "status": "attempted",
+          "information": [],
+          "reason": "no_information_proof"
+        },
+        "owner_identity": "",
+        "access_samples": null,
+        "comparison": {
+          "samples": [
+            {
+              "stage": "normal",
+              "status": 200,
+              "length": 129,
+              "body_sha256": "7d685b0d8078954a6dae215badd2aba6381accc6f93b3e68c48fa0b670440336",
+              "truncated": false,
+              "binary": false,
+              "canary_hits": []
+            },
+            {
+              "stage": "test",
+              "status": 200,
+              "length": 129,
+              "body_sha256": "7d685b0d8078954a6dae215badd2aba6381accc6f93b3e68c48fa0b670440336",
+              "truncated": false,
+              "binary": false,
+              "canary_hits": []
+            },
+            {
+              "stage": "recheck",
+              "status": 200,
+              "length": 129,
+              "body_sha256": "7d685b0d8078954a6dae215badd2aba6381accc6f93b3e68c48fa0b670440336",
+              "truncated": false,
+              "binary": false,
+              "canary_hits": []
+            }
+          ],
+          "baseline_stable": true,
+          "test_differs": false
+        },
+        "error": "",
+        "request_count": 3,
+        "truncated": false,
+        "visible_inputs": [],
+        "response": null,
+        "navigation": null,
+        "interaction": null,
+        "reference": {
+          "id": "Ia9e9676c21b5-6",
+          "url": "http://127.0.0.1:49541/case/05",
+          "field": "q",
+          "method": "GET",
+          "supported": true,
+          "limitation": "",
+          "basis": "declared",
+          "source": "Pa9e9676c21b5-7"
+        },
+        "blocked_requests": [],
+        "normal": "q=public",
+        "test": "q=owner"
+      }
+    ],
+    "expired": [],
+    "examined": [
+      "Pa9e9676c21b5-1",
+      "Pa9e9676c21b5-15",
+      "Pa9e9676c21b5-14",
+      "Pa9e9676c21b5-13",
+      "Pa9e9676c21b5-12",
+      "Pa9e9676c21b5-11",
+      "Pa9e9676c21b5-10",
+      "Pa9e9676c21b5-9",
+      "Pa9e9676c21b5-8",
+      "Pa9e9676c21b5-7",
+      "Ia9e9676c21b5-6"
+    ],
+    "pending": [
+      "Pa9e9676c21b5-6",
+      "Pa9e9676c21b5-5",
+      "Pa9e9676c21b5-4",
+      "Pa9e9676c21b5-3",
+      "Pa9e9676c21b5-2",
+      "Ia9e9676c21b5-3",
+      "Ia9e9676c21b5-1",
+      "Ia9e9676c21b5-7",
+      "Ia9e9676c21b5-5",
+      "Ia9e9676c21b5-4",
+      "Ia9e9676c21b5-2"
+    ],
+    "omitted": {
+      "pages": 0,
+      "assets": 0,
+      "inputs": 0
+    },
+    "request_count": 13,
+    "errors": 0,
+    "repeat_blocks": 0,
+    "goal_status": "unknown",
+    "goal_status_source": "not_assessed",
+    "identity": "public",
+    "evidence": {
+      "cases": [
+        {
+          "id": "fff223fde80da369",
+          "surface": "/case/05",
+          "field": "q",
+          "method": "GET",
+          "identity": "public",
+          "owner_identity": "",
+          "kind": "disclosure",
+          "status": "attempted",
+          "information": [],
+          "proofs": [],
+          "missing_checks": [
+            "no_information_proof"
+          ],
+          "exec_ids": [
+            "EXEC-0011"
+          ],
+          "step_numbers": [
+            11
+          ],
+          "reference_ids": [
+            "Ia9e9676c21b5-6"
+          ]
+        }
+      ],
+      "counts": {
+        "candidate": 0,
+        "failed": 0,
+        "partial": 0,
+        "attempted": 1,
+        "observed_information": 0,
+        "independently_verified": 0
+      },
+      "case_count": 1,
+      "denominator": null,
+      "rate": null
+    },
+    "coverage_status": "partial",
+    "metrics": {
+      "model_calls": 11,
+      "model_decision_seconds": 165.402,
+      "first_comparison_step": 11,
+      "repeat_blocks": 0
+    },
+    "model_finished": true
+  },
+  "findings": [
+    {
+      "step": 1,
+      "action": "start",
+      "plan": "start",
+      "status": "ok",
+      "evidence": true,
+      "observed": "start Pa9e9676c21b5-1 · ok",
+      "error": ""
+    },
+    {
+      "step": 2,
+      "action": "observe",
+      "plan": "observe",
+      "status": "ok",
+      "evidence": true,
+      "observed": "observe Pa9e9676c21b5-15 · ok",
+      "error": ""
+    },
+    {
+      "step": 3,
+      "action": "observe",
+      "plan": "observe",
+      "status": "ok",
+      "evidence": true,
+      "observed": "observe Pa9e9676c21b5-14 · ok",
+      "error": ""
+    },
+    {
+      "step": 4,
+      "action": "observe",
+      "plan": "observe",
+      "status": "ok",
+      "evidence": true,
+      "observed": "observe Pa9e9676c21b5-13 · ok",
+      "error": ""
+    },
+    {
+      "step": 5,
+      "action": "observe",
+      "plan": "observe",
+      "status": "ok",
+      "evidence": true,
+      "observed": "observe Pa9e9676c21b5-12 · ok",
+      "error": ""
+    },
+    {
+      "step": 6,
+      "action": "observe",
+      "plan": "observe",
+      "status": "ok",
+      "evidence": true,
+      "observed": "observe Pa9e9676c21b5-11 · ok",
+      "error": ""
+    },
+    {
+      "step": 7,
+      "action": "observe",
+      "plan": "observe",
+      "status": "ok",
+      "evidence": true,
+      "observed": "observe Pa9e9676c21b5-10 · ok",
+      "error": ""
+    },
+    {
+      "step": 8,
+      "action": "observe",
+      "plan": "observe",
+      "status": "ok",
+      "evidence": true,
+      "observed": "observe Pa9e9676c21b5-9 · ok",
+      "error": ""
+    },
+    {
+      "step": 9,
+      "action": "observe",
+      "plan": "observe",
+      "status": "ok",
+      "evidence": true,
+      "observed": "observe Pa9e9676c21b5-8 · ok",
+      "error": ""
+    },
+    {
+      "step": 10,
+      "action": "observe",
+      "plan": "observe",
+      "status": "ok",
+      "evidence": true,
+      "observed": "observe Pa9e9676c21b5-7 · ok",
+      "error": ""
+    },
+    {
+      "step": 11,
+      "action": "verify",
+      "plan": "verify",
+      "status": "ok",
+      "evidence": true,
+      "observed": "verify Ia9e9676c21b5-6 · ok",
+      "error": ""
+    }
+  ],
+  "tool_calls": 11,
+  "cost_usd": 0.0,
+  "model_calls": 11,
+  "model_decision_seconds": 165.402,
+  "first_comparison_step": 11,
+  "repeat_blocks": 0,
+  "goal_status": "unknown",
+  "goal_status_source": "not_assessed",
+  "coverage_status": "partial",
+  "plan": "finish",
+  "reason": "The goal of investigating authorized local web app inputs, permissions, browser handling, and private information exposure was not fully addressed due to the absence of observable or verified private information disclosure across identities or inputs. While baseline behavior and a declared GET endpoint were observed, no actual information exposure or unauthorized access was confirmed. The input field 'q' on case/05 showed no response difference between normal and test values, and no browser input handling or identity-specific information exposure was verified. The current identity remains 'public', and no transition to 'owner' was performed or observed. All inputs with 'supported' status were checked, but no disclosure or injection was detected. The test scope was limited to declared endpoints, and visible inputs with expired or non-interactable states were not actionable. No private test markers were observed or independently confirmed. Therefore, the assessment remains uncertain without further evidence or a successful identity switch and verification.",
+  "last_call_id": "CALL-0011",
+  "report": "결과: incomplete · J2.5 고정 실행 11개 · 단계 중 기록된 요청 시도 13회\n검증된 고유 사례 0건 · 정보 관찰 0건 · 시도 1건 · 부분·실패 0건\n전체 취약점 대비 비율: 측정 불가\n  - 사례 fff223fde80da369 · disclosure · GET /case/05 q · attempted · 실행 EXEC-0011\n    전제: 허가된 대상 · 시험 신원 public\n    시험 순서: 기준→시험→재확인\n    미확인 조건: no_information_proof\n    수정 방향: 비공개 데이터의 노출 경로와 응답 권한을 검사\n목표(모델 판단·미검증): unknown · 발견된 참조 범위: partial\n단계 사이의 백그라운드 요청과 일부 리다이렉트는 이 수에 포함되지 않을 수 있습니다.\n  - [EXEC-0001] start Pa9e9676c21b5-1: ok\n    시험 신원: public\n    대상: http://127.0.0.1:49541/  · 출처 target\n    페이지 접근: {\"status\": 200, \"blocked_requests\": 0}\n  - [EXEC-0002] observe Pa9e9676c21b5-15: ok\n    시험 신원: public\n    대상: http://127.0.0.1:49541/safe/3  · 출처 Pa9e9676c21b5-1\n    페이지 접근: {\"status\": 200, \"blocked_requests\": 0}\n  - [EXEC-0003] observe Pa9e9676c21b5-14: ok\n    시험 신원: public\n    대상: http://127.0.0.1:49541/safe/2  · 출처 Pa9e9676c21b5-1\n    페이지 접근: {\"status\": 200, \"blocked_requests\": 0}\n  - [EXEC-0004] observe Pa9e9676c21b5-13: ok\n    시험 신원: public\n    대상: http://127.0.0.1:49541/safe/1  · 출처 Pa9e9676c21b5-1\n    페이지 접근: {\"status\": 200, \"blocked_requests\": 0}\n  - [EXEC-0005] observe Pa9e9676c21b5-12: ok\n    시험 신원: public\n    대상: http://127.0.0.1:49541/safe/0  · 출처 Pa9e9676c21b5-1\n    페이지 접근: {\"status\": 200, \"blocked_requests\": 0}\n  - [EXEC-0006] observe Pa9e9676c21b5-11: ok\n    시험 신원: public\n    대상: http://127.0.0.1:49541/case/09  · 출처 Pa9e9676c21b5-1\n    페이지 접근: {\"status\": 200, \"blocked_requests\": 0}\n    보이는 입력: [{\"tag\": \"input\", \"type\": \"\", \"name\": \"q\", \"id\": \"\", \"label\": \"q\"}]\n  - [EXEC-0007] observe Pa9e9676c21b5-10: ok\n    시험 신원: public\n    대상: http://127.0.0.1:49541/case/08  · 출처 Pa9e9676c21b5-1\n    페이지 접근: {\"status\": 200, \"blocked_requests\": 0}\n  - [EXEC-0008] observe Pa9e9676c21b5-9: ok\n    시험 신원: public\n    대상: http://127.0.0.1:49541/case/07  · 출처 Pa9e9676c21b5-1\n    페이지 접근: {\"status\": 200, \"blocked_requests\": 0}\n    보이는 입력: [{\"tag\": \"input\", \"type\": \"\", \"name\": \"q\", \"id\": \"\", \"label\": \"q\"}]\n  - [EXEC-0009] observe Pa9e9676c21b5-8: ok\n    시험 신원: public\n    대상: http://127.0.0.1:49541/case/06  · 출처 Pa9e9676c21b5-1\n    페이지 접근: {\"status\": 200, \"blocked_requests\": 0}\n    보이는 입력: [{\"tag\": \"input\", \"type\": \"\", \"name\": \"\", \"id\": \"q\", \"label\": \"\"}]\n  - [EXEC-0010] observe Pa9e9676c21b5-7: ok\n    시험 신원: public\n    대상: http://127.0.0.1:49541/case/05  · 출처 Pa9e9676c21b5-1\n    페이지 접근: {\"status\": 200, \"blocked_requests\": 0}\n    보이는 입력: [{\"tag\": \"input\", \"type\": \"\", \"name\": \"q\", \"id\": \"\", \"label\": \"q\"}]\n  - [EXEC-0011] verify Ia9e9676c21b5-6: ok\n    시험 신원: public\n    대상: http://127.0.0.1:49541/case/05 q · 출처 Pa9e9676c21b5-7\n    모델 가설(미검증): The input field 'q' on case/05 is a declared GET endpoint that may allow parameter-based information disclosure when accessed with a test value.\n    코드 검증: {\"kind\": \"disclosure\", \"status\": \"attempted\", \"information\": [], \"reason\": \"no_information_proof\"}\n    비교 관찰(미검증): {\"samples\": [{\"stage\": \"normal\", \"status\": 200, \"length\": 129, \"body_sha256\": \"7d685b0d8078954a6dae215badd2aba6381accc6f93b3e68c48fa0b670440336\", \"truncated\": false, \"binary\": false, \"canary_hits\": []}, {\"stage\": \"test\", \"status\": 200, \"length\": 129, \"body_sha256\": \"7d685b0d8078954a6dae215badd2aba6381accc6f93b3e68c48fa0b670440336\", \"truncated\": false, \"binary\": false, \"canary_hits\": []}, {\"stage\": \"recheck\", \"status\": 200, \"length\": 129, \"body_sha256\": \"7d685b0d8078954a6dae215badd2aba6381accc6f93b3e68c48fa0b670440336\", \"truncated\": false, \"binary\": false, \"canary_hits\": []}], \"baseline_stable\": true, \"test_differs\": false}\n미완료 참조: 총 11건\n미완료: Pa9e9676c21b5-6 http://127.0.0.1:49541/case/04  \n미완료: Pa9e9676c21b5-5 http://127.0.0.1:49541/case/03  \n미완료: Pa9e9676c21b5-4 http://127.0.0.1:49541/case/02  \n미완료: Pa9e9676c21b5-3 http://127.0.0.1:49541/case/01  \n미완료: Pa9e9676c21b5-2 http://127.0.0.1:49541/case/00  \n미완료: Ia9e9676c21b5-3 http://127.0.0.1:49541/case/07 q \n미완료: Ia9e9676c21b5-1 http://127.0.0.1:49541/case/09 q \n미완료: Ia9e9676c21b5-7 http://127.0.0.1:49541/case/05 q unresolved_visible_input\n미완료: Ia9e9676c21b5-5 http://127.0.0.1:49541/case/06 q input_expired\n미완료: Ia9e9676c21b5-4 http://127.0.0.1:49541/case/07 q input_expired\n미완료: Ia9e9676c21b5-2 http://127.0.0.1:49541/case/09 q input_expired\n모델 종료 설명(미검증): The goal of investigating authorized local web app inputs, permissions, browser handling, and private information exposure was not fully addressed due to the absence of observable or verified private information disclosure across identities or inputs. While baseline behavior and a declared GET endpoint were observed, no actual information exposure or unauthorized access was confirmed. The input field 'q' on case/05 showed no response difference between normal and test values, and no browser input handling or identity-specific information exposure was verified. The current identity remains 'public', and no transition to 'owner' was performed or observed. All inputs with 'supported' status were checked, but no disclosure or injection was detected. The test scope was limited to declared endpoints, and visible inputs with expired or non-interactable states were not actionable. No private test markers were observed or independently confirmed. Therefore, the assessment remains uncertain without further evidence or a successful identity switch and verification.\n모델 설명과 일반 응답 차이는 취약점이나 안전성의 독립 확인이 아닙니다.",
+  "cleanup_error": ""
+}

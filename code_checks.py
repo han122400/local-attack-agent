@@ -33,6 +33,9 @@ def check_generated_code(code: str) -> list[str]:
         tree = ast.parse(code)
         compile(tree, "<generated>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
     except SyntaxError as exc:
+        offset = exc.offset or 0
+        if (exc.text or "")[max(0, offset - 2):offset] == "\\n":
+            return ["Syntax error: literal backslash-n between statements. JSON must decode to real newlines (escape once, not twice), or use a valid single-line top-level await command."]
         return [f"Syntax error: {exc.msg} (line {exc.lineno})."]
 
     parents: dict[ast.AST, ast.AST] = {}
@@ -63,13 +66,65 @@ def check_generated_code(code: str) -> list[str]:
                        for node in ast.walk(tree))
     dynamic_namespace = any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                             and node.func.id in {"exec", "eval", "globals", "locals"} for node in ast.walk(tree))
-    shadowed = set(writes)
-    shadowed.update(node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
+    definitions = {node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+    shadowed = set(writes) | definitions
+    origins = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                origins.setdefault(alias.asname or alias.name.split(".")[0], set()).add(("module", alias.name))
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                origins.setdefault(alias.asname or alias.name, set()).add((node.module if node.level == 0 else None, alias.name))
+    asyncio_modules = ({"asyncio"} if "asyncio" not in origins else set()) - shadowed
+    asyncio_functions = {}
+    for name, sources in origins.items():
+        if name in shadowed or len(sources) != 1:
+            continue
+        source, member = next(iter(sources))
+        if (source, member) == ("module", "asyncio"):
+            asyncio_modules.add(name)
+        elif source == "asyncio":
+            asyncio_functions[name] = member
+
+    def asyncio_call(node, methods):
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        return (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
+                and func.value.id in asyncio_modules and func.attr in methods
+                or isinstance(func, ast.Name) and asyncio_functions.get(func.id) in methods)
+
+    def lexical_scope(node):
+        scope = parents.get(node)
+        while scope is not None:
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                return scope
+            scope = parents.get(scope)
+        return tree
+
+    def known_loop(node, seen=()):
+        if asyncio_call(node, {"get_event_loop", "get_running_loop", "new_event_loop"}):
+            return True
+        return (isinstance(node, ast.Name) and node.id not in seen and writes[node.id] == 1
+                and node.id not in origins and node.id not in definitions and node.id in bindings
+                and lexical_scope(node) is lexical_scope(bindings[node.id])
+                and known_loop(bindings[node.id], (*seen, node.id)))
+
+    def in_async_runtime(node):
+        scope = parents.get(node)
+        while scope is not None:
+            if isinstance(scope, (ast.FunctionDef, ast.Lambda)):
+                return False  # A synchronous worker may execute on another thread.
+            if isinstance(scope, ast.AsyncFunctionDef):
+                return True
+            scope = parents.get(scope)
+        return True
     for node in ast.walk(tree):
         if not isinstance(node, ast.alias):
             continue
         parent = parents.get(node)
-        if (isinstance(parent, ast.ImportFrom) and parent.module == "tools" and parent.level == 0
+        if (isinstance(parent, ast.ImportFrom) and parent.module in {"tools", "browser_api"} and parent.level == 0
                 and node.asname is None and node.name in _HELPER_FUNCS | _SYNC_HELPERS):
             continue
         shadowed.add(node.asname or node.name.split(".")[0])
@@ -105,11 +160,10 @@ def check_generated_code(code: str) -> list[str]:
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name) and node.func.value.id in pages and node.func.attr == "get"):
             problems.append("goto_and_render returns a Page, not a dictionary; use page.url or awaited Page methods.")
-        # asyncio.run(...) inside the already-running loop
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "run" and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "asyncio"):
-            problems.append("Do not call asyncio.run(); the event loop is already running — use top-level await.")
+        if (isinstance(node, ast.Call) and in_async_runtime(node)
+                and (asyncio_call(node, {"run"}) or isinstance(node.func, ast.Attribute)
+                     and node.func.attr in {"run_until_complete", "run_forever"} and known_loop(node.func.value))):
+            problems.append(f"Do not call {ast.unparse(node.func)}(); the event loop is already running. Use top-level await or await main(page, context, browser), never main(None, None, None).")
         # importing playwright objects that are already provided
         if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("playwright"):
             problems.append("Do not import from playwright; page, context and browser are already provided.")

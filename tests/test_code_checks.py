@@ -4,6 +4,46 @@ from code_checks import check_generated_code
 
 
 class CodeCheckTests(unittest.TestCase):
+    def test_double_escaped_statement_newlines_get_specific_feedback_without_rewriting_strings(self):
+        self.assertTrue(any("literal backslash-n" in problem for problem in check_generated_code("import asyncio\\nprint('fixture')")))
+        self.assertEqual(check_generated_code("print('literal \\n stays inside a string')"), [])
+        self.assertEqual(check_generated_code("r = await http_get('x'); print(r['status'])"), [])
+
+    def test_nested_event_loop_drivers_get_runtime_specific_repair_feedback(self):
+        sources = (
+            "asyncio.get_event_loop().run_until_complete(task())",
+            "import asyncio as aio\nloop = aio.get_running_loop()\nloop.run_until_complete(task())",
+            "from asyncio import get_event_loop as current_loop\nloop = current_loop()\nloop.run_forever()",
+            "from asyncio import run as run_task\nrun_task(task())",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertTrue(any("already running" in problem and "await" in problem
+                                    for problem in check_generated_code(source)))
+
+    def test_repeated_real_imports_do_not_hide_invalid_loop_drivers(self):
+        for source in ("import asyncio\nimport asyncio\nasyncio.run(task())",
+                       "import asyncio\nasync def main(page, context, browser):\n    import asyncio\n    asyncio.get_event_loop().run_until_complete(task())"):
+            with self.subTest(source=source):
+                self.assertTrue(any("already running" in problem for problem in check_generated_code(source)))
+
+    def test_unrelated_scope_assignments_do_not_identify_custom_objects_as_asyncio_loops(self):
+        for source in ("def worker():\n    loop = asyncio.new_event_loop()\nfrom custom import loop\nloop.run_forever()",
+                       "loop = asyncio.get_running_loop()\nasync def probe():\n    from custom import loop\n    loop.run_forever()",
+                       "def worker():\n    loop = asyncio.new_event_loop()\nloop.run_forever()"):
+            with self.subTest(source=source):
+                self.assertEqual(check_generated_code(source), [])
+
+    def test_custom_loop_named_objects_and_thread_workers_remain_allowed(self):
+        for source in ("loop = custom\nloop.run_until_complete(task())",
+                       "from custom import asyncio\nasyncio.get_event_loop().run_until_complete(task())",
+                       "from asyncio import get_event_loop\nfrom custom import get_event_loop\nget_event_loop().run_until_complete(task())",
+                       "def worker():\n    loop = asyncio.new_event_loop()\n    loop.run_until_complete(task())\nawait asyncio.to_thread(worker)",
+                       "await asyncio.to_thread(lambda: asyncio.run(task()))",
+                       "async def main(page, context, browser):\n    print(await page.title())\nawait main(page, context, browser)"):
+            with self.subTest(source=source):
+                self.assertEqual(check_generated_code(source), [])
+
     def test_clean_code_passes(self):
         self.assertEqual(check_generated_code(
             "await page.goto('http://127.0.0.1:3000/')\nprint(await page.title())"), [])
@@ -93,10 +133,11 @@ class CodeCheckTests(unittest.TestCase):
                 self.assertEqual(check_generated_code(source), [])
 
     def test_runtime_imports_keep_known_types_and_custom_functions_remain_allowed(self):
-        self.assertTrue(any("synchronous" in p for p in check_generated_code(
-            "from tools import captured_requests\nawait captured_requests()")))
-        self.assertTrue(any("dictionary" in p for p in check_generated_code(
-            "from tools import http_get\nr = await http_get('x')\nprint(r.status)")))
+        for module in ("tools", "browser_api"):
+            self.assertTrue(any("synchronous" in p for p in check_generated_code(
+                f"from {module} import captured_requests\nawait captured_requests()")))
+            self.assertTrue(any("dictionary" in p for p in check_generated_code(
+                f"from {module} import http_get\nr = await http_get('x')\nprint(r.status)")))
         self.assertEqual(check_generated_code("def get_text(url):\n    return 'local'\nprint(get_text('x'))"), [])
 
 

@@ -12,7 +12,7 @@ def classify_event(kind: str, values: dict, *, legacy: bool = False) -> dict:
         category, component = "model", "ollama"
     elif kind in {"exec_started", "exec_finished", "file_changed"}:
         category, component = "execution", "runtime"
-    elif kind in {"exec_output", "observation", "http_response"}:
+    elif kind in {"exec_output", "observation", "http_response", "j25_progress", "j25_observation"}:
         category, component, outcome = "observation", "runtime", "observed"
     elif kind.startswith(("runtime_", "process_", "browser_")) or kind == "worker_output":
         category, component = "system", "browser_worker" if kind.startswith("browser_") or kind == "worker_output" else "runtime"
@@ -22,7 +22,7 @@ def classify_event(kind: str, values: dict, *, legacy: bool = False) -> dict:
         outcome = "received"
     elif kind == "exec_finished":
         source = values.get("failure_source")
-        component = {"run_python": "browser_worker", "run_command": "cmd",
+        component = {"run_python": "browser_worker", "j25": "browser_worker", "run_command": "cmd",
                      "read_file": "file_api", "write_file": "file_api"}.get(values.get("action"), "runtime")
         if values.get("cancelled"):
             outcome, cause, retryable, source = "cancelled", "execution_cancelled", False, "control"
