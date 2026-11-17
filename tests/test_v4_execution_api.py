@@ -66,7 +66,7 @@ class ExecutionApiTests(unittest.TestCase):
         self.assertEqual(state["report_status"], "complete")
 
     def test_mode_prompt_mismatch_and_bad_settings_reject_before_model_lookup(self):
-        for changes in ({"prompt_version": "v3"}, {"v4_settings": {"node_attempts": 0}}, {"experiment_mode": "v3", "prompt_version": "v4"}):
+        for changes in ({"prompt_version": "v3"}, {"v4_settings": {"node_attempts": 0}}, {"experiment_mode": "v3", "prompt_version": "v4"}, {"seed_settings": {"start_mode": "seeded", "seed_from": "../bad"}}):
             with patch("web.app.get_ollama_models", side_effect=AssertionError("No lookup for invalid config")):
                 response = self.client.post("/api/start", json={**self.body, **changes})
             self.assertEqual(response.status_code, 400, response.text)

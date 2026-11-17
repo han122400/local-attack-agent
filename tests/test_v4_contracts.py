@@ -85,6 +85,17 @@ class ResultContractTests(unittest.TestCase):
 
 
 class ExperimentConfigTests(unittest.TestCase):
+    def test_seed_settings_defaults_and_rejects_invalid_configuration(self):
+        from engine.experiment_config import validate_seed_settings
+        self.assertEqual(validate_seed_settings(None, "v4"), {"start_mode": "fresh", "seed_from": "latest", "carry": "structure", "reverify": "lazy"})
+        self.assertEqual(validate_seed_settings({"start_mode": "seeded", "seed_from": "latest", "reverify": "lazy"}, "v4")["reverify"], "lazy")
+        self.assertEqual(validate_seed_settings({"start_mode": "seeded", "reverify": "eager"}, "v4")["reverify"], "eager")
+        for value, mode in (({"start_mode": "seeded"}, "v3"), ({"start_mode": "bad"}, "v4"),
+                            ({"seed_from": "../outside"}, "v4"), ({"carry": "everything"}, "v4"),
+                            ({"reverify": "bad"}, "v4"), ({"unknown": 1}, "v4"), ([], "v4")):
+            with self.subTest(value=value, mode=mode), self.assertRaises(ValueError):
+                validate_seed_settings(value, mode)
+
     def test_v3_defaults_and_ignores_inactive_scorer_settings(self):
         config = validate_experiment_config({"scorer_provider": "bad", "scorer_settings": {"key": "secret"}})
         self.assertEqual(config, {"experiment_mode": "v3", "scorer_provider": None,
@@ -100,7 +111,7 @@ class ExperimentConfigTests(unittest.TestCase):
     def test_rejects_unknown_modes_missing_models_and_secret_or_generation_settings(self):
         baseline = {"experiment_mode": "v4", "scorer_provider": "openrouter",
                     "scorer_model": "typesafe/jev-1.14", "scorer_settings": {}}
-        for change in ({"experiment_mode": "v5"}, {"scorer_provider": "other"}, {"scorer_model": ""},
+        for change in ({"experiment_mode": "v6"}, {"scorer_provider": "other"}, {"scorer_model": ""},
                        {"scorer_model": "~typesafe/jev-latest"}, {"scorer_settings": {"api_key": "secret"}},
                        {"scorer_settings": {"temperature": 0.2}}, {"scorer_settings": {"batch_size": True}},
                        {"scorer_settings": {"timeout_seconds": float("nan")}},

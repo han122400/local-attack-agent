@@ -48,6 +48,12 @@ docker run -d --name juice-lab -p 127.0.0.1:3000:3000 bkimminich/juice-shop:v20.
 
 macOS/Linux에서는 `.venv/bin/python app.py`로 시작합니다.
 
+기본 실행은 Python 코드와 `prompts/system/*.txt` 변경을 감지해 서버를 자동 재시작합니다.
+`runs/`의 실험 로그·생성 코드, 로컬 의존성 및 테스트 파일은 감시에서 제외합니다.
+HTML·CSS·JavaScript 변경은 브라우저를 새로고침하면 반영됩니다.
+자동 재시작 중에는 진행 중인 실험이 중단될 수 있으므로, 긴 실험 중 코드를 편집하려면
+`python app.py --no-reload`로 실행해 자동 재시작을 끌 수 있습니다.
+
 테스트는 Windows에서 `.\.venv\Scripts\python.exe -m unittest discover -s tests -v`,
 macOS/Linux에서 `.venv/bin/python -m unittest discover -s tests -v`로 실행합니다.
 브라우저 테스트에는 위에서 설치한 Chromium이 필요하며, 모델 응답과 사이트는 모의 데이터로 검증합니다.

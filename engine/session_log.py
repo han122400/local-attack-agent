@@ -401,7 +401,7 @@ class SessionStore:
             except ValueError as exc:
                 raise LogFailure("Cannot restore v4 preparation settings") from exc
             keys = ("target", "goal", "model", "model_settings", "budgets", "prompt_version",
-                    "tree_schema_version", "result_schema_version", "v4_settings")
+                    "tree_schema_version", "result_schema_version", "v4_settings", "seed_settings", "seed_source")
             metadata.update({key: v4_configuration.get(key) for key in keys})
             stage = v4_configuration["v4_stage"]
             metadata.update(selected, v4_stage=stage, execution_ready=stage == "execution", scorer_validation="syntax_only",

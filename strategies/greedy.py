@@ -19,8 +19,62 @@ from engine.contracts import (ContractError, MAX_RESULT_BYTES, RESULT_SCHEMA, de
                           normalize_url, validate_result)
 from engine.policy import V4BudgetStop, execution_settings
 from engine.tree import (TreeStore, MAX_EVIDENCE_BYTES, _json_result, _read_bounded, _safe_path,
-                     latest_observation, investigation_gaps)
+                     latest_observation, investigation_gaps, seed_dependency_invalidation_seq)
 from engine.risk_rubric import observations, OBSERVATIONS_SCHEMA
+
+
+def seed_dispatchable(state, node_id, target):
+    """Whether a same-origin path has its seeded prerequisites verified."""
+    return seed_execution_path(state, node_id, target) is not None
+
+
+def seed_execution_path(state, node_id, target):
+    """Find a verified path; only explicitly verified alternate edges may bypass a primary dependency."""
+    def origin(url):
+        parts = urlsplit(normalize_url(url))
+        return parts.scheme, parts.hostname, parts.port or (443 if parts.scheme == "https" else 80)
+
+    allowed = origin(target)
+    def find(current_id, visited):
+        if current_id in visited or current_id not in state["nodes"]:
+            return None
+        node = state["nodes"][current_id]
+        if node.get("exploration_state") == "blocked" or origin(node["locator"]["url"]) != allowed:
+            return None
+        parent_id = node.get("parent_id")
+        if parent_id is None:
+            return [current_id] if current_id == state.get("root_id", current_id) else None
+        paths = node.get("discovery_paths", [])
+        primary = next((path for path in paths if path["parent_id"] == parent_id), None)
+        if primary is None:
+            return None
+        verified = node.get("seed_enabled_by_verified", {})
+        alternatives = [path for path in paths if path != primary and path["relation"] == "enabled_by"
+                        and path["parent_id"] in verified]
+        for path in [primary, *alternatives]:
+            if path["relation"] == "enabled_by" and node.get("seeded") and path["parent_id"] not in verified:
+                continue
+            prefix = find(path["parent_id"], visited | {current_id})
+            if prefix is not None:
+                return [*prefix, current_id]
+        return None
+    return find(node_id, set())
+
+
+def needs_seed_prerequisite_observation(state, node_id):
+    """A reused node must be investigated if a live child relies on it."""
+    node = state["nodes"][node_id]
+    if node.get("investigation_state") != "reused":
+        return False
+    # Alternate discovery paths do not appear in the primary child_ids list.
+    # They still need a current-run parent observation before operator review.
+    for child in state["nodes"].values():
+        if (child.get("seeded") and child.get("exploration_state") not in ("done", "blocked")
+                and any(path["parent_id"] == node_id and path["relation"] == "enabled_by"
+                        for path in child.get("discovery_paths", []))
+                and node_id not in child.get("seed_enabled_by_verified", [])):
+            return True
+    return False
 
 
 class BudgetGate:
@@ -28,6 +82,7 @@ class BudgetGate:
         self.log, self.stop_event, self.clock = log, stop_event, clock
         self.settings = execution_settings(log.metadata.get("v4_settings"))
         self.budgets = log.metadata["budgets"]
+        self.eager_call_limit = None
         self.deadline = clock() + self.budgets["seconds"]
         self.deep_reserve = min(self.settings["deep_reserve_calls"], self.budgets["model_calls"] // 4)
         log.update(v4_budget_policy={"version": "v4-budget-v3", "deep_reserve_calls": self.deep_reserve,
@@ -50,6 +105,8 @@ class BudgetGate:
 
     def admit(self, phase, estimate, timeout):
         value = self.check()
+        if self.eager_call_limit is not None and phase in ("execution", "scorer") and value["model_calls"] >= self.eager_call_limit:
+            raise V4BudgetStop("eager_limit")
         if phase in ("execution", "scorer") and value["model_calls"] >= self.budgets["model_calls"]:
             raise V4BudgetStop("call_budget")
         if value["accounted_cost_usd"] + estimate > self.settings["max_cost_usd"]:
@@ -71,6 +128,10 @@ class BudgetGate:
 
 
 class V4Runner:
+    # Give an operator a bounded opportunity to review evidence without
+    # exceeding the run's ordinary time budget.
+    seed_review_wait_seconds = 30.0
+
     def __init__(self, log, runtime, *, transport=None, scorer_adapter=None, stop_event=None, clock=time.monotonic):
         self.log, self.runtime = log, runtime
         self.stop_event = stop_event or threading.Event()
@@ -82,25 +143,39 @@ class V4Runner:
         prompt, digest = load_prompt("v4")
         self.harness = Harness(log, transport=transport, max_calls=log.metadata["budgets"]["model_calls"],
             max_decode_attempts=2, max_transport_retries=1, stop_requested=self.stop_event.is_set,
-            system_prompt=prompt, system_prompt_version="v4", system_prompt_sha256=digest, before_request=self.gate.before_model)
+            system_prompt=prompt, system_prompt_version="v4", system_prompt_sha256=digest, before_request=self._before_model)
         self.scorer = RiskScorer(self.tree, adapter=scorer_adapter, admit_request=self.gate.admit)
         self.history = []
         self._discovery_cache = {}
         from engine.planning import context_char_budget
         self.context_budget = context_char_budget(log.metadata["model_settings"]["options"].get("num_ctx", 8192), prompt)
 
+    def _before_model(self, call_id, payload):
+        self.gate.before_model(call_id, payload)
+        # This budget is the application's character-based approximation for
+        # non-system messages, not the model's actual token or RAM usage.
+        chars = sum(len(message.get("content", "")) for message in payload["messages"][1:])
+        self.log.update(context_chars=chars, context_budget=self.context_budget)
+
     def _context(self, node_id, *, unproductive=0, node_tools=0):
         state = self.tree.refresh()
         node = state["nodes"][node_id]
         def public(item):
             return {key: item[key] for key in ("id", "kind", "locator", "hypothesis", "observations")}
-        path, current = [], node
-        while current["parent_id"]:
-            current = state["nodes"][current["parent_id"]]
-            path.insert(0, public(current))
+        route = seed_execution_path(state, node_id, self.log.metadata["target"])
+        if route is None:
+            raise ContractError("Node has no eligible scope and dependency path")
+        path = [public(state["nodes"][key]) for key in route[:-1]]
         attempt_id = f"A{len(state['attempts']) + 1:04d}"
         siblings = state["nodes"][node["parent_id"]]["child_ids"] if node["parent_id"] else []
-        ranks = [{"node_id": key, "score": state["nodes"][key]["risk"].get("score")} for key in siblings]
+        ranks = []
+        for key in siblings:
+            risk = state["nodes"][key]["risk"]
+            rank = {"node_id": key, "score": risk.get("score") if risk["status"] == "scored" else None,
+                    "status": risk["status"], "reason": risk.get("reason")}
+            if risk["status"] != "scored" and risk.get("score") is not None:
+                rank["previous_score"] = risk["score"]
+            ranks.append(rank)
         ranks.sort(key=lambda item: (item["score"] is None, -(item["score"] or 0), siblings.index(item["node_id"])))
         previous = latest_observation(state, node_id)
         if previous:
@@ -162,14 +237,20 @@ class V4Runner:
                 if attempt["status"] != "imported" or attempt["execution_status"] != "succeeded":
                     continue
                 result = attempt["result"]
-                if any(dedup_key(item) == node["dedup_key"] for item in result["discovered"]):
-                    matches.append((attempt["imported_seq"], parent_id, attempt))
+                discoveries = [item for item in result["discovered"] if dedup_key(item) == node["dedup_key"]]
+                if discoveries:
+                    refs, seen = [], set()
+                    for discovery in discoveries:
+                        for ref in discovery.get("evidence_refs", result["evidence_refs"]):
+                            if ref["path"] not in seen:
+                                refs.append(ref)
+                                seen.add(ref["path"])
+                    matches.append((attempt["imported_seq"], parent_id, attempt, refs))
         if not matches:
             return None
-        matches.sort(reverse=True)
-        _, parent_id, attempt = next((item for item in matches if item[2]["result"]["evidence_refs"]), matches[0])
+        matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        _, parent_id, attempt, refs = next((item for item in matches if item[3]), matches[0])
         result = attempt["result"]
-        refs = result["evidence_refs"]
         claim = result["claim"]
         return {"parent_id": parent_id, "attempt_id": attempt["attempt_id"], "claim": claim[:1000],
                 "evidence_refs": [{"path": ref["path"], "description": ref["description"][:200]}
@@ -344,6 +425,8 @@ class V4Runner:
             raise
 
     def _investigate(self, node_id):
+        if not seed_dispatchable(self.tree.refresh(), node_id, self.log.metadata["target"]):
+            raise ContractError("Seed node is outside scope or has unverified dependencies")
         unproductive = 0
         node_tools = 0
         complete, stop_reason = False, "node_tool_limit"
@@ -550,25 +633,67 @@ class V4Runner:
 
     def run(self):
         try:
+            self._eager_seed_candidates()
             current = self.tree.state["root_id"]
-            while current:
+            deferred = set()
+            dependency_version = None
+            while current or deferred:
+                if current is None:
+                    if not self._wait_for_seed_review():
+                        return "incomplete", "seed_dependencies_deferred"
+                    deferred.clear()
+                    dependency_version = None
+                    current = self.tree.refresh()["root_id"]
                 self.gate.check()
+                state = self.tree.refresh()
+                # Operator-reviewed edges and stale propagation may change
+                # while another branch is being investigated. A previously
+                # deferred parent must then be reconsidered.
+                current_version = json.dumps([
+                    (key, item.get("seed_freshness"), item.get("seed_revalidation_pending"),
+                     item.get("seed_enabled_by_verified", {}), item.get("discovery_paths", []))
+                    for key, item in state["nodes"].items()
+                ], sort_keys=True)
+                if dependency_version is not None and current_version != dependency_version:
+                    deferred.clear()
+                dependency_version = current_version
+                if needs_seed_prerequisite_observation(state, current):
+                    self.tree.request_seed_reinvestigation(current)
                 node = self.tree.refresh()["nodes"][current]
                 if node["investigation_state"] == "pending":
                     self._investigate(current)
                 node = self.tree.refresh()["nodes"][current]
                 pending = [key for key in node["child_ids"] if self.tree.state["nodes"][key]["exploration_state"] not in ("done", "blocked")]
                 if pending:
-                    ranked = self.scorer.score_children(current)
+                    eligible = [key for key in pending if key not in deferred and seed_dispatchable(self.tree.state, key, self.log.metadata["target"])]
+                    if not eligible:
+                        self.log.append("v4_seed_dependencies_deferred", {"parent_id": current, "node_ids": pending})
+                        deferred.add(current)
+                        current = node["parent_id"]
+                        continue
+                    ranked = self.scorer.score_children(current, include_completed=True, reserve_final=True)
                     if not ranked["ready"]:
                         if ranked["stop_reason"] == "context_changed":
                             continue
                         raise V4BudgetStop(ranked["stop_reason"])
-                    selected = ranked["ordered_node_ids"][0]
+                    selected = next((key for key in ranked["ordered_node_ids"] if key in eligible), None)
+                    if selected is None:
+                        return "incomplete", "seed_dependencies_deferred"
                     self.log.append("v4_node_selection", {"parent_id": current, "node_id": selected,
                         "score": ranked["scores"].get(selected), "degraded_mode": selected in ranked["unscored"]})
                     current = selected
                 else:
+                    # Leaf observations can invalidate their own prior score. A
+                    # final sibling assessment includes completed nodes without
+                    # putting them back into the exploration queue.
+                    if any(self.tree.state["nodes"][key]["exploration_state"] != "blocked"
+                           and self.tree.state["nodes"][key]["risk"]["status"] in ("pending", "stale", "unscored")
+                           for key in node["child_ids"]):
+                        ranked = self.scorer.score_children(current, include_completed=True)
+                        if not ranked["ready"]:
+                            if ranked["stop_reason"] == "context_changed":
+                                continue
+                            raise V4BudgetStop(ranked["stop_reason"])
                     parent = node["parent_id"]
                     self.tree.set_node_state(current, "done")
                     current = parent
@@ -585,3 +710,125 @@ class V4Runner:
                 self.log.update(v4_usage=usage)
             finally:
                 self.scorer.close()
+
+    def _reviewable_seed_dependencies(self, state):
+        """List unverified edges with fresh, reviewable evidence in this run."""
+        pending = []
+        for child in state["nodes"].values():
+            if (not child.get("seeded") or child["exploration_state"] in ("done", "blocked")
+                    or seed_dispatchable(state, child["id"], self.log.metadata["target"])):
+                continue
+            verified = child.get("seed_enabled_by_verified", {})
+            for path in child["discovery_paths"]:
+                parent_id = path["parent_id"]
+                if (path["relation"] != "enabled_by" or parent_id in verified
+                        or parent_id not in state["nodes"]
+                        or not seed_dispatchable(state, parent_id, self.log.metadata["target"])):
+                    continue
+                for attempt_id in reversed(state["nodes"][parent_id]["attempts"]):
+                    attempt = state["attempts"][attempt_id]
+                    if (attempt["status"] != "imported" or attempt["execution_status"] != "succeeded"
+                            or attempt["imported_seq"] <= seed_dependency_invalidation_seq(child, parent_id)):
+                        continue
+                    refs = [ref for ref in attempt["evidence_refs"] if ref.get("source") == "model_file"]
+                    if refs:
+                        pending.append({"child_id": child["id"], "parent_id": parent_id,
+                                        "attempt_id": attempt_id, "evidence_refs": refs})
+                        break
+        return pending
+
+    def _wait_for_seed_review(self):
+        """Wait briefly for a review event, without issuing calls or losing stop requests."""
+        wake = threading.Event()
+        def on_event(event):
+            if event.get("kind") == "node_seed_dependency_verified":
+                wake.set()
+        self.log.listen(on_event)
+        try:
+            state = self.tree.refresh()
+            pending = self._reviewable_seed_dependencies(state)
+            remaining = min(self.seed_review_wait_seconds, max(0.0, self.gate.deadline - self.gate.clock()))
+            if not pending or remaining <= 0:
+                return False
+            self.log.append("v4_seed_review_waiting", {"dependencies": pending, "timeout_seconds": remaining})
+            deadline = time.monotonic() + remaining
+            while True:
+                if self.stop_event.is_set():
+                    raise V4BudgetStop("user_stopped")
+                state = self.tree.refresh()
+                if any(seed_dispatchable(state, item["child_id"], self.log.metadata["target"]) for item in pending):
+                    return True
+                left = min(deadline - time.monotonic(), self.gate.deadline - self.gate.clock())
+                if left <= 0:
+                    return False
+                wake.wait(min(.2, left))
+                wake.clear()
+        finally:
+            self.log.unlisten(on_event)
+
+    def _eager_seed_candidates(self):
+        settings = self.log.metadata.get("seed_settings") or {}
+        if settings.get("start_mode") != "seeded" or settings.get("reverify") != "eager":
+            return
+        start = self.gate.usage()["model_calls"]
+        allowance = self.gate.budgets["model_calls"] // 4
+        if not allowance:
+            return
+        self.gate.eager_call_limit = start + allowance
+        try:
+            state = self.tree.refresh()
+            candidates = [node for node in state["nodes"].values()
+                          if node.get("seeded") and node["kind"] == "candidate"
+                          and node["investigation_state"] == "pending"]
+            candidates.sort(key=lambda node: (node["risk"].get("score") is None,
+                                              -(node["risk"].get("score") or 0), node["id"]))
+            for node in candidates[:5]:
+                self._observe_eager_prerequisites(node["id"])
+                state = self.tree.refresh()
+                current = state["nodes"][node["id"]]
+                if current["exploration_state"] in ("done", "blocked") or current["investigation_state"] != "pending":
+                    continue
+                if not seed_dispatchable(state, node["id"], self.log.metadata["target"]):
+                    continue
+                self._investigate(node["id"])
+        except V4BudgetStop as exc:
+            if exc.reason != "eager_limit":
+                raise
+            self.log.append("v4_seed_eager_limit", {"model_call_limit": allowance})
+        finally:
+            self.gate.eager_call_limit = None
+
+    def _observe_eager_prerequisites(self, node_id):
+        """Observe reachable primary and alternate prerequisite parents within the eager allowance."""
+        state = self.tree.refresh()
+        dependencies, visited, scheduled = [], set(), set()
+
+        def collect(current_id):
+            if current_id in visited or current_id not in state["nodes"]:
+                return
+            visited.add(current_id)
+            node = state["nodes"][current_id]
+            primary_parent = node.get("parent_id")
+            for path in node.get("discovery_paths", []):
+                parent_id = path["parent_id"]
+                if parent_id != primary_parent and path["relation"] != "enabled_by":
+                    continue
+                collect(parent_id)
+                if (path["relation"] == "enabled_by" and node.get("seeded")
+                        and parent_id not in scheduled):
+                    dependencies.append(parent_id)
+                    scheduled.add(parent_id)
+
+        collect(node_id)
+        for parent_id in dependencies:
+            state = self.tree.refresh()
+            parent = state["nodes"].get(parent_id)
+            if parent is None:
+                continue
+            if parent["exploration_state"] in ("done", "blocked"):
+                continue
+            if needs_seed_prerequisite_observation(state, parent_id):
+                self.tree.request_seed_reinvestigation(parent_id)
+                parent = self.tree.refresh()["nodes"][parent_id]
+            if parent["investigation_state"] == "pending" and seed_dispatchable(self.tree.state, parent_id, self.log.metadata["target"]):
+                self._investigate(parent_id)

@@ -1,0 +1,29 @@
+/* Selected tree node inspection */
+.node-detail-content { min-width: 0; color: var(--text); }
+.node-detail-heading { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; padding-bottom:18px; border-bottom:1px solid var(--line); }
+.node-detail-kicker { color:var(--accent); font:700 10px/1.4 ui-monospace,Consolas,monospace; letter-spacing:.12em; }
+.node-detail-title { margin:4px 0 0; font:700 23px/1.25 ui-monospace,Consolas,monospace; }
+.node-detail-kind { border:1px solid #536e4a; background:#233529; color:#d3edac; padding:5px 10px; border-radius:999px; font-size:12px; white-space:nowrap; }
+.node-detail-overview { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin-top:16px; }
+.node-detail-metric { min-width:0; padding:11px 12px; border:1px solid var(--line); border-radius:8px; background:#101a17; }
+.node-detail-metric span { display:block; color:var(--muted); font-size:11px; margin-bottom:5px; }
+.node-detail-metric strong { display:block; font-size:13px; overflow-wrap:anywhere; }
+.node-detail-section { padding-top:17px; margin-top:17px; border-top:1px solid var(--line); min-width:0; }
+.node-detail-label { margin:0 0 11px; color:var(--text); font-size:13px; letter-spacing:.01em; }
+.node-detail-risk { border:1px solid #526e45; border-radius:9px; padding:14px; background:#1a291c; }
+.node-detail-risk-value { display:block; color:var(--accent); font-size:17px; line-height:1.5; overflow-wrap:anywhere; }
+.node-detail-note,.node-detail-empty { margin:6px 0 0; color:var(--muted); font-size:12px; line-height:1.6; }
+.node-detail-fields { display:grid; grid-template-columns:minmax(90px,auto) minmax(0,1fr); gap:8px 16px; margin:0; font-size:12px; line-height:1.55; }
+.node-detail-fields dt { color:var(--muted); }
+.node-detail-fields dd { margin:0; min-width:0; overflow-wrap:anywhere; white-space:pre-wrap; }
+.node-detail-text { font-size:13px; line-height:1.65; margin:6px 0 12px; white-space:pre-wrap; overflow-wrap:anywhere; }
+.node-detail-subtitle { font-size:11px; color:var(--muted); }
+.node-detail-evidence { list-style:none; padding:0; margin:0; display:grid; gap:8px; }
+.node-detail-evidence-item { border:1px solid var(--line); border-radius:7px; padding:10px; background:#101a17; min-width:0; }
+.node-detail-evidence-title { display:block; font-size:12px; font-weight:700; overflow-wrap:anywhere; }
+.node-detail-path { display:block; margin-top:5px; font:11px/1.5 ui-monospace,Consolas,monospace; color:var(--muted); overflow-wrap:anywhere; }
+.node-detail-download { display:inline-block; margin-top:8px; font-size:12px; color:var(--accent); }
+.node-detail-attempt { margin-top:8px; border:1px solid var(--line); border-radius:7px; padding:10px; background:#101a17; }
+.node-detail-attempt summary { color:var(--text); font-weight:700; font-size:12px; }
+.node-detail-attempt .node-detail-fields { margin-top:10px; }
+@media(max-width:600px) { .node-detail-overview { grid-template-columns:1fr; } .node-detail-fields { grid-template-columns:1fr; gap:3px; } .node-detail-fields dd { margin-bottom:8px; } }

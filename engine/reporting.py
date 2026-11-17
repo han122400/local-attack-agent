@@ -10,6 +10,8 @@ from engine.lab import TARGET as LAB_TARGET
 from engine.contracts import dedup_key
 from engine.tree import TreeStore, investigation_gaps, latest_observation
 from engine.usage import summarize_usage
+from engine.seed_metrics import seed_metrics
+from engine.execution_evidence import executed_node_ids
 
 
 def readable_prefix(log):
@@ -47,9 +49,10 @@ def _metadata(log, **fields):
         atomic_write_json(log.run_dir / "session.json", log.metadata)
 
 
-def _candidate_leads(state):
+def _candidate_leads(state, executed=None):
     """Expose model-authored hypotheses and preserved provenance without issuing a verdict."""
     discovery_evidence = {}
+    executed = executed_node_ids(state) if executed is None else executed
     discovery_claims = {}
     for attempt in state["attempts"].values():
         if attempt["status"] != "imported" or attempt["execution_status"] != "succeeded":
@@ -57,7 +60,11 @@ def _candidate_leads(state):
         refs = [ref for ref in attempt["evidence_refs"] if ref.get("source") == "model_file"]
         candidates = [item for item in attempt["result"]["discovered"] if item["kind"] == "candidate"]
         for discovery in candidates:
-            discovery_evidence.setdefault(dedup_key(discovery), []).extend(refs)
+            attributed = refs
+            if "evidence_refs" in discovery:
+                paths = {ref["path"] for ref in discovery["evidence_refs"]}
+                attributed = [ref for ref in refs if ref.get("runtime_path") in paths]
+            discovery_evidence.setdefault(dedup_key(discovery), []).extend(attributed)
         claim = attempt["result"]["claim"].strip()
         if len(candidates) == 1 and claim:
             discovery_claims[dedup_key(candidates[0])] = claim
@@ -76,14 +83,15 @@ def _candidate_leads(state):
         leads.append({"node_id": node["id"], "locator": node["locator"],
                       "hypothesis": node["hypothesis"], "investigation_state": node["investigation_state"],
                       "investigation_reason": node["investigation_reason"],
-                      "test_attempted": bool(node["attempts"]),
+                      "test_attempted": node["id"] in executed,
                       "candidate_proposed_verdict": previous["proposed_verdict"] if previous else None,
                       "candidate_claim": previous["claim"] if previous else "",
                       "discovery_claim": discovery_claims.get(node["dedup_key"], ""),
                       "discovery_evidence_refs": sources[:8],
                       "discovery_evidence_count": len(sources),
-                      "candidate_evidence_refs": [ref for ref in node["evidence_refs"]
-                                                  if ref.get("source") == "model_file"][:8]})
+                      "candidate_evidence_refs": [ref for attempt_id in node["attempts"]
+                          for ref in state["attempts"][attempt_id].get("evidence_refs", [])
+                          if ref.get("source") == "model_file"][:8]})
     return leads
 
 
@@ -101,23 +109,35 @@ def save_report(log, run_result, reason, *, state=None, error=None, persist_meta
         run_result = "incomplete"
         reason = "investigation_unavailable" if degraded else "investigation_incomplete"
     stats = {key: None for key in ("surfaces", "candidates", "tested_candidates", "confirmed", "rejected",
-                                  "inconclusive", "unexplored", "unscored", "fallback_selections", "incomplete_nodes")}
+                                  "inconclusive", "unexplored", "unscored", "fallback_selections", "incomplete_nodes",
+                                  "reused_nodes", "seed_pending_candidates", "seed_stale_nodes", "seed_deferred_nodes", "observed_nodes")}
     high, evidence, candidate_leads = [], [], None
     if not degraded:
+        from strategies.greedy import seed_dispatchable
         nodes = list(state["nodes"].values())
         candidates = [node for node in nodes if node["kind"] == "candidate"]
+        executed = executed_node_ids(state, events)
         stats.update(surfaces=sum(node["kind"] == "surface" for node in nodes), candidates=len(candidates),
-            tested_candidates=sum(bool(node["attempts"]) for node in candidates),
+            tested_candidates=sum(node["id"] in executed for node in candidates),
             inconclusive=len(candidates),
             incomplete_nodes=len(gaps),
+            reused_nodes=sum(node["investigation_state"] == "reused" for node in nodes),
+            observed_nodes=sum(latest_observation(state, node["id"]) is not None for node in nodes),
+            seed_pending_candidates=sum(bool(node.get("seeded")) and (node["investigation_state"] != "done"
+                                        or node.get("seed_revalidation_pending", False)) for node in candidates),
+            seed_stale_nodes=sum(node.get("seed_freshness") == "stale" for node in nodes),
+            seed_deferred_nodes=sum(bool(node.get("seeded"))
+                                    and node["exploration_state"] not in ("done", "blocked")
+                                    and not seed_dispatchable(state, node["id"], log.metadata["target"])
+                                    for node in nodes),
             unexplored=sum(node["investigation_state"] == "pending" and node["exploration_state"] != "blocked" for node in nodes),
-            unscored=sum(node["kind"] != "root" and node["risk"].get("score") is None for node in nodes),
+            unscored=sum(node["kind"] != "root" and node["risk"].get("status") != "scored" for node in nodes),
             fallback_selections=sum(event["kind"] == "v4_node_selection" and event.get("degraded_mode") is True for event in events))
         high = [{"node_id": node["id"], "score": node["risk"]["score"]} for node in nodes
-                if node["investigation_state"] != "done" and node["exploration_state"] != "blocked"
-                and (node["risk"].get("score") or 0) >= 75]
+                if node["investigation_state"] not in ("done", "reused") and node["exploration_state"] != "blocked"
+                and node["risk"].get("status") == "scored" and (node["risk"].get("score") or 0) >= 75]
         evidence = [ref for node in nodes for ref in node["evidence_refs"]]
-        candidate_leads = _candidate_leads(state)
+        candidate_leads = _candidate_leads(state, executed)
     else:
         # These are prefix references, never final verification statistics.
         for event in events:
@@ -150,6 +170,7 @@ def save_report(log, run_result, reason, *, state=None, error=None, persist_meta
     report = {"schema_version": 1, "run_id": log.run_id, "status": status, "run_result": run_result,
               "stop_reason": reason, "summary": summary, "stats": stats, "unexplored_high_risk": high,
               "incomplete_nodes": gaps, "candidate_leads": candidate_leads,
+              "seed_metrics": None if degraded else seed_metrics(events, state, log.metadata),
               "evidence_refs": evidence, "usage": usage, "last_snapshot_usage": log.metadata.get("v4_usage") if degraded else None,
               "last_readable_seq": events[-1]["seq"] if events else 0, "corruption": corruption, "error": error}
     atomic_write_json(log.run_dir / "report.json", report)

@@ -46,11 +46,59 @@ class Runtime:
 
 
 class LoopTests(unittest.TestCase):
+    def test_completed_investigation_keeps_reassessed_risk_on_last_leaf(self):
+        def callback(context):
+            command = self.command(context, [surface()] if context["node"]["id"] == "N0001" else [])
+            result = json.loads(command["command"])
+            result["observations"] = {"input_control": "full", "baseline_compared": True,
+                                      "query_behavior": "error", "response_status": 500}
+            command["command"] = json.dumps(result)
+            return command
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        child = TreeStore(self.log).rebuild()["nodes"]["N0002"]
+        self.assertEqual(child["risk"]["status"], "scored")
+        self.assertEqual(child["risk"]["source_request_id"], "S000002")
+        self.assertEqual(len(child["risk_history"]), 2)
+
+    def test_last_sibling_observation_refreshes_completed_siblings_too(self):
+        def callback(context):
+            discoveries = [surface("https://example.test/a"), surface("https://example.test/b")] if context["node"]["id"] == "N0001" else []
+            command = self.command(context, discoveries)
+            result = json.loads(command["command"])
+            result["observations"] = {"input_control": "full", "response_status": 200}
+            command["command"] = json.dumps(result)
+            return command
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        nodes = TreeStore(self.log).rebuild()["nodes"]
+        for key in ("N0002", "N0003"):
+            self.assertEqual(nodes[key]["risk"]["status"], "scored")
+            self.assertEqual(nodes[key]["risk"]["source_request_id"], "S000003")
+            self.assertEqual(nodes[key]["exploration_state"], "done")
+
+    def test_parent_budget_reserves_a_final_assessment_for_all_five_siblings(self):
+        def callback(context):
+            discoveries = [surface(f"https://example.test/{i}") for i in range(5)] if context["node"]["id"] == "N0001" else []
+            command = self.command(context, discoveries)
+            result = json.loads(command["command"])
+            result["observations"] = {"input_control": "full", "response_status": 200}
+            command["command"] = json.dumps(result)
+            return command
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        state = TreeStore(self.log).rebuild()
+        self.assertEqual(len(state["scorer"]["requests"]), 4)
+        for node in state["nodes"].values():
+            if node["kind"] != "root":
+                self.assertEqual(node["risk"]["status"], "scored")
+                self.assertEqual(node["risk"]["source_request_id"], "S000004")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.log = SessionLog(Path(self.temp.name), "a" * 32, {"experiment_mode": "v4", "target": "https://example.test/",
-            "model": "mock:model", "goal": "inspect", "model_settings": {"think": False, "options": {"num_ctx": 8192, "num_predict": 4096}},
+            "model": "mock:model", "goal": "inspect", "model_settings": {"think": False, "options": {"num_ctx": 32768, "num_predict": 4096}},
             "budgets": {"seconds": 120, "model_calls": 30, "tool_calls": 30, "command_seconds": 10, "finalize_seconds": 10},
             "scorer_provider": "openrouter", "scorer_model": "typesafe/jev-1.14", "scorer_settings": {},
             "v4_settings": {"node_attempts": 2}})
@@ -71,6 +119,177 @@ class LoopTests(unittest.TestCase):
                   "result_path": context["attempt"]["result_path"]}
         return {"action": action, "plan": "inspect", "reason": "investigate current node", "path": "", "content": "",
                 "code": "", "command": json.dumps(result) if action == "run_command" else ""}
+
+    def _review_wait_run(self, runner_class, *, review, stop=False):
+        tree = TreeStore(self.log)
+        tree.initialize("https://example.test/")
+        tree.mark_seeded("N0001", "b" * 32, "N0001", {}, reused=True)
+        lead = surface("https://example.test/a", "candidate")
+        lead["relation"] = "enabled_by"
+        child = tree.discover("N0001", lead)
+        tree.mark_seeded(child, "b" * 32, "N0002", {}, reused=False)
+        runtime = Runtime(self.log)
+        (runtime.runtime_dir / "work" / "response.txt").write_text("observed evidence", encoding="utf-8")
+        visited = []
+        def callback(context):
+            node_id = context["node"]["id"]
+            visited.append(node_id)
+            refs = [{"path": "work/response.txt", "description": "parent evidence"}] if node_id == "N0001" else []
+            return self.command(context, evidence_refs=refs)
+        runner = runner_class(self.log, runtime, transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        runner.seed_review_wait_seconds = 2 if review or stop else .15
+        waiting = threading.Event()
+        self.log.listen(lambda event: waiting.set() if event.get("kind") == "v4_seed_review_waiting" else None)
+        outcome = []
+        worker = threading.Thread(target=lambda: outcome.append(runner.run()))
+        worker.start()
+        try:
+            self.assertTrue(waiting.wait(3), "runner did not wait for review")
+            if review:
+                state = tree.refresh()
+                attempt = state["attempts"][state["nodes"]["N0001"]["attempts"][-1]]
+                tree.record_seed_dependency_verification(child, "N0001", attempt["attempt_id"], attempt["evidence_refs"][0])
+            elif stop:
+                runner.stop_event.set()
+            worker.join(5)
+            self.assertFalse(worker.is_alive())
+            if review:
+                self.assertIn(child, visited)
+            else:
+                self.assertNotIn(child, visited)
+                self.assertEqual(outcome[0][0], "stopped" if stop else "incomplete")
+        finally:
+            runner.stop_event.set()
+            worker.join(5)
+
+    def test_v4_waits_for_late_operator_review(self):
+        self._review_wait_run(V4Runner, review=True)
+
+    def test_v4_review_timeout_remains_incomplete(self):
+        self._review_wait_run(V4Runner, review=False)
+
+    def test_v4_review_wait_honors_stop(self):
+        self._review_wait_run(V4Runner, review=False, stop=True)
+
+    def test_eager_tests_seed_candidate_before_new_root_investigation(self):
+        self.log.update(seed_settings={"start_mode": "seeded", "reverify": "eager"})
+        tree = TreeStore(self.log)
+        tree.initialize("https://example.test/")
+        candidate = tree.discover("N0001", surface("https://example.test/q", "candidate"))
+        tree.mark_seeded(candidate, "b" * 32, "N0002", {}, reused=False)
+        visited = []
+        def callback(context):
+            visited.append(context["node"]["id"])
+            return self.command(context)
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        runner.run()
+        self.assertEqual(visited[0], candidate)
+
+    def test_eager_observes_reused_alternate_enabled_by_parent(self):
+        self.log.update(seed_settings={"start_mode": "seeded", "reverify": "eager"})
+        tree = TreeStore(self.log)
+        tree.initialize("https://example.test/")
+        tree.mark_seeded("N0001", "b" * 32, "N0001", {}, reused=True)
+        primary = tree.discover("N0001", surface("https://example.test/primary"))
+        alternate = tree.discover("N0001", surface("https://example.test/alternate"))
+        lead = surface("https://example.test/q", "candidate")
+        lead["relation"] = "enabled_by"
+        candidate = tree.discover(primary, lead)
+        tree.discover(alternate, lead)
+        tree.mark_seeded(primary, "b" * 32, "N0002", {}, reused=True)
+        tree.mark_seeded(alternate, "b" * 32, "N0003", {}, reused=True)
+        tree.mark_seeded(candidate, "b" * 32, "N0004", {}, reused=False)
+        visited = []
+        def callback(context):
+            visited.append(context["node"]["id"])
+            return self.command(context)
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        runner._eager_seed_candidates()
+        self.assertIn(alternate, visited)
+        self.assertNotIn(candidate, visited)  # the relationship is not operator-verified
+
+    def test_lazy_can_review_and_use_alternate_parent_after_primary_deferred(self):
+        tree = TreeStore(self.log)
+        tree.initialize("https://example.test/")
+        tree.mark_seeded("N0001", "b" * 32, "N0001", {}, reused=True)
+        primary = tree.discover("N0001", surface("https://example.test/primary"))
+        alternate = tree.discover("N0001", surface("https://example.test/alternate"))
+        lead = surface("https://example.test/q", "candidate")
+        lead["relation"] = "enabled_by"
+        candidate = tree.discover(primary, lead)
+        tree.discover(alternate, lead)
+        tree.mark_seeded(primary, "b" * 32, "N0002", {}, reused=True)
+        tree.mark_seeded(alternate, "b" * 32, "N0003", {}, reused=True)
+        tree.mark_seeded(candidate, "b" * 32, "N0004", {}, reused=False)
+        runtime = Runtime(self.log)
+        (runtime.runtime_dir / "work" / "alt.txt").write_text("alternate prerequisite evidence", encoding="utf-8")
+        visited, candidate_path = [], []
+        def callback(context):
+            current = context["node"]["id"]
+            visited.append(current)
+            if current == candidate:
+                candidate_path.extend(item["id"] for item in context["parent_path"])
+            refs = [{"path": "work/alt.txt", "description": "alternate evidence"}] if current == alternate else []
+            return self.command(context, evidence_refs=refs)
+        runner = V4Runner(self.log, runtime, transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        runner.seed_review_wait_seconds = 3
+        waiting = threading.Event()
+        self.log.listen(lambda event: waiting.set() if event.get("kind") == "v4_seed_review_waiting" else None)
+        result = []
+        worker = threading.Thread(target=lambda: result.append(runner.run()))
+        worker.start()
+        try:
+            self.assertTrue(waiting.wait(5), "runner did not wait for alternate evidence review")
+            state = tree.refresh()
+            attempt = state["attempts"][state["nodes"][alternate]["attempts"][-1]]
+            tree.record_seed_dependency_verification(candidate, alternate, attempt["attempt_id"], attempt["evidence_refs"][0])
+            worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertIn(candidate, visited)
+            self.assertEqual(candidate_path[-1], alternate)
+        finally:
+            runner.stop_event.set()
+            worker.join(5)
+
+    def test_deferred_seed_does_not_prevent_independent_sibling_test(self):
+        tree = TreeStore(self.log)
+        tree.initialize("https://example.test/")
+        tree.mark_seeded("N0001", "b" * 32, "N0001", {}, reused=True)
+        blocked = surface("https://example.test/a", "candidate")
+        blocked["relation"] = "enabled_by"
+        blocked_id = tree.discover("N0001", blocked)
+        open_id = tree.discover("N0001", surface("https://example.test/b", "candidate"))
+        tree.mark_seeded(blocked_id, "b" * 32, "N0002", {}, reused=False)
+        tree.mark_seeded(open_id, "b" * 32, "N0003", {}, reused=False)
+        visited = []
+        def callback(context):
+            visited.append(context["node"]["id"])
+            return self.command(context)
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("incomplete", "seed_dependencies_deferred"))
+        self.assertEqual(visited, ["N0001", open_id])
+
+    def test_eager_cap_stops_followups_then_normal_dfs_can_resume(self):
+        self.log.update(seed_settings={"start_mode": "seeded", "reverify": "eager"}, v4_settings={"node_attempts": 5},
+                        budgets={**self.log.metadata["budgets"], "model_calls": 8})
+        tree = TreeStore(self.log)
+        tree.initialize("https://example.test/")
+        tree.mark_seeded("N0001", "b" * 32, "N0001", {}, reused=True)
+        candidate = tree.discover("N0001", surface("https://example.test/q", "candidate"))
+        tree.mark_seeded(candidate, "b" * 32, "N0002", {}, reused=False)
+        visited = []
+        def callback(context):
+            visited.append(context["node"]["id"])
+            return self.command(context, next_observation="continue" if len(visited) <= 2 else "")
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        runner._eager_seed_candidates()
+        self.assertEqual(len(visited), 2)
+        self.assertIsNone(runner.gate.eager_call_limit)
+        self.assertEqual(runner.tree.refresh()["nodes"][candidate]["investigation_state"], "pending")
+        self.log.update(seed_settings={"start_mode": "seeded", "reverify": "lazy"})
+        runner.run()
+        self.assertGreater(len(visited), 2)
+        self.assertTrue(all(node_id == candidate for node_id in visited))
 
     def test_recent_includes_prepared_file_path_for_the_next_decision(self):
         runtime = Runtime(self.log)
@@ -650,7 +869,8 @@ class LoopTests(unittest.TestCase):
             if context["node"]["id"] == "N0001":
                 root_calls += 1
                 if root_calls == 1:
-                    return self.command(context, [surface("https://example.test/search?q=", "candidate")],
+                    return self.command(context, [{**surface("https://example.test/search?q=", "candidate"),
+                        "evidence_refs": [{"path": "work/parent-response.txt", "description": "initial probe response"}]}],
                         next_observation="Inspect another input",
                         evidence_refs=[{"path": "work/parent-response.txt", "description": "initial probe response"}])
                 return self.command(context)

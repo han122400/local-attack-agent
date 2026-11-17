@@ -71,7 +71,7 @@ class RiskScorer:
         scores = {key: values[key]["value"]["score"] for key in current["eligible"] if values[key]["status"] == "scored"}
         unscored = {key: values[key]["reason"] for key in current["eligible"] if values[key]["status"] == "unscored"}
         order = {key: i for i, key in enumerate(current["eligible"])}
-        ids = sorted(current["eligible"], key=lambda key: (key not in scores, -scores.get(key, 0), order[key], key))
+        ids = sorted(current["selectable"], key=lambda key: (key not in scores, -scores.get(key, 0), order[key], key))
         return {"ready": True, "stop_reason": None, "context_key": current["key"],
                 "ordered_node_ids": ids, "scores": scores, "unscored": unscored,
                 "fallback_node_ids": [key for key in ids if key in unscored]}
@@ -87,7 +87,15 @@ class RiskScorer:
             count += 1
         return last, count
 
-    def score_children(self, parent_id: str) -> dict:
+    @staticmethod
+    def _cached_outcome_matches(risk, outcome, context_key):
+        if outcome["status"] == "scored":
+            return risk["status"] == "scored" and risk.get("context_key") == context_key
+        return (risk["status"] in ("stale", "unscored")
+                and risk.get("attempted_context_key", risk.get("context_key")) == context_key
+                and risk.get("reason") == outcome["reason"])
+
+    def score_children(self, parent_id: str, *, include_completed=False, reserve_final=False) -> dict:
         tree = self.tree.refresh()
         if tree["scorer"]["halt"]:
             return self._stop(tree["scorer"]["halt"]["reason"], persist=False)
@@ -100,8 +108,15 @@ class RiskScorer:
         except ProviderError:
             return self._stop("scorer_unavailable")
         settings, pin = config["settings"], config["model_pin"]
-        initial = context(self.tree.refresh(), parent_id, config)
+        # Leave one sibling batch for observations collected at the end of the
+        # branch. The configured parent/global limits still cap every request.
+        parent_limit = settings["max_calls_per_parent"]
+        if reserve_final and parent_limit > 1:
+            parent_limit -= 1
+        scope = {"include_completed": True} if include_completed else {}
+        initial = context(self.tree.refresh(), parent_id, config, include_completed=include_completed)
         local_errors = {key: value for key, value in initial["invalid"].items() if key in initial["eligible"]}
+        retrying_reserved = False
         while True:
             tree = self.tree.refresh()
             state = tree["scorer"]
@@ -111,7 +126,7 @@ class RiskScorer:
             # and new scorer objects must never reissue it automatically.
             if any("finish" not in item for item in state["requests"].values()):
                 return self._stop("scorer_unavailable", persist=False)
-            current = context(tree, parent_id, config)
+            current = context(tree, parent_id, config, include_completed=include_completed)
             if current["key"] != initial["key"]:
                 return self._stop("context_changed", persist=False)
             accounting = usage(state)
@@ -123,10 +138,15 @@ class RiskScorer:
             if error and (not error["retryable"] or failures > settings["max_retries"]):
                 return self._stop("scorer_unavailable")
             cached = state["batches"].get(current["key"])
-            if cached is not None and set(current["eligible"]) <= cached.keys():
-                if any(tree["nodes"][key]["risk"].get("context_key") != current["key"] for key in current["eligible"]):
+            parent_calls = sum(item["parent_id"] == parent_id for item in state["requests"].values())
+            retry_reserved = cached is not None and parent_calls < parent_limit and any(
+                cached.get(key, {}).get("reason") == "parent_limit" for key in current["eligible"])
+            retrying_reserved = retrying_reserved or retry_reserved
+            if cached is not None and set(current["eligible"]) <= cached.keys() and not retrying_reserved:
+                if any(not self._cached_outcome_matches(tree["nodes"][key]["risk"], cached[key], current["key"])
+                       for key in current["eligible"]):
                     self.tree.record_scoring("scorer_batch_applied", {"parent_id": parent_id,
-                        "context_key": current["key"], "outcomes": {key: cached[key] for key in current["eligible"]}})
+                        **scope, "context_key": current["key"], "outcomes": {key: cached[key] for key in current["eligible"]}})
                 return self._ready(current, cached)
             scores, failed_nodes = outcomes(state, current["key"])
             for key, count in failed_nodes.items():
@@ -137,7 +157,7 @@ class RiskScorer:
                 values = {key: {"status": "scored", "value": scores[key]} if key in scores else
                            {"status": "unscored", "reason": local_errors[key]} for key in current["eligible"]}
                 self.tree.record_scoring("scorer_batch_applied", {"parent_id": parent_id,
-                    "context_key": current["key"], "outcomes": values})
+                    **scope, "context_key": current["key"], "outcomes": values})
                 return self._ready(current, values)
             # Global limits win over the parent cap. Never offer a partially
             # evaluated sibling batch as selectable on a global budget stop.
@@ -145,8 +165,7 @@ class RiskScorer:
                 return self._stop("call_budget")
             if accounting["elapsed_seconds"] >= settings["time_budget_seconds"]:
                 return self._stop("time_budget")
-            parent_calls = sum(item["parent_id"] == parent_id for item in state["requests"].values())
-            if parent_calls >= settings["max_calls_per_parent"]:
+            if parent_calls >= parent_limit:
                 if error:
                     return self._stop("scorer_unavailable")
                 local_errors.update({key: "parent_limit" for key in missing})
@@ -170,7 +189,7 @@ class RiskScorer:
                 timeout = self.admit_request("scorer", estimate, timeout)
             request_id = f"S{len(state['requests']) + 1:06d}"
             self.tree.record_scoring("scorer_request_started", {"request_id": request_id, "parent_id": parent_id,
-                "context_key": current["key"], "node_ids": ids, "request": payload, "input_hash": fingerprint(payload),
+                **scope, "context_key": current["key"], "node_ids": ids, "request": payload, "input_hash": fingerprint(payload),
                 "estimated_cost_usd": estimate, "timeout_seconds": timeout, "started_at": utc_now()})
             started = self.clock()
             try:

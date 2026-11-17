@@ -60,7 +60,16 @@ def scoring_request_bytes(configuration: dict, request: dict) -> int:
     return len(canonical_bytes(wire))
 
 
-def context(tree: dict, parent_id: str, configuration: dict) -> dict:
+def invalidate_risk(node: dict) -> None:
+    """Keep the last assessment visible without treating it as current evidence."""
+    risk = node["risk"]
+    node["risk"] = ({**risk, "status": "stale", "reason": "observations_changed"}
+                    if risk.get("score") is not None else {"status": "pending", "score": None})
+
+
+def context(tree: dict, parent_id: str, configuration: dict, *, include_completed=False) -> dict:
+    if type(include_completed) is not bool:
+        raise ContractError("Invalid assessment scope")
     parent = tree["nodes"][parent_id]
     siblings = [tree["nodes"][key] for key in parent["child_ids"]]
     projected, valid, invalid = [], [], {}
@@ -76,8 +85,11 @@ def context(tree: dict, parent_id: str, configuration: dict) -> dict:
     # claims, and evidence attachments alone do not invalidate a score.
     value = {"configuration": configuration, "parent": project_node(parent),
              "parent_locator_hash": fingerprint(parent["locator"]), "siblings": projected}
-    eligible = [node["id"] for node in siblings if node["exploration_state"] not in ("done", "blocked")]
-    return {"key": fingerprint(value), "parent": parent, "siblings": valid, "eligible": eligible, "invalid": invalid}
+    selectable = [node["id"] for node in siblings if node["exploration_state"] not in ("done", "blocked")]
+    eligible = ([node["id"] for node in siblings if node["exploration_state"] != "blocked"]
+                if include_completed else selectable)
+    return {"key": fingerprint(value), "parent": parent, "siblings": valid, "eligible": eligible,
+            "selectable": selectable, "invalid": invalid}
 
 
 def usage(state: dict) -> dict:
@@ -159,6 +171,9 @@ def apply_scoring_event(tree: dict, kind: str, payload: dict) -> None:
             if state["configuration"] is not None or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", payload["catalog_error"]):
                 raise ContractError("Invalid catalog failure accounting")
         state["halt"] = copy.deepcopy(payload)
+        for node in tree["nodes"].values():
+            if node["risk"]["status"] == "stale":
+                node["risk"]["reason"] = payload["reason"]
         return
     configuration = state["configuration"]
     if configuration is None:
@@ -169,7 +184,7 @@ def apply_scoring_event(tree: dict, kind: str, payload: dict) -> None:
         request_id = payload["request_id"]
         if request_id != f"S{len(state['requests']) + 1:06d}":
             raise ContractError("Invalid scoring request identity")
-        current = context(tree, payload["parent_id"], configuration)
+        current = context(tree, payload["parent_id"], configuration, include_completed=payload.get("include_completed", False))
         ids = payload["node_ids"]
         if (payload["context_key"] != current["key"] or not isinstance(ids, list) or not ids
                 or len(set(ids)) != len(ids) or not set(ids) <= set(current["eligible"])):
@@ -218,7 +233,7 @@ def apply_scoring_event(tree: dict, kind: str, payload: dict) -> None:
                 raise ContractError("Invalid provider failure")
         request["finish"] = copy.deepcopy(payload)
     elif kind == "scorer_batch_applied":
-        current = context(tree, payload["parent_id"], configuration)
+        current = context(tree, payload["parent_id"], configuration, include_completed=payload.get("include_completed", False))
         if current["key"] != payload["context_key"] or set(payload["outcomes"]) != set(current["eligible"]) or state["halt"]:
             raise ContractError("Stale or incomplete scoring batch")
         completed, _failures = outcomes(state, current["key"])
@@ -233,9 +248,14 @@ def apply_scoring_event(tree: dict, kind: str, payload: dict) -> None:
                     "model": source["finish"]["result"]["model"], "requested_model": configuration["model_pin"]["id"],
                     "source_request_id": source["request_id"], "rubric_version": RUBRIC_VERSION,
                     "contract_version": configuration["contract_version"]}
+                history = tree["nodes"][node_id].setdefault("risk_history", [])
+                if not any(item["source_request_id"] == source["request_id"] for item in history):
+                    history.append(copy.deepcopy(tree["nodes"][node_id]["risk"]))
             elif risk["status"] == "unscored" and risk["reason"] in _UNSCORED:
-                tree["nodes"][node_id]["risk"] = {"status": "unscored", "score": None,
-                    "reason": risk["reason"], "context_key": current["key"]}
+                previous = tree["nodes"][node_id]["risk"]
+                tree["nodes"][node_id]["risk"] = ({**previous, "status": "stale", "reason": risk["reason"],
+                    "attempted_context_key": current["key"]} if previous.get("score") is not None else
+                    {"status": "unscored", "score": None, "reason": risk["reason"], "context_key": current["key"]})
             else:
                 raise ContractError("Invalid scoring outcome")
         state["batches"][current["key"]] = copy.deepcopy(payload["outcomes"])

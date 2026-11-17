@@ -39,6 +39,8 @@ _ENUMS = {
     "query_behavior": {"unknown", "unchanged", "error", "controlled_difference"},
 }
 _OPTIONAL_BOOLS = {"auth_required", "upload_public"}
+_SECURITY_SIGNALS = {"unknown", "auth_bypass", "weak_credentials", "account_enumeration",
+                     "query_injection", "unescaped_reflection", "cross_user_access"}
 _BOOLS = {"baseline_compared", "reproduced"}
 _ROUTES = {"api", "search", "login", "upload", "admin", "users", "orders", "products",
            "download", "profile", "reset", "checkout"}
@@ -46,6 +48,8 @@ _METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE"}
 _AUTH = {"anonymous", "authenticated", "owner", "non_owner", "admin", "unknown"}
 _HYPOTHESES = {"sqli", "idor", "xss", "upload", "ssrf", "path_traversal", "auth", "csrf"}
 OBSERVATIONS_SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
+    "security_signal": {"enum": sorted(_SECURITY_SIGNALS)},
+    "baseline_status": {"anyOf": [{"type": "integer", "minimum": 100, "maximum": 599}, {"type": "null"}]},
     **{key: {"enum": sorted(values)} for key, values in _ENUMS.items()},
     **{key: {"type": ["boolean", "null"]} for key in sorted(_OPTIONAL_BOOLS)},
     **{key: {"type": "boolean"} for key in sorted(_BOOLS)},
@@ -89,6 +93,18 @@ def observations(value) -> dict:
     if status is not None and (type(status) is not int or not 100 <= status <= 599):
         raise ScoreContractError("invalid_observation_value")
     result["response_status"] = status
+    # Additive evidence fields: absent fields stay absent so old journal scoring
+    # projections and context hashes remain reproducible.
+    if "security_signal" in value:
+        signal = value["security_signal"]
+        if not isinstance(signal, str) or signal not in _SECURITY_SIGNALS:
+            raise ScoreContractError("invalid_observation_value")
+        result["security_signal"] = signal
+    if "baseline_status" in value:
+        baseline = value["baseline_status"]
+        if baseline is not None and (type(baseline) is not int or not 100 <= baseline <= 599):
+            raise ScoreContractError("invalid_observation_value")
+        result["baseline_status"] = baseline
     return result
 
 

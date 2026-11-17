@@ -31,6 +31,59 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(report["stop_reason"], "call_budget")
         self.assertTrue((self.log.run_dir / "report.json").is_file())
 
+    def test_unexecuted_attempt_is_not_counted_as_test_or_reuse(self):
+        candidate = self.tree.discover("N0001", surface("https://example.test/q", "candidate"))
+        self.tree.mark_seeded(candidate, "b" * 32, "N0002", {})
+        attempt = self.tree.begin_attempt(candidate, call_id="CALL-UNEXECUTED")
+        self.tree.fail_attempt(attempt["attempt_id"], reason="not_executed")
+        report = save_report(self.log, "interrupted", "crash_before_execution", state=self.tree.refresh())
+        self.assertEqual(report["stats"]["tested_candidates"], 0)
+        self.assertFalse(report["candidate_leads"][0]["test_attempted"])
+        self.assertEqual(report["seed_metrics"]["coverage_reuse"]["used"], 0)
+
+    def test_started_execution_counts_even_if_result_is_missing(self):
+        candidate = self.tree.discover("N0001", surface("https://example.test/q", "candidate"))
+        self.tree.begin_attempt(candidate, call_id="CALL-STARTED")
+        self.log.append("exec_started", {"exec_id": "EXEC-STARTED", "call_id": "CALL-STARTED", "action": "run_command"})
+        report = save_report(self.log, "interrupted", "crash_after_execution_started", state=self.tree.refresh())
+        self.assertEqual(report["stats"]["tested_candidates"], 1)
+        self.assertTrue(report["candidate_leads"][0]["test_attempted"])
+
+    def test_terminal_seeded_candidate_pending_revalidation_is_counted(self):
+        candidate = self.tree.discover("N0001", surface("https://example.test/q", "candidate"))
+        self.tree.mark_seeded(candidate, "b" * 32, "N0002", {})
+        self.tree.finish_investigation(candidate)
+        self.tree.set_node_state(candidate, "done")
+        state = self.tree.refresh()
+        state["nodes"][candidate]["seed_revalidation_pending"] = True
+        report = save_report(self.log, "completed", "tree_exhausted", state=state)
+        self.assertEqual(report["stats"]["seed_pending_candidates"], 1)
+        self.assertTrue(any(gap["node_id"] == candidate for gap in report["incomplete_nodes"]))
+
+    def test_report_separates_reused_and_seeded_work_from_actual_attempts(self):
+        candidate_id = self.tree.discover("N0001", surface("https://example.test/q", "candidate"))
+        state = self.tree.state
+        root = state["nodes"]["N0001"]
+        root.update(seeded=True, investigation_state="reused", seed_freshness="unknown")
+        candidate = state["nodes"][candidate_id]
+        candidate.update(seeded=True, seed_freshness="unknown")
+        candidate["discovery_paths"][0]["relation"] = "enabled_by"
+        self.log.append("v4_seed_dependencies_deferred", {"parent_id": "N0001", "node_ids": [candidate_id]})
+        report = save_report(self.log, "incomplete", "seed_dependencies_deferred", state=state)
+        self.assertEqual(report["stats"]["reused_nodes"], 1)
+        self.assertEqual(report["stats"]["seed_pending_candidates"], 1)
+        self.assertEqual(report["stats"]["tested_candidates"], 0)
+        self.assertEqual(report["stats"]["seed_stale_nodes"], 0)
+        self.assertEqual(report["stats"]["seed_deferred_nodes"], 1)
+
+    def test_report_does_not_count_resolved_historical_deferral(self):
+        candidate_id = self.tree.discover("N0001", surface("https://example.test/q", "candidate"))
+        state = self.tree.state
+        state["nodes"][candidate_id].update(seeded=True, seed_freshness="unknown")
+        self.log.append("v4_seed_dependencies_deferred", {"parent_id": "N0001", "node_ids": [candidate_id]})
+        report = save_report(self.log, "incomplete", "investigation_incomplete", state=state)
+        self.assertEqual(report["stats"]["seed_deferred_nodes"], 0)
+
     def test_report_exposes_unverified_candidate_and_its_discovery_evidence(self):
         attempt = self.tree.begin_attempt("N0001", call_id="CALL-0001")
         self.log.append("exec_started", {"exec_id": "EXEC-0001", "call_id": "CALL-0001", "action": "run_command"})
@@ -40,7 +93,8 @@ class ReportingTests(unittest.TestCase):
         result_path = self.log.run_dir / "runtime" / attempt["result_path"]
         result_path.parent.mkdir(parents=True, exist_ok=True)
         result_path.write_text(json.dumps({"schema_version": 1, "attempt_id": attempt["attempt_id"],
-            "node_id": "N0001", "discovered": [surface("https://example.test/search?q=", "candidate")],
+            "node_id": "N0001", "discovered": [{**surface("https://example.test/search?q=", "candidate"),
+                "evidence_refs": [{"path": "work/search.txt", "description": "Original search response"}]}],
             "proposed_verdict": "confirmed", "claim": "SQL error proves injection", "next_observation": "",
             "evidence_refs": [{"path": "work/search.txt", "description": "Original search response"}]}), encoding="utf-8")
         self.log.append("exec_finished", {"exec_id": "EXEC-0001", "call_id": "CALL-0001", "action": "run_command",

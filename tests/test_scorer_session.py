@@ -81,6 +81,67 @@ class ScorerSessionTests(unittest.TestCase):
         self.assertEqual(self.log.latest_seq, before)
         self.assertTrue((self.log.run_dir / "scorer.json").is_file())
 
+    def test_changed_observations_preserve_last_score_and_history(self):
+        scorer = self.scorer()
+        scorer.score_children(self.root)
+        child = self.children[0]
+        self.tree.set_observations(child, {"query_behavior": "error"})
+        node = TreeStore(self.log).rebuild()["nodes"][child]
+        self.assertEqual(node["risk"]["status"], "stale")
+        self.assertEqual(node["risk"]["score"], 75)
+        self.assertEqual(node["risk_history"][0]["score"], 75)
+
+    def test_completed_nodes_are_reassessed_without_becoming_selectable(self):
+        class ObservationAdapter(FakeAdapter):
+            def evaluate(self, pin, parent, siblings, node_ids, **kwargs):
+                result = good(node_ids)
+                for node in siblings:
+                    if node["id"] in node_ids:
+                        level = 2 if node["observations"]["query_behavior"] == "error" else 1
+                        result["scores"][node["id"]] = validate_answer({**answer(), "score": level,
+                            "probabilities": {str(i): int(i == level) for i in range(5)}})
+                return result
+        scorer = self.scorer(ObservationAdapter())
+        scorer.score_children(self.root)
+        child = self.children[0]
+        self.tree.set_observations(child, {"query_behavior": "error", "baseline_compared": True})
+        self.tree.set_node_state(child, "done")
+        result = scorer.score_children(self.root, include_completed=True)
+        self.assertTrue(result["ready"])
+        self.assertNotIn(child, result["ordered_node_ids"])
+        node = TreeStore(self.log).rebuild()["nodes"][child]
+        self.assertEqual(node["risk"]["status"], "scored")
+        self.assertEqual(node["risk"]["source_request_id"], "S000002")
+        self.assertEqual(node["risk"]["score"], 50)
+        self.assertEqual([item["score"] for item in node["risk_history"]], [25, 50])
+
+    def test_reassessment_limit_preserves_prior_score_with_explicit_reason(self):
+        scorer = self.scorer(max_calls_per_parent=1)
+        scorer.score_children(self.root)
+        self.tree.set_observations(self.children[0], {"query_behavior": "error"})
+        result = scorer.score_children(self.root, include_completed=True)
+        self.assertTrue(result["ready"])
+        node = self.tree.refresh()["nodes"][self.children[0]]
+        self.assertEqual((node["risk"]["status"], node["risk"]["score"]), ("stale", 75))
+        self.assertEqual(node["risk"]["reason"], "parent_limit")
+        self.assertEqual(scorer.usage()["requests"], 1)
+
+    def test_reserved_final_call_replaces_cached_limit_even_when_facts_are_unchanged(self):
+        scorer = self.scorer(max_calls_per_parent=2)
+        scorer.score_children(self.root, include_completed=True, reserve_final=True)
+        self.tree.set_observations(self.children[0], {"query_behavior": "error"})
+        limited = scorer.score_children(self.root, include_completed=True, reserve_final=True)
+        self.assertEqual(limited["unscored"], {key: "parent_limit" for key in self.children})
+        for key in self.children:
+            self.tree.set_node_state(key, "done")
+        final = scorer.score_children(self.root, include_completed=True)
+        self.assertEqual(final["unscored"], {})
+        self.assertEqual(final["ordered_node_ids"], [])
+        self.assertEqual(scorer.usage()["requests"], 2)
+        for key in self.children:
+            self.assertEqual(self.tree.state["nodes"][key]["risk"]["status"], "scored")
+            self.assertEqual(self.tree.state["nodes"][key]["risk"]["source_request_id"], "S000002")
+
     def test_visits_and_completion_do_not_invalidate_but_facts_and_new_siblings_do(self):
         adapter = FakeAdapter()
         scorer = self.scorer(adapter, max_calls_per_parent=10)
@@ -90,7 +151,7 @@ class ScorerSessionTests(unittest.TestCase):
         scorer.score_children(self.root)
         self.assertEqual(len(adapter.calls), 1)
         self.tree.set_observations(self.children[1], {"query_behavior": "error"})
-        self.assertEqual(self.tree.state["nodes"][self.children[2]]["risk"]["status"], "pending")
+        self.assertEqual(self.tree.state["nodes"][self.children[2]]["risk"]["status"], "stale")
         scorer.score_children(self.root)
         self.assertEqual(adapter.calls[-1], self.children[1:])
         self.tree.set_observations(self.children[1], {"query_behavior": "error", "body": "PRIVATE"})

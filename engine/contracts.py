@@ -84,7 +84,7 @@ def validate_locator(value: dict) -> dict:
 
 
 def validate_discovery(value: dict) -> dict:
-    _object(value, ("kind", "relation", "locator", "hypothesis"), ("observations",))
+    _object(value, ("kind", "relation", "locator", "hypothesis"), ("observations", "evidence_refs"))
     if value["kind"] not in ("surface", "candidate") or value["relation"] not in RELATIONS:
         raise ContractError("Invalid discovered node kind/relation")
     hypothesis = value["hypothesis"]
@@ -112,6 +112,8 @@ def validate_discovery(value: dict) -> dict:
               "locator": locator, "hypothesis": hypothesis}
     if "observations" in value:
         result["observations"] = observations(value["observations"])
+    if "evidence_refs" in value:
+        result["evidence_refs"] = validate_evidence_refs(value["evidence_refs"])
     return result
 
 
@@ -142,6 +144,17 @@ def evidence_path(value: str) -> str:
     return relative.as_posix()
 
 
+def validate_evidence_refs(value: list) -> list[dict]:
+    if not isinstance(value, list) or len(value) > 50:
+        raise ContractError("Invalid evidence list")
+    refs = []
+    for entry in value:
+        _object(entry, ("path", "description"))
+        refs.append({"path": evidence_path(entry["path"]),
+                     "description": _text(entry["description"], "evidence description", 2000, empty=True)})
+    return refs
+
+
 def validate_result(value: dict, *, attempt_id: str, node_id: str) -> dict:
     fields = ("schema_version", "attempt_id", "node_id", "discovered", "proposed_verdict",
               "claim", "evidence_refs", "next_observation")
@@ -155,11 +168,7 @@ def validate_result(value: dict, *, attempt_id: str, node_id: str) -> dict:
         raise ContractError("Invalid discovery/evidence list")
     if value["proposed_verdict"] not in VERDICTS:
         raise ContractError("Invalid proposed verdict")
-    refs = []
-    for entry in evidence:
-        _object(entry, ("path", "description"))
-        refs.append({"path": evidence_path(entry["path"]),
-                     "description": _text(entry["description"], "evidence description", 2000, empty=True)})
+    refs = validate_evidence_refs(evidence)
     normalized = {"schema_version": SCHEMA_VERSION, "attempt_id": attempt_id, "node_id": node_id,
                   "discovered": [validate_discovery(item) for item in discoveries],
                   "proposed_verdict": value["proposed_verdict"],
@@ -167,6 +176,10 @@ def validate_result(value: dict, *, attempt_id: str, node_id: str) -> dict:
                   "next_observation": _text(value["next_observation"], "next observation", 4000, empty=True)}
     if "observations" in value:
         normalized["observations"] = observations(value["observations"])
+    captured_paths = {ref["path"] for ref in refs}
+    for discovery in normalized["discovered"]:
+        if any(ref["path"] not in captured_paths for ref in discovery.get("evidence_refs", [])):
+            raise ContractError("Discovery evidence must reference result evidence")
     if len(json.dumps(normalized, ensure_ascii=False).encode("utf-8")) > MAX_RESULT_BYTES:
         raise ContractError("Result is too large")
     return normalized
@@ -180,11 +193,15 @@ _LOCATOR = {"type": "object", "additionalProperties": False,
             "properties": {key: _TEXT for key in ("url", "method", "input", "auth_context", "route_template")}}
 _HYPOTHESIS = {"type": "object", "additionalProperties": False, "required": ["type", "statement"],
                "properties": {"type": _TEXT, "statement": _TEXT}}
+_EVIDENCE_REFS = {"type": "array", "maxItems": 50, "items": {
+    "type": "object", "additionalProperties": False, "required": ["path", "description"],
+    "properties": {"path": _TEXT, "description": _TEXT}}}
 DISCOVERY_SCHEMA = {"type": "object", "additionalProperties": False,
                     "required": ["kind", "relation", "locator", "hypothesis"],
                     "properties": {"kind": {"enum": ["surface", "candidate"]},
                                    "relation": {"enum": list(RELATIONS)}, "locator": _LOCATOR,
-                                   "hypothesis": {"anyOf": [_HYPOTHESIS, {"type": "null"}]}, "observations": OBSERVATIONS_SCHEMA},
+                                   "hypothesis": {"anyOf": [_HYPOTHESIS, {"type": "null"}]}, "observations": OBSERVATIONS_SCHEMA,
+                                   "evidence_refs": _EVIDENCE_REFS},
                     "oneOf": [{"properties": {"kind": {"const": "surface"}, "hypothesis": {"type": "null"}}},
                               {"properties": {"kind": {"const": "candidate"}, "hypothesis": _HYPOTHESIS}}]}
 RESULT_SCHEMA = {"type": "object", "additionalProperties": False,

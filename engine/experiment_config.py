@@ -18,6 +18,26 @@ _INTEGER_LIMITS = {"max_retries": (0, 5), "max_calls": (1, 500), "max_calls_per_
 _LOCAL_INTEGERS = {"num_ctx": (256, 1048576), "num_predict": (1, 131072)}
 
 
+def validate_seed_settings(raw, mode: str) -> dict:
+    """Validate seeding syntax; the run store checks source and target eligibility."""
+    from engine.session_log import validate_run_id
+
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict) or raw.keys() - {"start_mode", "seed_from", "carry", "reverify"}:
+        raise ValueError("Invalid seed_settings")
+    settings = {"start_mode": "fresh", "seed_from": "latest", "carry": "structure", "reverify": "lazy", **raw}
+    if settings["start_mode"] not in ("fresh", "seeded"):
+        raise ValueError("Invalid seed start_mode")
+    if settings["start_mode"] == "seeded" and mode != "v4":
+        raise ValueError("Seeding requires v4")
+    if settings["seed_from"] != "latest":
+        validate_run_id(settings["seed_from"])
+    if settings["carry"] != "structure" or settings["reverify"] not in ("lazy", "eager"):
+        raise ValueError("Invalid seed carry or reverify setting")
+    return settings
+
+
 class V4ExecutionUnavailable(RuntimeError):
     """The selected provider requires the later B adapter stage."""
 

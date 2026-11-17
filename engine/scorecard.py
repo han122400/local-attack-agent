@@ -1,7 +1,7 @@
 """Read-only quality scorecard for exploration runs.
 
-Scores each run under runs/<run_id>/ from its saved session.json (and events.jsonl for
-compaction counts). It never touches the lab, browser, Ollama, or the controller lease, so it is
+Scores v4 runs from their replayed events.jsonl and older runs from session.json findings.
+It never touches the lab, browser, Ollama, or the controller lease, so it is
 safe to run while an experiment is in progress — an in-flight run with a partial/locked session.json
 is simply skipped.
 
@@ -60,6 +60,66 @@ def _count_compactions(run_dir: Path) -> int | None:
         return None
 
 
+def _v4_metrics(session: dict, run_dir: Path) -> dict:
+    """Measure preserved observations, not model-authored vulnerability verdicts."""
+    from engine.tree import replay_tree
+    from engine.usage import summarize_usage
+    from engine.risk_rubric import fingerprint
+    from engine.session_log import LogFailure
+
+    unavailable = {key: None for key in ("steps", "evidence", "inconclusive", "failed", "repeats",
+                                         "unique_obs", "compactions", "score")}
+    saved_usage = session.get("v4_usage") or {}
+    unavailable.update(instrumented=False, metrics_version="v4-process-v1", metrics_error="unreadable_events",
+                       cost_usd=saved_usage.get("cost_usd"), known_cost_usd=saved_usage.get("known_cost_usd"),
+                       unknown_cost_requests=saved_usage.get("unknown_cost_requests"))
+    try:
+        path = run_dir / "events.jsonl"
+        if path.stat().st_size > 64 * 1024 * 1024:
+            return unavailable
+        with path.open(encoding="utf-8") as stream:
+            events = [json.loads(line) for line in stream if line.strip()]
+        state = replay_tree(events, session.get("run_id", run_dir.name))
+        if state["root_id"] is None:
+            return unavailable
+        costs = summarize_usage(events, state)
+    except (OSError, ValueError, KeyError, TypeError, RecursionError, LogFailure):
+        return unavailable
+
+    execution_calls = {item["call_id"] for item in state["executions"].values()}
+    attempts = [item for item in state["attempts"].values() if item["call_id"] in execution_calls]
+    steps, evidence, inconclusive, repeats = len(attempts), 0, 0, 0
+    seen = set()
+    for attempt in attempts:
+        if attempt["status"] != "imported" or attempt["execution_status"] != "succeeded":
+            continue
+        refs = [ref for ref in attempt["evidence_refs"] if ref.get("source") == "model_file" and ref["bytes"] > 0]
+        if not refs:
+            inconclusive += 1
+            continue
+        evidence += 1
+        identity = (attempt["node_id"], fingerprint(attempt["result"].get("observations", {})),
+                    tuple(sorted({ref["sha256"] for ref in refs})))
+        repeats += identity in seen
+        seen.add(identity)
+    failed_executions = {key for key, item in state["executions"].items()
+                         if "finish" in item and (item["finish"]["exit_code"] != 0
+                         or item["finish"]["timed_out"] or item["finish"]["cancelled"])}
+    failed = len(failed_executions) + sum(item["status"] == "failed" and item.get("exec_id") not in failed_executions
+                                         for item in attempts)
+    score = None
+    if steps:
+        score = round(SCORE_WEIGHTS["evidence_rate"] * evidence / steps
+            + SCORE_WEIGHTS["non_waste_rate"] * max(0, 1 - (repeats + inconclusive + failed) / steps)
+            + SCORE_WEIGHTS["clean_finish"] * (session.get("run_result") == "completed"), 3)
+    return {"metrics_version": "v4-process-v1", "metrics_error": None, "instrumented": True,
+            "steps": steps, "evidence": evidence, "inconclusive": inconclusive, "failed": failed,
+            "repeats": repeats, "unique_obs": len(seen), "score": score,
+            "compactions": sum(event["kind"] == "context_compacted" for event in events),
+            "cost_usd": costs["cost_usd"], "known_cost_usd": costs["known_cost_usd"],
+            "unknown_cost_requests": costs["unknown_cost_requests"]}
+
+
 def score_run(session: dict, run_dir: Path) -> dict:
     """Metrics for one run from its session dict. Pure; tolerant of missing/older fields."""
     findings = session.get("findings") or []
@@ -85,7 +145,7 @@ def score_run(session: dict, run_dir: Path) -> dict:
     started, finished = session.get("started_at"), session.get("finished_at")
     duration = round(finished - started) if isinstance(started, (int, float)) and isinstance(finished, (int, float)) else None
 
-    return {
+    metrics = {
         "run_id": session.get("run_id", run_dir.name),
         "model": session.get("model"),
         "num_ctx": _num_ctx(session),
@@ -105,6 +165,9 @@ def score_run(session: dict, run_dir: Path) -> dict:
         "cost_usd": session.get("cost_usd"),
         "score": round(score, 3),
     }
+    if session.get("experiment_mode") == "v4":
+        metrics.update(_v4_metrics(session, run_dir))
+    return metrics
 
 
 def load_runs(runs_root: Path = RUNS_ROOT) -> list[dict]:
@@ -153,11 +216,12 @@ def print_table(rows: list[dict]) -> None:
             value = row["run_id"][:12] if name == "run_id" else row.get(name)
             cells.append(_fmt(value, width))
         print("  ".join(cells))
-    scores = [r["score"] for r in rows]
+    scores = [r["score"] for r in rows if r["score"] is not None]
     print("-" * len(header))
     evless = sum(1 for r in rows if r["instrumented"] and r["clean_finish"] and r["evidence"] == 0)
     legacy = sum(1 for r in rows if not r["instrumented"])
-    print(f"runs={len(rows)}  score mean={statistics.mean(scores):.3f}"
+    mean = f"{statistics.mean(scores):.3f}" if scores else "-"
+    print(f"runs={len(rows)}  score mean={mean}"
           + (f"  stdev={statistics.pstdev(scores):.3f}" if len(scores) > 1 else "")
           + f"  evidence-less completed={evless} (of instrumented)"
           + (f"  ·  {legacy} legacy run(s) pre-evidence-flag" if legacy else ""))
@@ -195,13 +259,16 @@ def print_group(rows: list[dict], field: str) -> None:
     print(f"{'value':<28} {'n':>3} {'score mean':>11} {'stdev':>7} {'ev mean':>8} {'steps':>6} {'ev-less done':>12}")
     print("-" * 80)
     for value, group in sorted(buckets.items(), key=lambda kv: str(kv[0])):
-        scores = [r["score"] for r in group]
-        evid = [r["evidence"] for r in group]
-        steps = [r["steps"] for r in group]
+        scores = [r["score"] for r in group if r["score"] is not None]
+        evid = [r["evidence"] for r in group if r["evidence"] is not None]
+        steps = [r["steps"] for r in group if r["steps"] is not None]
         evless = sum(1 for r in group if r["instrumented"] and r["clean_finish"] and r["evidence"] == 0)
-        print(f"{str(value)[:28]:<28} {len(group):>3} {statistics.mean(scores):>11.3f} "
+        mean = f"{statistics.mean(scores):.3f}" if scores else "-"
+        ev_mean = f"{statistics.mean(evid):.1f}" if evid else "-"
+        step_mean = f"{statistics.mean(steps):.1f}" if steps else "-"
+        print(f"{str(value)[:28]:<28} {len(group):>3} {mean:>11} "
               f"{(statistics.pstdev(scores) if len(scores) > 1 else 0):>7.3f} "
-              f"{statistics.mean(evid):>8.1f} {statistics.mean(steps):>6.1f} {evless:>12}")
+              f"{ev_mean:>8} {step_mean:>6} {evless:>12}")
 
 
 def main(argv: list[str]) -> int:

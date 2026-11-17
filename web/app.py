@@ -29,7 +29,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.concurrency import run_in_threadpool
 
 import engine.scorecard as scorecard
-from engine.experiment_config import validate_experiment_config, require_execution_ready, V4ExecutionUnavailable, compatible_prompt
+from engine.experiment_config import validate_experiment_config, validate_seed_settings, require_execution_ready, V4ExecutionUnavailable, compatible_prompt
 
 
 TARGET = "http://127.0.0.1:3000/"
@@ -650,6 +650,7 @@ async def start(request: Request) -> dict:
             raise ValueError("실험 설정은 JSON 객체여야 합니다.")
         experiment = validate_experiment_config(body)
         require_execution_ready(experiment)
+        seed_settings = validate_seed_settings(body.get("seed_settings"), experiment["experiment_mode"])
         prompt_version = compatible_prompt(experiment["experiment_mode"], body.get("prompt_version"))
         from engine.policy import execution_settings
         v4_settings = execution_settings(body.get("v4_settings")) if experiment["experiment_mode"] == "v4" else None
@@ -680,7 +681,8 @@ async def start(request: Request) -> dict:
                 raise ValueError(f"선택한 모델의 출력 한도는 {info['max_completion_tokens']} 토큰입니다.")
         started = EXPLORER.start(target, model, goal=goal, model_settings=settings,
                                  scenario_source=scenario_source, chain_mode=chain_mode,
-                                 budgets=body.get("budgets"), prompt_version=prompt_version, v4_settings=v4_settings, **experiment)
+                                 budgets=body.get("budgets"), prompt_version=prompt_version, v4_settings=v4_settings,
+                                 seed_settings=seed_settings, **experiment)
     except V4ExecutionUnavailable as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
     except ValueError as exc:
@@ -832,6 +834,23 @@ def run_node(run_id: str, node_id: str) -> JSONResponse:
                         headers={"Cache-Control": "no-store"})
 
 
+@app.post("/api/runs/{run_id}/seed-dependency-review")
+async def review_seed_dependency(run_id: str, request: Request) -> dict:
+    check_origin(request)
+    try:
+        body = await request.json()
+        if (not isinstance(body, dict) or set(body) != {"child_id", "parent_id", "attempt_id", "evidence_ref", "reviewed"}
+                or body["reviewed"] is not True):
+            raise ValueError("Explicit evidence review is required")
+        node = EXPLORER.review_seed_dependency(run_id, body["child_id"], body["parent_id"],
+                                              body["attempt_id"], body["evidence_ref"])
+        return {"recorded": True, "node_id": node["id"]}
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.get("/api/runs/{run_id}/events")
 def run_events(run_id: str, after_seq: int = 0, limit: int = 250) -> JSONResponse:
     existing_run(run_id)
@@ -946,6 +965,22 @@ def run_file(run_id: str, source: str, path: str) -> JSONResponse:
                          "truncated": stat.st_size > 131072}, headers={"Cache-Control": "no-store"})
 
 
+@app.get("/api/runs/{run_id}/evidence-download")
+def download_evidence(run_id: str, path: str) -> Response:
+    """Download a bounded preserved artifact without rendering untrusted HTML."""
+    from engine.tree import MAX_EVIDENCE_BYTES, _read_bounded
+    root, available = run_file_root(run_id, "artifacts")
+    if not available:
+        raise HTTPException(status_code=410, detail="보존 증거가 없습니다.")
+    try:
+        body = _read_bounded(root, path, MAX_EVIDENCE_BYTES)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="증거 파일을 읽을 수 없습니다.") from exc
+    return Response(body, media_type="application/octet-stream", headers={
+        "Content-Disposition": 'attachment; filename="evidence.bin"',
+        "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
+
+
 @app.get("/api/runs/{run_id}/export")
 def run_export(run_id: str) -> Response:
     state = existing_run(run_id)
@@ -1035,11 +1070,32 @@ app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="dashboard")
 
 
 def main() -> None:
+    import argparse
+    import importlib.util
     import uvicorn
+    from engine.paths import PROJECT_ROOT
+
+    parser = argparse.ArgumentParser(description="Local Attack Agent dashboard")
+    parser.add_argument("--no-reload", action="store_true", help="코드 변경 시 서버 자동 재시작 끄기")
+    arguments = parser.parse_args()
+    reload = not arguments.no_reload
+    reload_options = {}
+    if reload:
+        if importlib.util.find_spec("watchfiles") is None:
+            parser.error("자동 재시작에는 watchfiles가 필요합니다. python -m pip install -r requirements.txt를 실행하세요.")
+        reload_options = {
+            "reload_dirs": [str(PROJECT_ROOT)],
+            "reload_includes": ["*.py", "prompts/system/*.txt"],
+            "reload_excludes": [str(PROJECT_ROOT / directory) for directory in
+                                ("runs", ".deps", ".venv", "venv", ".git", ".codex", ".agents", "tests")
+                                if (PROJECT_ROOT / directory).is_dir()],
+        }
 
     print(f"Dashboard: http://{DASHBOARD_HOST}:{DASHBOARD_PORT}/")
     print(f"Target: {TARGET} | Ollama: {MODEL}")
-    uvicorn.run(app, host=DASHBOARD_HOST, port=DASHBOARD_PORT, log_level="warning")
+    print("코드 변경 시 서버 자동 재시작: " + ("켜짐 (--no-reload로 끄기)" if reload else "꺼짐"))
+    uvicorn.run("web.app:app", host=DASHBOARD_HOST, port=DASHBOARD_PORT, log_level="warning",
+                app_dir=str(PROJECT_ROOT), reload=reload, **reload_options)
 
 
 if __name__ == "__main__":

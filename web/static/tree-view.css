@@ -1,0 +1,19 @@
+/* Node-link view: horizontal and vertical scrolling keep large trees legible. */
+.attack-tree-viewport{display:block;position:relative;overflow:auto;max-height:65vh;min-height:220px;border:1px solid var(--line);border-radius:10px;background-color:#121d1d;background-image:radial-gradient(#314441 1px,transparent 1px);background-size:20px 20px;scrollbar-color:#58736b #121d1d}
+.attack-tree-stage{position:relative;margin:0 auto}
+.attack-tree-lines{position:absolute;inset:0;pointer-events:none;overflow:visible}
+.attack-tree-line{fill:none;stroke:#6c9183;stroke-width:2}
+.attack-tree-line.secondary{stroke:#b59a68;stroke-dasharray:6 5;stroke-width:1.5}
+.attack-tree-node{position:absolute;display:flex;flex-direction:column;align-items:stretch;gap:7px;width:224px;height:132px;padding:12px 14px;border:1px solid #47645b;border-radius:10px;background:#203332;color:var(--text);text-align:left;box-shadow:0 5px 16px #0003;cursor:pointer;overflow:hidden}
+.attack-tree-node:hover{background:#2b4240;border-color:#88b9a5}
+.attack-tree-node[aria-pressed=true]{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent),0 5px 16px #0003}
+.attack-tree-node:focus-visible{outline:3px solid var(--accent);outline-offset:3px;z-index:2}
+.attack-tree-node-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.attack-tree-id{font:700 12px ui-monospace,Consolas,monospace;color:var(--accent)}
+.attack-tree-kind{font-size:11px;font-weight:700;letter-spacing:.01em;color:#cee3dc;background:#315047;padding:2px 7px;border-radius:99px;white-space:nowrap}
+.kind-candidate .attack-tree-kind{background:#56462e;color:#ffe0a5}.kind-root .attack-tree-kind{background:#315159;color:#c5e9eb}
+.attack-tree-route{font-size:13px;font-weight:700;line-height:1.3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.attack-tree-risk,.attack-tree-state{font-size:11px;line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.attack-tree-risk{color:#c4ddd2}.attack-tree-risk.is-stale{color:#f5cb82}.attack-tree-state{color:#aac0ba}
+.attack-tree-empty{padding:22px;color:var(--muted)}
+@media(max-width:600px){.attack-tree-viewport{max-height:55vh;min-height:200px}}

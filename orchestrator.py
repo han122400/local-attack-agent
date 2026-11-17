@@ -11,7 +11,7 @@ import uuid
 from dataclasses import asdict
 from pathlib import Path
 from engine.paths import RUNS_ROOT
-from engine.experiment_config import validate_experiment_config, require_execution_ready, compatible_prompt
+from engine.experiment_config import validate_experiment_config, validate_seed_settings, require_execution_ready, compatible_prompt
 from engine.contracts import SCHEMA_VERSION
 from engine.tree import TreeStore
 from urllib.parse import urlsplit
@@ -131,14 +131,28 @@ class ExplorerV3:
             finally:
                 self.lease.release()
 
+    def review_seed_dependency(self, run_id, child_id, parent_id, attempt_id, evidence_ref):
+        """Record an operator's review on the active run's single writer."""
+        validate_run_id(run_id)
+        with self.lock:
+            runtime = self._runtime
+            if (self.active_run_id != run_id or self.worker is None or not self.worker.is_alive()
+                    or runtime is None or runtime.log.run_id != run_id or runtime.log.metadata.get("phase") != "running"):
+                raise RuntimeError("Dependency review requires an active running session")
+            tree = TreeStore(runtime.log)
+            tree.record_seed_dependency_verification(child_id, parent_id, attempt_id, evidence_ref)
+            return tree.refresh()["nodes"][child_id]
+
     def start(self, target: str = TARGET, model: str = MODEL, *, goal: str = "Explore the local lab",
               model_settings: dict | None = None, scenario_source: str = "manual", chain_mode: str = "none",
               budgets: dict | None = None, prompt_version: str | None = None, experiment_mode: str = "v3",
               scorer_provider: str | None = None, scorer_model: str | None = None,
-              scorer_settings: dict | None = None, v4_settings: dict | None = None) -> str | bool:
+              scorer_settings: dict | None = None, v4_settings: dict | None = None,
+              seed_settings: dict | None = None) -> str | bool:
         experiment = validate_experiment_config({"experiment_mode": experiment_mode, "scorer_provider": scorer_provider,
                                                 "scorer_model": scorer_model, "scorer_settings": {} if scorer_settings is None else scorer_settings})
         require_execution_ready(experiment)
+        seed = validate_seed_settings(seed_settings, experiment_mode)
         from engine.policy import execution_settings
         execution = execution_settings(v4_settings) if experiment_mode == "v4" else None
         if scenario_source != "manual" or chain_mode != "none":
@@ -162,6 +176,14 @@ class ExplorerV3:
             if not ready:
                 self.lease.release()
                 raise RuntimeError(reason)
+            source = None
+            try:
+                if seed["start_mode"] == "seeded":
+                    from engine.seed_source import resolve_seed
+                    source = resolve_seed(self.store, seed["seed_from"], target)
+            except Exception:
+                self.lease.release()
+                raise
             self.stop_event.clear()
             run_id = uuid.uuid4().hex
             metadata = {"owner_instance_id": self.instance_id, "controller_pid": os.getpid(),
@@ -177,17 +199,44 @@ class ExplorerV3:
             if experiment_mode == "v4":
                 metadata.update(v4_stage="execution", execution_ready=True, v4_settings=execution,
                                 scorer_validation="syntax_only", tree_schema_version=SCHEMA_VERSION, result_schema_version=SCHEMA_VERSION)
+                metadata["seed_settings"] = seed
+                if source:
+                    metadata["seed_source"] = {key: source[key] for key in ("run_id", "last_event_seq", "schema_version",
+                        "source_creation_cost_usd", "source_unknown_cost_requests", "source_model_calls")}
             log = None
             try:
                 log = self.store.create(run_id, metadata)
                 log.append("run_created", {"owner_instance_id": self.instance_id, "goal": goal.strip()})
                 if experiment_mode == "v4":
                     log.append("v4_execution_created", {"configuration": metadata})
-                    TreeStore(log).initialize(target)
-            except Exception:
-                if log is not None:
-                    log.close()
-                self.lease.release()
+                    tree = TreeStore(log)
+                    tree.initialize(target)
+                    if source:
+                        from engine.seed import import_seed
+                        log.append("seed_started", {"source": metadata["seed_source"]})
+                        counts = import_seed(tree, source["state"], source["run_id"])
+                        for field in ("excluded_node_details", "excluded_path_details"):
+                            entries = counts.pop(field, [])
+                            for offset in range(0, len(entries), 100):
+                                log.append("seed_exclusions_recorded", {"type": field, "entries": entries[offset:offset + 100]})
+                        log.append("seed_completed", {"counts": counts})
+            except Exception as exc:
+                try:
+                    if log is not None:
+                        if source is not None and not log.failed:
+                            # The worker and runtime have not started. Preserve the
+                            # incomplete journal as a failed run without blocking
+                            # subsequent starts or treating it as a usable seed.
+                            log.append("seed_failed", {"error": str(exc)[:500]})
+                            log.update(phase="finished", run_result="error", finish_reason="seed_failed",
+                                       finished_at=time.time(), log_status="finalized",
+                                       cleanup_status="succeeded", lab_reset_status="not_applicable",
+                                       execution_ready=False)
+                            log.flush()
+                finally:
+                    if log is not None:
+                        log.close()
+                    self.lease.release()
                 raise
             self.active_run_id = run_id
             self._recent_state = {**metadata, "run_id": run_id, "status": "running", "phase": "preparing",
@@ -626,6 +675,12 @@ class ExplorerV3:
                     return True
                 result = metadata.get("run_result") or "interrupted"
                 reason = metadata.get("finish_reason") or "App exited during the run"
+                if metadata.get("experiment_mode") == "v4":
+                    from engine.seed_source import seed_import_status
+                    seed_status = seed_import_status(metadata, log.snapshot_events())
+                    if seed_status in ("incomplete", "failed"):
+                        result, reason = "incomplete", "seed_import_incomplete"
+                        log.update(seed_import_status=seed_status, execution_ready=False)
                 attempts = int(metadata.get("recovery_attempts", 0)) + 1
                 cleanup = "succeeded" if metadata.get("cleanup_status") == "succeeded" else "recovery_required"
                 log.update(run_result=result, cleanup_status=cleanup, phase="recovery_required",
