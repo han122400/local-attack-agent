@@ -222,7 +222,12 @@ class SessionLog:
                     raise ValueError("Artifact links and reparse points are not allowed")
             current = current.parent
 
-    def preserve_bytes(self, name: str, data: bytes) -> dict:
+    def preserve_bytes(self, name: str, data: bytes, *, optional: bool = False) -> dict:
+        """Preserve bytes; optional observer artifacts may fail without poisoning the journal.
+
+        Mandatory execution evidence retains the historical fail-stop behavior.
+        A failed optional artifact must never be referenced by an appended event.
+        """
         with self._lock:
             self._require_open()
             relative = safe_relative_path(name)
@@ -242,7 +247,8 @@ class SessionLog:
                 if path.stat().st_size != len(data) or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
                     raise OSError("Evidence verification failed")
             except Exception as exc:
-                self.failed = True
+                if not optional:
+                    self.failed = True
                 raise LogFailure(f"Evidence write failed: {exc}") from exc
             return {"path": (Path("artifacts") / saved_name).as_posix(), "bytes": len(data), "sha256": digest}
 

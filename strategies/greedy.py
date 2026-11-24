@@ -201,6 +201,42 @@ class V4Runner:
                               "model_calls": self.gate.budgets["model_calls"] - self.gate.usage()["model_calls"],
                               "node_attempts": max(0, self.settings["node_attempts"] - unproductive),
                               "node_tool_calls": max(0, self.settings["node_tool_calls"] - node_tools)}}
+        from engine.observation_verification import POLICIES, SHAPE_POLICY
+        policy = (state["scorer"].get("configuration") or {}).get("projection_version")
+        policy = policy or (self.log.metadata.get("scorer_settings") or {}).get("reevaluation_policy")
+        if policy in POLICIES:
+            value["http_capture"] = {
+                "passive_http": "For HTTP targets, proxy-aware clients are recorded without a request helper. "
+                "HARNESS_HTTP_CAPTURE_INDEX names an asynchronous JSON view of this exec's requests "
+                "(request_id and facts). It is a receipt lookup, not authoritative evidence. "
+                "Direct HTTPS outside audit_http/request remains unverified. Tools may bypass the proxy.",
+                "https_browser_audit": "Actual HTTPS browser response events produce visibility-only parsed "
+                "audit files, not literal evidence. They cannot support observations, scores, or verified reports. "
+                "For data-bearing HTTPS measurements that need verification, plan the request through audit_http "
+                "(run_python) or request (run_command) and cite its request_id. Do not use route.fetch or replay "
+                "state-changing requests merely to obtain capture proof.",
+                "python": "await audit_http(url, method='GET', headers={}, body=b'') returns request_id, status, body, json",
+                "command": "from http_capture_client import request; response = request(url, method='GET', headers={}, body=b'')",
+                "evidence": "Use observation_evidence[field] = {'request_ids': [response['request_id']]} for status. "
+                "For query_behavior/reproduced/baseline_compared use {'baseline': [id1,id2], 'test': [id3,id4], "
+                "'json_pointer': '/data'} for repeated GET JSON array counts with only the node input changed. "
+                "Unknown or uncaptured observations remain unverified. Supply evidence per discovery when applicable."}
+            if policy == SHAPE_POLICY:
+                value["http_capture"]["evidence"] += (
+                    " This policy also compares bounded JSON object keys, emptiness, and type at json_pointer; "
+                    "use an empty pointer for the root object. Reflected input keys and scalar values do not count.")
+            if node.get("origin") == "unverified_lead":
+                source = state["attempts"][node["source_attempt_id"]]
+                source_fields = source.get("observation_verification", {}).get("fields", {})
+                value["verification_task"] = {
+                    "source_attempt_id": node["source_attempt_id"],
+                    "capture_request_ids": node["capture_request_ids"],
+                    "claimed_signal": node["unverified_signal"],
+                    "source_check": source_fields.get(node["unverified_field"], {}),
+                    "instruction": "Investigate this unverified lead once. Use injected audit_http(url, params={...}) "
+                    "in run_python or http_capture_client.request(url, params={...}) in run_command. "
+                    "Repeat matched baseline and test requests, cite request_id values, and state what remains "
+                    "unverified. Do not treat the source claim as supported evidence."}
         while len(json.dumps(value, ensure_ascii=False)) > self.context_budget and (value["recent"] or value["parent_path"]):
             (value["recent"] if value["recent"] else value["parent_path"]).pop(0)
         while len(json.dumps(value, ensure_ascii=False)) > self.context_budget and previous and previous["evidence_refs"]:
@@ -485,6 +521,8 @@ class V4Runner:
             self.history.append({"node_id": node_id, "action": command.action, "exit_code": output.exit_code,
                                  "path": command.path if command.action in ("read_file", "write_file") else "",
                                  "stdout": output.stdout[-2500:], "stderr": output.stderr[-1000:]})
+            if getattr(output, "http_captures", None):
+                self.history[-1]["http_captures"] = output.http_captures[-16:]
             if not attempt:
                 continue
             try:
@@ -592,6 +630,9 @@ class V4Runner:
                 unproductive_reason = "no_progress_limit"
             self.log.append("v4_node_progress", {"node_id": node_id, "attempt_id": attempt["attempt_id"],
                 "progressed": progressed, "unproductive_results": unproductive, "tools_since_progress": node_tools})
+            if self.tree.state["nodes"][node_id].get("origin") == "unverified_lead":
+                complete, stop_reason = True, "verification_attempted"
+                break
             if imported["result"]["next_observation"].strip():
                 continue
             complete, stop_reason = True, "observations_complete"
@@ -649,11 +690,7 @@ class V4Runner:
                 # Operator-reviewed edges and stale propagation may change
                 # while another branch is being investigated. A previously
                 # deferred parent must then be reconsidered.
-                current_version = json.dumps([
-                    (key, item.get("seed_freshness"), item.get("seed_revalidation_pending"),
-                     item.get("seed_enabled_by_verified", {}), item.get("discovery_paths", []))
-                    for key, item in state["nodes"].items()
-                ], sort_keys=True)
+                current_version = state["seed_dependency_revision"]
                 if dependency_version is not None and current_version != dependency_version:
                     deferred.clear()
                 dependency_version = current_version

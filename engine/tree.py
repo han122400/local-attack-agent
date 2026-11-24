@@ -18,18 +18,32 @@ from engine.session_log import LogFailure, SessionLog, atomic_write_json, safe_r
 from engine.contracts import (SCHEMA_VERSION, MAX_RESULT_BYTES, MAX_EVIDENCE_BYTES, MAX_TOTAL_EVIDENCE_BYTES,
                           ContractError, dedup_key, normalize_url, validate_discovery, validate_id, validate_result)
 from engine.risk_rubric import observations
-from engine.followup import followup_candidates
+from engine.observation_verification import POLICIES, verify_observations
+from engine.followup import (UNVERIFIED_LEAD_HYPOTHESIS_TYPES, UNVERIFIED_LEAD_LIMIT, UNVERIFIED_LEAD_POLICY,
+                             followup_candidates, unverified_lead_candidates)
 from engine.scorer_state import SCORING_EVENTS, apply_scoring_event, empty_scorer, invalidate_risk, usage as scorer_usage
 
 
 _KINDS = {"tree_initialized", "node_discovered", "node_seeded", "node_seed_freshness_recorded", "node_seed_reinvestigation_requested", "node_seed_dependency_verified", "node_selected", "node_state_changed",
           "node_attempt_started", "node_result_imported", "node_observations_changed", "node_attempt_failed",
-          "node_verification_recorded", "node_investigation_finished", *SCORING_EVENTS}
+          "node_verification_recorded", "node_investigation_finished", "http_exchange_recorded", *SCORING_EVENTS}
+
+MAX_UNVERIFIED_LEADS_PER_RUN = UNVERIFIED_LEAD_LIMIT
+
+
+def _under_unverified_lead(state: dict, node: dict) -> bool:
+    while node is not None:
+        if node.get("origin") == "unverified_lead":
+            return True
+        node = state["nodes"].get(node["parent_id"]) if node.get("parent_id") else None
+    return False
 
 
 def _empty_state(run_id: str) -> dict:
+    # The dependency revision is the last event sequence that changed dependency state.
     return {"schema_version": SCHEMA_VERSION, "run_id": validate_run_id(run_id), "root_id": None,
-            "current_id": None, "last_event_seq": 0, "nodes": {}, "attempts": {}, "executions": {}, "scorer": empty_scorer()}
+            "current_id": None, "last_event_seq": 0, "seed_dependency_revision": 0,
+            "nodes": {}, "attempts": {}, "executions": {}, "scorer": empty_scorer()}
 
 
 def _digest(value: dict) -> str:
@@ -71,6 +85,10 @@ def investigation_gaps(state: dict) -> list[dict]:
                 continue
         elif node["investigation_state"] != "done":
             reason = node.get("investigation_reason") or "investigation_pending"
+        elif node.get("origin") == "unverified_lead":
+            # A verification lead is deliberately investigated once. A model's
+            # remaining suggestion cannot requeue it after that investigation.
+            continue
         elif previous is None:
             reason = "no_successful_observation"
         elif followup:
@@ -143,17 +161,23 @@ def _invalidate_seed_dependencies(state: dict, node_id: str, invalidation_seq: i
                     child["seed_dependency_invalidated_seqs"] = {path["parent_id"]: legacy_cutoff
                                                                 for path in child["discovery_paths"]}
                 child["seed_dependency_invalidated_seqs"][parent] = invalidation_seq
-                child.get("seed_enabled_by_verified", {}).pop(parent, None)
+                verified = child.get("seed_enabled_by_verified", {})
+                if parent in verified:
+                    verified.pop(parent)
+                    state["seed_dependency_revision"] = invalidation_seq
             if child["id"] in invalidated or _has_independent_seed_path(state, child["id"], invalidated):
                 continue
             invalidated.add(child["id"])
             queue.append(child["id"])
             if child.get("seeded"):
+                if child.get("seed_freshness") != "unknown" or child.get("seed_revalidation_pending") is not True:
+                    state["seed_dependency_revision"] = invalidation_seq
                 child["seed_freshness"] = "unknown"
                 child["seed_checked_fields"] = []
                 child["seed_dependency_invalidated_seq"] = invalidation_seq
                 child["seed_revalidation_pending"] = True
                 child["observations"] = observations({})
+                child.pop("observation_verification", None)
                 if child["exploration_state"] not in ("done", "blocked"):
                     invalidate_risk(child)
                     child["investigation_state"] = "pending"
@@ -184,8 +208,13 @@ def _response_status_evidence(data: bytes, target: str, method: str = "GET", aut
 
 
 def _invalidate_failed_seed_attempt(state: dict, node: dict, seq: int) -> None:
+    if node.pop("observation_verification", None) is not None:
+        _invalidate_children(state, node["parent_id"])
+        _invalidate_children(state, node["id"])
     if node.get("seeded"):
         _invalidate_seed_dependencies(state, node["id"], seq)
+        if node.get("seed_freshness") != "unknown":
+            state["seed_dependency_revision"] = seq
         node["seed_freshness"] = "unknown"
         node["seed_checked_fields"] = []
 
@@ -203,7 +232,10 @@ def _apply_seed_freshness(state: dict, payload: dict, seq: int) -> None:
             or attempt["execution_status"] != "succeeded" or ref not in attempt["evidence_refs"]):
         raise ContractError("Invalid seed freshness evidence")
     previous = node.get("seed_freshness_evidence", {}).get("response_status")
-    node["seed_freshness"] = "checked" if current == prior else "stale"
+    freshness = "checked" if current == prior else "stale"
+    if node.get("seed_freshness") != freshness or node.get("seed_revalidation_pending") is not False:
+        state["seed_dependency_revision"] = seq
+    node["seed_freshness"] = freshness
     node["seed_checked_fields"] = ["response_status"]
     node["seed_freshness_evidence"] = {"attempt_id": attempt["attempt_id"], "evidence_ref": ref,
                                        "response_status": current}
@@ -236,13 +268,16 @@ def _discover(state: dict, parent_id: str, discovery: dict) -> str:
         if existing["dedup_key"] == key:
             if link not in existing["discovery_paths"]:
                 existing["discovery_paths"].append(link)
+                state["seed_dependency_revision"] = state["last_event_seq"] + 1
             if "observations" in discovery and existing["observations"] != discovery["observations"]:
                 existing["observations"] = discovery["observations"]
+                existing.pop("observation_verification", None)
                 _invalidate_children(state, existing["parent_id"])
                 _invalidate_children(state, existing["id"])
             return existing["id"]
     node_id = f"N{len(state['nodes']) + 1:04d}"
     state["nodes"][node_id] = _node(node_id, parent_id, discovery)
+    state["seed_dependency_revision"] = state["last_event_seq"] + 1
     parent["child_ids"].append(node_id)
     _invalidate_children(state, parent_id)
     return node_id
@@ -314,15 +349,36 @@ def _apply(state: dict, event: dict) -> None:
                                  "auth_context": "anonymous"}}
         state["root_id"] = state["current_id"] = "N0001"
         state["nodes"]["N0001"] = _node("N0001", None, discovery)
+        state["seed_dependency_revision"] = event["seq"]
     elif state["root_id"] is None:
         raise ContractError("Tree has not been initialized")
     elif kind in SCORING_EVENTS:
         apply_scoring_event(state, kind, payload)
+    elif kind == "http_exchange_recorded":
+        attempt = state["attempts"][payload["attempt_id"]]
+        execution = state["executions"].get(event.get("exec_id"))
+        facts_schema = payload.get("facts_schema", 1)
+        if (attempt["status"] != "pending" or payload["node_id"] != attempt["node_id"]
+                or event.get("call_id") != attempt["call_id"] or execution is None
+                or execution["call_id"] != attempt["call_id"] or "finish" in execution
+                or not re.fullmatch(r"R[0-9a-f]{32}", payload["request_id"])
+                or type(facts_schema) is not int or facts_schema not in (1, 2)):
+            raise ContractError("Invalid HTTP capture attribution")
+        captures = state.setdefault("http_exchanges", {})
+        if payload["request_id"] in captures:
+            raise ContractError("Duplicate HTTP capture identity")
+        for side in ("request", "response"):
+            ref = _artifact_ref(payload[side])
+            if ref.get("source") != "harness_http":
+                raise ContractError("Invalid HTTP capture source")
+            state["nodes"][attempt["node_id"]]["evidence_refs"].append(ref)
+        captures[payload["request_id"]] = {**copy.deepcopy(payload), "exec_id": event["exec_id"]}
     elif kind == "node_observations_changed":
         node = state["nodes"][payload["node_id"]]
         value = observations(payload["observations"])
         if value != node["observations"]:
             node["observations"] = value
+            node.pop("observation_verification", None)
             _invalidate_children(state, node["parent_id"])
             _invalidate_children(state, node["id"])
     elif kind == "node_discovered":
@@ -337,6 +393,7 @@ def _apply(state: dict, event: dict) -> None:
         prior = observations(payload["observations"])
         node.update(seeded=True, carried_from={"run_id": source_run, "orig_node_id": source_node},
                     seed_prior_observations=prior, seed_freshness="unknown", observations=prior)
+        state["seed_dependency_revision"] = event["seq"]
         if reused:
             node["investigation_state"] = "reused"
     elif kind == "node_seed_reinvestigation_requested":
@@ -361,8 +418,12 @@ def _apply(state: dict, event: dict) -> None:
                 or evidence not in attempt["evidence_refs"]):
             raise ContractError("Invalid operator-reviewed dependency evidence")
         _artifact_ref(evidence)
-        child.setdefault("seed_enabled_by_verified", {})[parent_id] = {
-            "source": "operator_reviewed", "attempt_id": attempt["attempt_id"], "evidence_ref": copy.deepcopy(evidence)}
+        approval = {"source": "operator_reviewed", "attempt_id": attempt["attempt_id"],
+                    "evidence_ref": copy.deepcopy(evidence)}
+        verified = child.setdefault("seed_enabled_by_verified", {})
+        if verified.get(parent_id) != approval:
+            state["seed_dependency_revision"] = event["seq"]
+        verified[parent_id] = approval
     elif kind == "node_seed_freshness_recorded":
         _apply_seed_freshness(state, payload, event["seq"])
     elif kind == "node_selected":
@@ -458,6 +519,19 @@ def _apply(state: dict, event: dict) -> None:
                        result_ref=result_ref, evidence_refs=refs, result=result,
                        imported_seq=event["seq"], import_digest=digest)
         node = state["nodes"][attempt["node_id"]]
+        if "observation_policy" in payload:
+            if payload["observation_policy"] not in POLICIES:
+                raise ContractError("Unknown observation verification policy")
+            records = {key: item for key, item in state.get("http_exchanges", {}).items()
+                       if item["attempt_id"] == attempt["attempt_id"] and item["exec_id"] == event["exec_id"]}
+            if status != "succeeded":
+                records = {}
+            verified = verify_observations(result, node["locator"], records,
+                                           policy=payload["observation_policy"])
+            node["observation_verification"] = verified
+            attempt["observation_verification"] = copy.deepcopy(verified)
+            _invalidate_children(state, node["parent_id"])
+            _invalidate_children(state, node["id"])
         if "observations" in result and (status == "succeeded" or not node.get("seeded")):
             if node["observations"] != result["observations"]:
                 node["observations"] = result["observations"]
@@ -469,23 +543,84 @@ def _apply(state: dict, event: dict) -> None:
                                 "verdict": "inconclusive", "reason": "no_automatic_verdict",
                                 "source": "model_claim", "attempt_id": attempt["attempt_id"], "policy_version": None,
                                 "next_observation": result["next_observation"]}
+        lead_markers = payload.get("unverified_leads", [])
+        if "unverified_lead_policy" in payload or "unverified_leads" in payload:
+            if (payload.get("unverified_lead_policy") != UNVERIFIED_LEAD_POLICY
+                    or payload.get("observation_policy") not in POLICIES or status != "succeeded"
+                    or not isinstance(lead_markers, list) or not lead_markers
+                    or len(lead_markers) > UNVERIFIED_LEAD_LIMIT
+                    or sum(item.get("origin") == "unverified_lead" for item in state["nodes"].values())
+                    + len(lead_markers) > UNVERIFIED_LEAD_LIMIT):
+                raise ContractError("Invalid unverified lead policy")
+        markers_by_key = {}
+        for marker in lead_markers:
+            if (not isinstance(marker, dict) or set(marker) != {"candidate_key", "signal", "field", "capture_request_ids"}
+                    or not isinstance(marker["candidate_key"], str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", marker["candidate_key"])
+                    or marker["candidate_key"] in markers_by_key
+                    or marker["field"] not in ("security_signal", "query_behavior")
+                    or marker["signal"] != result["observations"].get(marker["field"])
+                    or (marker["field"] == "query_behavior" and marker["signal"] != "controlled_difference")
+                    or marker["signal"] not in UNVERIFIED_LEAD_HYPOTHESIS_TYPES
+                    or (marker["field"] == "security_signal" and marker["signal"] == "controlled_difference")
+                    or node["kind"] != "surface" or _under_unverified_lead(state, node)
+                    or node["observation_verification"]["fields"].get(marker["field"], {}).get("state")
+                    not in ("unsupported", "contradicted")
+                    or marker["capture_request_ids"] != sorted(records)):
+                raise ContractError("Invalid unverified lead provenance")
+            markers_by_key[marker["candidate_key"]] = marker
         if status == "succeeded":
             for discovery in result["discovered"]:
+                marker = (markers_by_key.get(dedup_key(discovery))
+                          if markers_by_key and discovery["kind"] == "candidate" else None)
+                if marker and ("observations" in discovery or discovery.get("evidence_refs")
+                               or discovery["hypothesis"]["type"] != UNVERIFIED_LEAD_HYPOTHESIS_TYPES[marker["signal"]]
+                               or dedup_key(discovery) in {item["dedup_key"] for item in state["nodes"].values()}):
+                    raise ContractError("Unverified lead must be a new unknown candidate")
                 child_id = _discover(state, node["id"], discovery)
                 child = state["nodes"][child_id]
+                if marker:
+                    child.update(origin="unverified_lead", source_attempt_id=attempt["attempt_id"],
+                                 capture_request_ids=list(marker["capture_request_ids"]),
+                                 unverified_signal=marker["signal"], unverified_field=marker["field"])
+                    del markers_by_key[marker["candidate_key"]]
+                if payload.get("observation_policy") in POLICIES and "observations" in discovery:
+                    child["observation_verification"] = verify_observations(
+                        discovery, child["locator"], records, policy=payload["observation_policy"])
+                    _invalidate_children(state, child["parent_id"])
+                    _invalidate_children(state, child_id)
                 paths = {ref["path"] for ref in discovery.get("evidence_refs", [])}
                 # Only explicitly attributed, captured evidence belongs to the
                 # child. Parent evidence must not leak into unrelated siblings.
                 for ref in refs:
                     if ref.get("runtime_path") in paths and ref not in child["evidence_refs"]:
                         child["evidence_refs"].append(copy.deepcopy(ref))
+            if markers_by_key:
+                raise ContractError("Unverified lead discovery is missing")
             review_ref = payload.get("seed_revalidation_evidence")
+            if payload.get("observation_policy") in POLICIES and node.get("seeded"):
+                from engine.observation_verification import _matches
+                matching = [record for record in records.values()
+                            if _matches(record["facts"], node["locator"])
+                            and record["facts"]["url"] == node["locator"]["url"]]
+                if matching and len({record["facts"]["status"] for record in matching}) == 1:
+                    record = matching[-1]
+                    if (node.get("seed_revalidation_pending") and not result["next_observation"].strip()
+                            and attempt["started_seq"] > node.get("seed_dependency_invalidated_seq", 0)):
+                        node["seed_revalidation_pending"] = False
+                        state["seed_dependency_revision"] = event["seq"]
+                    if (node["locator"]["method"] == "GET" and node["locator"]["auth_context"] == "anonymous"
+                            and type(node.get("seed_prior_observations", {}).get("response_status")) is int):
+                        attempt["evidence_refs"].append(record["response"])
+                        _apply_seed_freshness(state, {"node_id": node["id"], "attempt_id": attempt["attempt_id"],
+                            "response_status": record["facts"]["status"], "evidence_ref": record["response"]}, event["seq"])
             if review_ref is not None and (not isinstance(review_ref, dict) or review_ref not in refs
                                            or review_ref.get("source") != "model_file"):
                 raise ContractError("Invalid seed revalidation evidence")
             if (node.get("seed_revalidation_pending") and review_ref and not result["next_observation"].strip()
                     and attempt["started_seq"] > node.get("seed_dependency_invalidated_seq", 0)):
                 node["seed_revalidation_pending"] = False
+                state["seed_dependency_revision"] = event["seq"]
             if "seed_freshness" in payload:
                 _apply_seed_freshness(state, {"node_id": node["id"], "attempt_id": attempt["attempt_id"],
                                              **payload["seed_freshness"]}, event["seq"])
@@ -737,16 +872,45 @@ class TreeStore:
             # Enrich only an explicitly matching surface's candidate. Root facts
             # and unrelated locations must never be copied to new children.
             node = self._state["nodes"][attempt["node_id"]]
+            policy = (self._state["scorer"].get("configuration") or {}).get("projection_version")
+            policy = policy or (self.log.metadata.get("scorer_settings") or {}).get("reevaluation_policy")
+            records = []
+            verified = None
+            if policy in POLICIES:
+                from engine.http_capture import check_capture_records
+                records = [record for record in self._state.get("http_exchanges", {}).values()
+                           if record["attempt_id"] == attempt_id and record["exec_id"] == exec_id]
+                check_capture_records(self.log.run_dir, records)
+                verified = verify_observations(result, node["locator"],
+                                               {record["request_id"]: record for record in records}, policy=policy)
             if status == "succeeded" and node["kind"] == "surface":
                 for discovery in result["discovered"]:
                     if (discovery["kind"] == "candidate"
                             and dedup_key({**discovery, "kind": "surface", "hypothesis": None}) == node["dedup_key"]):
                         if "observations" in result:
                             discovery.setdefault("observations", copy.deepcopy(result["observations"]))
+                        if "observation_evidence" in result:
+                            discovery.setdefault("observation_evidence", copy.deepcopy(result["observation_evidence"]))
                         discovery.setdefault("evidence_refs", copy.deepcopy(result["evidence_refs"]))
-            followups = followup_candidates(node, result) if status == "succeeded" else []
+            followup_input = result
+            if verified is not None:
+                supported_facts = {field: value for field, value in result.get("observations", {}).items()
+                                   if verified["fields"].get(field, {}).get("state") == "supported"
+                                   and verified["fields"][field].get("value") == value}
+                followup_input = {**result, "observations": supported_facts}
+            followups = followup_candidates(node, followup_input) if status == "succeeded" else []
             followups = followups[:max(0, 100 - len(result["discovered"]))]
             result["discovered"].extend(followups)
+            lead_suggestions = []
+            if (status == "succeeded" and policy in POLICIES and not _under_unverified_lead(self._state, node)):
+                remaining = min(MAX_UNVERIFIED_LEADS_PER_RUN - sum(
+                    item.get("origin") == "unverified_lead" for item in self._state["nodes"].values()),
+                    100 - len(result["discovered"]))
+                if remaining > 0:
+                    lead_suggestions = unverified_lead_candidates(
+                        node, result, verified,
+                        existing_keys={item["dedup_key"] for item in self._state["nodes"].values()})[:remaining]
+                    result["discovered"].extend(item["discovery"] for item in lead_suggestions)
             for discovery in result["discovered"]:
                 # Absent attribution is a legacy journal convention only. New
                 # discoveries without a binding cannot borrow all parent files.
@@ -761,19 +925,27 @@ class TreeStore:
             result.pop("evidence_refs")
             payload = {"attempt_id": attempt_id, "execution_status": status,
                        "result": result, "result_ref": result_ref, "evidence_refs": refs}
+            if policy in POLICIES:
+                payload["observation_policy"] = policy
+            if lead_suggestions:
+                payload["unverified_lead_policy"] = UNVERIFIED_LEAD_POLICY
+                payload["unverified_leads"] = [{"candidate_key": dedup_key(item["discovery"]),
+                                                "signal": item["signal"], "field": item["field"],
+                                                "capture_request_ids": sorted(record["request_id"] for record in records)}
+                                               for item in lead_suggestions]
             if followups:
                 payload["followup_policy"] = "observed-security-signal-v1"
                 payload["generated_candidate_count"] = len(followups)
             node = self._state["nodes"][attempt["node_id"]]
             prior = node.get("seed_prior_observations", {}).get("response_status")
-            if status == "succeeded" and node.get("seed_revalidation_pending") and not result["next_observation"].strip():
+            if policy not in POLICIES and status == "succeeded" and node.get("seed_revalidation_pending") and not result["next_observation"].strip():
                 locator = node["locator"]
                 matched = [(ref, _response_status_evidence(data, locator["url"], locator["method"], locator["auth_context"]))
                            for ref, (_, data) in zip(refs, captured)]
                 matched = [(ref, value) for ref, value in matched if value is not None]
                 if matched and len({value for _, value in matched}) == 1:
                     payload["seed_revalidation_evidence"] = matched[0][0]
-            if (status == "succeeded" and node.get("seeded") and type(prior) is int
+            if (policy not in POLICIES and status == "succeeded" and node.get("seeded") and type(prior) is int
                     and node["locator"]["method"] == "GET" and node["locator"]["auth_context"] == "anonymous"):
                 matched = [(ref, _response_status_evidence(data, node["locator"]["url"]))
                            for ref, (_, data) in zip(refs, captured)]
@@ -810,6 +982,12 @@ class TreeStore:
     def rebuild(self) -> dict:
         with self.log.locked_writer():
             state = replay_tree(self.log.snapshot_events(), self.log.run_id)
+            if state.get("http_exchanges"):
+                from engine.http_capture import check_capture_records
+                try:
+                    check_capture_records(self.log.run_dir, state["http_exchanges"].values())
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    raise LogFailure("Cannot verify captured tree evidence") from exc
             if state["root_id"] is None:
                 raise LogFailure("Tree initialization event is missing")
             for node in state["nodes"].values():

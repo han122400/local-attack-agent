@@ -6,7 +6,7 @@ import copy
 import time
 
 from engine.decision_provider import LocalOllamaScorer, OpenRouterDecisions, ProviderError, estimated_cost, utc_now
-from engine.risk_rubric import CONTRACT_VERSION, PROJECTION_VERSION, RUBRIC_VERSION, fingerprint
+from engine.risk_rubric import CONTRACT_VERSION, RUBRIC_VERSION, fingerprint
 from engine.scorer_state import (ORDINAL_CONTRACT_VERSION, SETTINGS_VERSION, context, effective_settings,
                           outcomes, score_request, scoring_request_bytes, usage)
 from engine.contracts import ContractError
@@ -55,7 +55,7 @@ class RiskScorer:
         provider = self.log.metadata["scorer_provider"]
         configuration = {"provider": provider, "model_pin": pin, "settings": settings,
                          "settings_version": SETTINGS_VERSION,
-                         "rubric_version": RUBRIC_VERSION, "projection_version": PROJECTION_VERSION,
+                         "rubric_version": RUBRIC_VERSION, "projection_version": settings["reevaluation_policy"],
                          "contract_version": ORDINAL_CONTRACT_VERSION if provider == "local" else CONTRACT_VERSION,
                          "catalog_elapsed_seconds": self.clock() - started}
         self.tree.record_scoring("scorer_configured", configuration)
@@ -97,6 +97,13 @@ class RiskScorer:
 
     def score_children(self, parent_id: str, *, include_completed=False, reserve_final=False) -> dict:
         tree = self.tree.refresh()
+        if tree.get("http_exchanges"):
+            from engine.http_capture import check_capture_records
+            from engine.session_log import LogFailure
+            try:
+                check_capture_records(self.log.run_dir, tree["http_exchanges"].values())
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise LogFailure("Cannot verify captured scoring evidence") from exc
         if tree["scorer"]["halt"]:
             return self._stop(tree["scorer"]["halt"]["reason"], persist=False)
         if parent_id not in tree["nodes"]:

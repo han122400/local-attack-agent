@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from engine.paths import PROJECT_ROOT
 from urllib.parse import urlsplit
@@ -133,8 +133,11 @@ async def main():
         options = {"headless": True}
         if executable:
             options["executable_path"] = executable
+        if os.environ.get("HARNESS_HTTP_PROXY"):
+            options["proxy"] = {"server": os.environ["HARNESS_HTTP_PROXY"], "bypass": "<-loopback>"}
         browser = await playwright.chromium.launch(**options)
-        context = await browser.new_context(service_workers="block", accept_downloads=False)
+        context = await browser.new_context(service_workers="block", accept_downloads=False,
+            ignore_https_errors=os.environ.get("HARNESS_MITM_OPT_IN") == "1")
         async def guard(route):
             request = route.request
             parts = urlsplit(request.url)
@@ -145,6 +148,15 @@ async def main():
             else:
                 await route.abort()
         await context.route("**/*", guard)
+        browser_audit = None
+        audit_initialization_error = None
+        if target_parts.scheme == "https":
+            try:
+                sys.path.insert(0, str(project))
+                from engine.browser_observation import BrowserObservationBuffer
+                browser_audit = BrowserObservationBuffer(context, target)
+            except Exception as exc:
+                audit_initialization_error = str(exc)[:500]
         page = await context.new_page()
         target_origin = target_parts.scheme + "://" + target_parts.netloc
         def _same_origin(url):
@@ -253,6 +265,15 @@ async def main():
                 source = Path(message["path"])
                 limit = message.get("timeout")
                 timed_out = False
+                audit_records, audit_warnings = [], []
+                if message.get("browser_audit"):
+                    if browser_audit is not None:
+                        try:
+                            browser_audit.begin(exec_id)
+                        except Exception as exc:
+                            audit_warnings.append(str(exc)[:500])
+                    elif audit_initialization_error:
+                        audit_warnings.append(audit_initialization_error)
                 failure_source, cause_code, exception_type = None, None, None
                 with open(message["stdout_path"], "w", encoding="utf-8", buffering=1) as out, \
                      open(message["stderr_path"], "w", encoding="utf-8", buffering=1) as err:
@@ -261,6 +282,14 @@ async def main():
                             namespace = {"__name__": "__agent__", "__file__": str(source),
                                          "browser": browser, "context": context, "page": page,
                                          "asyncio": asyncio, **helpers}
+                            if message.get("http_capture_endpoint"):
+                                sys.path.insert(0, str(project / "engine"))
+                                from http_capture_client import async_helpers
+                                namespace.update(async_helpers(message["http_capture_endpoint"]))
+                            if message.get("http_capture_index"):
+                                os.environ["HARNESS_HTTP_CAPTURE_INDEX"] = message["http_capture_index"]
+                            else:
+                                os.environ.pop("HARNESS_HTTP_CAPTURE_INDEX", None)
                             tree = ast.parse(source.read_text(encoding="utf-8"), str(source))
                             # If the code already calls main() at top level, do not auto-call it again;
                             # otherwise the user's main ran twice and its output was duplicated.
@@ -300,11 +329,22 @@ async def main():
                             exit_code = 1
                         out.flush()
                         err.flush()
+                if browser_audit is not None:
+                    try:
+                        audit_records = await browser_audit.finish(exec_id)
+                    except Exception as exc:
+                        audit_warnings.append(str(exc)[:500])
                 send(sock, {"type": "result", "exec_id": exec_id, "exit_code": exit_code,
+                            "browser_observations": audit_records, "browser_audit_warnings": audit_warnings,
                             "timed_out": timed_out, "exception": detail[-4000:],
                             "failure_source": failure_source, "cause_code": cause_code,
                             "exception_type": exception_type})
         finally:
+            if browser_audit is not None:
+                try:
+                    await browser_audit.close()
+                except Exception:
+                    pass
             await context.close()
             await browser.close()
             sock.close()
@@ -328,6 +368,8 @@ class ExecutionResult:
     cancelled: bool = False
     output_truncated: bool = False
     artifact_path: str = ""
+    http_captures: list = field(default_factory=list)
+    capture_warnings: list = field(default_factory=list)
     failure_source: str | None = None
     cause_code: str | None = None
     exception_type: str | None = None
@@ -335,7 +377,10 @@ class ExecutionResult:
 
 
 class CommandRuntime:
-    def __init__(self, runs_root: Path, log: SessionLog, *, python: str | None = None):
+    def __init__(self, runs_root: Path, log: SessionLog, *, python: str | None = None,
+                 mitm_capture: bool = False):
+        if type(mitm_capture) is not bool:
+            raise TypeError("mitm_capture must be an explicit boolean")
         self.log = log
         self.run_id = log.run_id
         self.runtime_dir = Path(runs_root).resolve() / self.run_id / "runtime"
@@ -356,6 +401,14 @@ class CommandRuntime:
         self._exec_counter = 0
         self._browser_enabled = False
         self.target = "http://127.0.0.1:3000/"
+        self._http_capture = None
+        self._http_proxy = None
+        self._proxy_start_error = None
+        self._mitm_opt_in = mitm_capture
+        self._mitm_proxy = None
+        self._mitm_ca_bundle = None
+        self._capture_receipt_path = None
+        self._browser_proxy_changed = False
 
     def _check_run(self, run_id: str) -> None:
         if validate_run_id(run_id) != self.run_id:
@@ -364,11 +417,32 @@ class CommandRuntime:
     def _environment(self) -> dict:
         env = dict(os.environ)
         env.pop("OPENROUTER_API_KEY", None)
+        for name in ("HARNESS_HTTP_PROXY", "HARNESS_MITM_OPT_IN", "HARNESS_HTTP_ENDPOINT", "HARNESS_HTTP_CAPTURE_INDEX"):
+            env.pop(name, None)
         temporary = self.runtime_dir / "tmp"
         env.update({"TEMP": str(temporary), "TMP": str(temporary), "TMPDIR": str(temporary),
                     "PIP_CACHE_DIR": str(temporary / "pip-cache"),
                     "PYTHONPYCACHEPREFIX": str(temporary / "pycache"),
                     "npm_config_cache": str(temporary / "npm-cache")})
+        if self._http_capture is not None:
+            env["HARNESS_HTTP_ENDPOINT"] = self._http_capture.endpoint
+            env["PYTHONPATH"] = str(PROJECT_ROOT / "engine") + os.pathsep + env.get("PYTHONPATH", "")
+        proxy = self._mitm_proxy or self._http_proxy
+        if proxy is not None:
+            address = proxy.address
+            env["HARNESS_HTTP_PROXY"] = address
+            # Do not redirect FTP/SOCKS/other protocols into an HTTP observer.
+            # Existing ALL_PROXY settings belong to those clients and are retained.
+            for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                env[name] = address
+            # Local targets must also use the observer. Clients may still opt out.
+            env["NO_PROXY"] = env["no_proxy"] = ""
+        if self._mitm_proxy is not None:
+            env["HARNESS_MITM_OPT_IN"] = "1"
+            for name in ("SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO", "NODE_EXTRA_CA_CERTS"):
+                env[name] = str(self._mitm_ca_bundle)
+        if self._capture_receipt_path is not None:
+            env["HARNESS_HTTP_CAPTURE_INDEX"] = str(self._capture_receipt_path)
         return env
 
     def start_session(self, run_id: str, *, target: str = "http://127.0.0.1:3000/", browser: bool = True) -> None:
@@ -381,6 +455,29 @@ class CommandRuntime:
             for folder in ("tools", "work", "tmp", "deps", "browser"):
                 (self.runtime_dir / folder).mkdir(parents=True, exist_ok=True)
             self.log.append("runtime_started", {"runtime_path": str(self.runtime_dir)})
+            from engine.observation_verification import POLICIES
+            policy = (self.log.metadata.get("scorer_settings") or {}).get("reevaluation_policy")
+            if self._mitm_opt_in and self.log.metadata.get("experiment_mode") == "v4" and policy in POLICIES:
+                self.log.append("http_capture_opt_in", {
+                    "mode": "mitm", "first_tls_failure_possible": True,
+                    "representation": "reconstructed", "verification_eligible": False})
+                try:
+                    from engine.http_mitm_capture import OptionalMitmProxy
+                    self._mitm_proxy = OptionalMitmProxy(target, self._record_mitm_exchange, self.log.run_dir / "_ca")
+                    self._mitm_ca_bundle = self._build_mitm_bundle(self._mitm_proxy.ca_file)
+                except Exception as exc:
+                    if self._mitm_proxy is not None:
+                        self._mitm_proxy.close()
+                        self._mitm_proxy = None
+                    self._proxy_start_error = f"MITM capture unavailable: {type(exc).__name__}: {exc}"
+            if (self.log.metadata.get("experiment_mode") == "v4" and policy in POLICIES
+                    and urlsplit(target).scheme == "http" and self._mitm_proxy is None):
+                try:
+                    from engine.http_proxy_capture import PlainHttpProxy
+                    self._http_proxy = PlainHttpProxy(target, self._record_proxy_exchange)
+                except Exception as exc:
+                    # A missing observer must not make code or HTTP execution fail.
+                    self._proxy_start_error = f"{type(exc).__name__}: {exc}"
             self._browser_enabled = browser
             if browser:
                 self._start_browser_worker()
@@ -640,6 +737,47 @@ class CommandRuntime:
                 if remaining:
                     self._add_output(exec_id, channel, remaining)
 
+    @staticmethod
+    def _record_proxy_exchange(request, response, url, binding):
+        binding.record(request, response, url)
+
+    @staticmethod
+    def _record_mitm_exchange(observation, binding):
+        binding.record(observation)
+
+    def _preserve_browser_audit(self, reply, sink, result):
+        """Worker data is visibility-only; this method has no literal-record sink."""
+        observations = reply.get("browser_observations", [])
+        if not isinstance(observations, list):
+            return
+        expected = urlsplit(self.target)
+        for observation in observations[:32]:
+            if not isinstance(observation, dict) or observation.get('representation') != 'playwright_decoded':
+                continue
+            try:
+                actual = urlsplit(observation['request']['url'])
+                if (actual.scheme, actual.netloc) != (expected.scheme, expected.netloc):
+                    continue
+                sink.record(observation)
+            except Exception as exc:
+                result.capture_warnings.append(f"Browser audit omitted: {type(exc).__name__}: {exc}"[:500])
+        warnings = reply.get('browser_audit_warnings', [])
+        if isinstance(warnings, list):
+            result.capture_warnings.extend(str(warning)[:500] for warning in warnings[:4])
+
+    def _build_mitm_bundle(self, ca_file):
+        import ssl
+        chunks = [ssl.DER_cert_to_PEM_cert(cert).encode('ascii')
+                  for cert in ssl.create_default_context().get_ca_certs(binary_form=True)]
+        for name in ("SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO", "NODE_EXTRA_CA_CERTS"):
+            existing = os.environ.get(name)
+            if existing and Path(existing).is_file():
+                chunks.append(Path(existing).read_bytes())
+        chunks.append(Path(ca_file).read_bytes())
+        destination = self.log.run_dir / '_ca' / 'sandbox-trust.pem'
+        destination.write_bytes(b'\n'.join(chunks))
+        return destination
+
     def _run_command(self, command: str, exec_id: str, timeout: float) -> int:
         # cmd.exe parses /C with its own quote rules. Passing the command as a
         # list argument applies C-runtime backslash escaping, which corrupts
@@ -684,10 +822,55 @@ class CommandRuntime:
         result = ExecutionResult(exec_id=exec_id, action=action)
         stage = "input"
         began = time.monotonic()
+        proxy_token = None
+        proxy_sink = None
+        mitm_token = None
+        browser_audit_sink = None
+        if self._proxy_start_error:
+            result.capture_warnings.append(self._proxy_start_error)
         self._call_by_exec[exec_id] = call_id
         self.log.append("exec_started", {"exec_id": exec_id, "call_id": call_id, "action": action,
                                          "cwd": str(self.runtime_dir)})
         try:
+            from engine.observation_verification import POLICIES, SHAPE_POLICY
+            observation_policy = (self.log.metadata.get("scorer_settings") or {}).get("reevaluation_policy")
+            if (action in ("run_command", "run_python") and self.log.metadata.get("experiment_mode") == "v4"
+                    and observation_policy in POLICIES):
+                from engine.http_capture import CaptureSession
+                from engine.tree import replay_tree
+                state = replay_tree(self.log.snapshot_events(), self.run_id)
+                attempt = next((a for a in state["attempts"].values() if a["call_id"] == call_id and a["status"] == "pending"), None)
+                if attempt is not None:
+                    node = state["nodes"][attempt["node_id"]]
+                    if action == "run_python" and urlsplit(self.target).scheme == "https":
+                        from engine.http_capture_sink import ReconstructedCaptureSink
+                        browser_audit_sink = ReconstructedCaptureSink(self.log, attempt, exec_id)
+                    if self._mitm_proxy is not None:
+                        from engine.http_capture_sink import ReconstructedCaptureSink
+                        try:
+                            mitm_token = self._mitm_proxy.activate(ReconstructedCaptureSink(self.log, attempt, exec_id))
+                        except Exception as exc:
+                            result.capture_warnings.append(f"MITM observer binding unavailable: {exc}")
+                            backend, self._mitm_proxy = self._mitm_proxy, None
+                            self._mitm_ca_bundle = None
+                            self._browser_proxy_changed = True
+                            try:
+                                backend.close()
+                            except Exception:
+                                pass
+                    if self._http_proxy is not None:
+                        from engine.http_capture_sink import LiteralCaptureSink
+                        self._capture_receipt_path = self.runtime_dir / 'tmp' / f'{exec_id}-http-captures.json'
+                        proxy_sink = LiteralCaptureSink(self.log, self.target, attempt, exec_id,
+                            node["locator"]["auth_context"], facts_schema=2 if observation_policy == SHAPE_POLICY else 1,
+                            receipt_path=self._capture_receipt_path)
+                        proxy_token = self._http_proxy.activate(proxy_sink)
+                    try:
+                        self._http_capture = CaptureSession(self.log, self.target, attempt, exec_id,
+                                                            node["locator"]["auth_context"], timeout,
+                                                            facts_schema=2 if observation_policy == SHAPE_POLICY else 1)
+                    except Exception as exc:
+                        result.capture_warnings.append(f"Helper capture unavailable: {type(exc).__name__}: {exc}")
             if action == "read_file":
                 stage = "file_api"
                 path = self._file_path(command["path"], writing=False)
@@ -721,6 +904,14 @@ class CommandRuntime:
                 stage = "executor"
                 if not self._browser_enabled:
                     raise RuntimeError("Browser worker is unavailable")
+                if self._browser_proxy_changed:
+                    if self._worker is not None:
+                        self._kill_tree(self._worker, self._owned[self._worker.pid])
+                        self._unregister(self._worker)
+                        self._worker = None
+                    self._kill_browser_procs(time.monotonic() + 5)
+                    self._browser_proxy_changed = False
+                    result.capture_warnings.append("Browser restarted before execution after proxy failure; browser state reset")
                 if self._worker is None or self._worker.poll() is not None:
                     # A prior worker was hard-killed (unresponsive timeout) or crashed. Bring a
                     # fresh browser back so the session keeps working; browser state resets.
@@ -765,6 +956,9 @@ class CommandRuntime:
                         self._tail_python_output(paths, offsets, decoders, exec_id)
                     self._send_control({"type": "execute", "exec_id": exec_id, "path": str(source),
                                         "stdout_path": str(paths["stdout"]), "stderr_path": str(paths["stderr"]),
+                                        "http_capture_endpoint": self._http_capture.endpoint if self._http_capture else None,
+                                        "http_capture_index": str(self._capture_receipt_path) if self._capture_receipt_path else None,
+                                        "browser_audit": browser_audit_sink is not None,
                                         "timeout": timeout})
                     # The worker cancels the code at `timeout` and reports back; give it extra grace
                     # so we only hard-kill (and lose the browser) when the worker is truly unresponsive.
@@ -772,6 +966,8 @@ class CommandRuntime:
                     self._tail_python_output(paths, offsets, decoders, exec_id, final=True)
                     if reply.get("type") != "result" or reply.get("exec_id") != exec_id:
                         raise RuntimeError("Browser worker response mismatch")
+                    if browser_audit_sink is not None:
+                        self._preserve_browser_audit(reply, browser_audit_sink, result)
                     result.exit_code = reply.get("exit_code")
                     result.exception = reply.get("exception", "")
                     result.failure_source = reply.get("failure_source")
@@ -819,6 +1015,18 @@ class CommandRuntime:
             result.cause_code = "invalid_execution_input" if input_failure else "executor_failure"
             result.retryable = True
         finally:
+            if mitm_token is not None:
+                try:
+                    self._mitm_proxy.deactivate(mitm_token)
+                except Exception as exc:
+                    result.capture_warnings.append(f"MITM observer drain unavailable: {exc}")
+            if proxy_token is not None:
+                self._http_proxy.deactivate(proxy_token)
+                result.http_captures = list(proxy_sink.records)
+            self._capture_receipt_path = None
+            if self._http_capture is not None:
+                capture, self._http_capture = self._http_capture, None
+                capture.close()
             self._active_exec_id = None
             output = self._output.pop(exec_id, {})
             result.stdout = result.stdout or output.get("stdout", "")
@@ -900,6 +1108,12 @@ class CommandRuntime:
         for thread in self._output_threads:
             thread.join(timeout=max(0.1, deadline - time.monotonic()))
         self._worker = None
+        if self._http_proxy is not None:
+            proxy, self._http_proxy = self._http_proxy, None
+            proxy.close()
+        if self._mitm_proxy is not None:
+            proxy, self._mitm_proxy = self._mitm_proxy, None
+            proxy.close()
         if record:
             try:
                 self.log.append("runtime_stopped", {})

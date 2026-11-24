@@ -2,6 +2,7 @@
 
 import json
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -12,6 +13,10 @@ from engine.tree import TreeStore, investigation_gaps, latest_observation
 from engine.usage import summarize_usage
 from engine.seed_metrics import seed_metrics
 from engine.execution_evidence import executed_node_ids
+from engine.risk_rubric import AUDIT_PROJECTION_VERSION, project_node
+from engine.observation_verification import POLICIES, supported_observations
+from engine.http_audit import audit_writer, checked_audit, empty_audit, finalized_archive
+from engine.observed_http import observed_http_section
 
 
 def readable_prefix(log):
@@ -101,10 +106,22 @@ def save_report(log, run_result, reason, *, state=None, error=None, persist_meta
     usage = None
     if not degraded:
         try:
+            from engine.http_capture import check_capture_records
+            check_capture_records(log.run_dir, state.get("http_exchanges", {}).values())
             usage = summarize_usage(events, state)
-        except (ValueError, KeyError, TypeError):
-            degraded, error = True, error or "Invalid usage events"
+        except (OSError, ValueError, KeyError, TypeError):
+            degraded, error = True, error or "Invalid usage events or captured evidence"
     gaps = investigation_gaps(state) if not degraded else None
+    policy = (log.metadata.get("scorer_settings") or {}).get("reevaluation_policy")
+    if not policy:
+        creation = next((e.get("configuration") for e in events if e["kind"] == "v4_execution_created"), None)
+        if isinstance(creation, dict) and isinstance(creation.get("scorer_settings"), dict):
+            policy = creation["scorer_settings"].get("reevaluation_policy")
+    scorer_config = (state or {}).get("scorer", {}).get("configuration") or {}
+    policy = scorer_config.get("projection_version") or policy
+    audited = policy in (AUDIT_PROJECTION_VERSION, *POLICIES)
+    if audited and gaps:
+        gaps = [{"node_id": gap["node_id"], "reason": gap["reason"]} for gap in gaps]
     if run_result == "completed" and (degraded or gaps):
         run_result = "incomplete"
         reason = "investigation_unavailable" if degraded else "investigation_incomplete"
@@ -112,6 +129,7 @@ def save_report(log, run_result, reason, *, state=None, error=None, persist_meta
                                   "inconclusive", "unexplored", "unscored", "fallback_selections", "incomplete_nodes",
                                   "reused_nodes", "seed_pending_candidates", "seed_stale_nodes", "seed_deferred_nodes", "observed_nodes")}
     high, evidence, candidate_leads = [], [], None
+    unverified_leads = None
     if not degraded:
         from strategies.greedy import seed_dispatchable
         nodes = list(state["nodes"].values())
@@ -136,9 +154,47 @@ def save_report(log, run_result, reason, *, state=None, error=None, persist_meta
         high = [{"node_id": node["id"], "score": node["risk"]["score"]} for node in nodes
                 if node["investigation_state"] not in ("done", "reused") and node["exploration_state"] != "blocked"
                 and node["risk"].get("status") == "scored" and (node["risk"].get("score") or 0) >= 75]
-        evidence = [ref for node in nodes for ref in node["evidence_refs"]]
-        candidate_leads = _candidate_leads(state, executed)
-    else:
+        if audited:
+            candidate_leads = []
+            for node in candidates:
+                category = project_node(node, projection_version=AUDIT_PROJECTION_VERSION)["hypothesis_type"]
+                candidate_leads.append({"node_id": node["id"], "hypothesis": {"type": category},
+                                        "locator": node["locator"], "test_attempted": node["id"] in executed,
+                                        "verification_state": "inconclusive", "attempt_ids": list(node["attempts"])})
+                if policy in POLICIES:
+                    candidate_leads[-1]["observations"] = supported_observations(node, policy=policy)
+                    candidate_leads[-1]["observation_verification"] = {"policy": policy, "fields": {
+                        field: {key: value for key, value in entry.items() if key != "value"}
+                        for field, entry in node.get("observation_verification", {}).get("fields", {}).items()}}
+            if policy in POLICIES:
+                unverified_leads = []
+                for node in candidates:
+                    if node.get("origin") != "unverified_lead":
+                        continue
+                    attempt_id = node["source_attempt_id"]
+                    attempt = state["attempts"][attempt_id]
+                    fields = attempt.get("observation_verification", {}).get("fields", {})
+                    unresolved = {key: entry for key, entry in fields.items()
+                                  if key in ("security_signal", "query_behavior")
+                                  and entry.get("value") not in (None, "unknown", "unchanged")
+                                  and entry.get("state") in ("unsupported", "contradicted")}
+                    if node["investigation_state"] in ("done", "incomplete") or node["exploration_state"] == "blocked":
+                        followup_status = "inconclusive"
+                    elif node["attempts"] or node["exploration_state"] != "discovered":
+                        followup_status = "investigated"
+                    else:
+                        followup_status = "queued"
+                    unverified_leads.append({"node_id": node["id"], "source_node_id": attempt["node_id"],
+                        "attempt_id": attempt_id, "locator": node["locator"],
+                        "hypothesis_type": node["hypothesis"]["type"],
+                        "unverified_signal": node["unverified_signal"],
+                        "verification_state": "inconclusive", "followup_status": followup_status,
+                        "fields": unresolved, "capture_request_ids": list(node["capture_request_ids"]),
+                        "claim_refs": [attempt["result_ref"]] if attempt.get("result_ref") else []})
+        else:
+            evidence = [ref for node in nodes for ref in node["evidence_refs"]]
+            candidate_leads = _candidate_leads(state, executed)
+    elif not audited:
         # These are prefix references, never final verification statistics.
         for event in events:
             payload = event.get("payload") or {}
@@ -152,7 +208,11 @@ def save_report(log, run_result, reason, *, state=None, error=None, persist_meta
         f"자동 취약점 판정 없음 · 미확정(미검증 포함) {stats['inconclusive']}\n"
         f"미탐색 {stats['unexplored']} · 조사 미완료 {stats['incomplete_nodes']} · 미점수 {stats['unscored']} · 후순위 선택 {stats['fallback_selections']}")
     summary = f"결과: {run_result} · 종료 사유: {reason}\n{counts}\n발견한 노드 범위의 결과이며 사이트 전체의 취약점 부재를 뜻하지 않습니다."
-    if candidate_leads:
+    if audited and candidate_leads:
+        summary += "\n미확인 후보 " + ", ".join(lead["node_id"] for lead in candidate_leads[:5])
+        if len(candidate_leads) > 5:
+            summary += f" 외 {len(candidate_leads) - 5}개"
+    elif candidate_leads:
         summary += "\n후보 단서: " + "; ".join(
             f"{lead['node_id']} {lead['hypothesis']['type']} {lead['locator']['method']} "
             f"{urlsplit(lead['locator']['url']).path} [{lead['locator']['input']}] "
@@ -167,13 +227,43 @@ def save_report(log, run_result, reason, *, state=None, error=None, persist_meta
                 summary += f"\n모델 기록(미확인, {lead['node_id']}): {claim[:220]}"
     if gaps:
         summary += "\n조사 미완료: " + "; ".join(f"{item['node_id']} ({item['reason']})" for item in gaps[:10])
+    if unverified_leads:
+        summary += "\n확인 필요 단서: " + ", ".join(item["node_id"] for item in unverified_leads[:10])
+    observed_http, observed_truncated = ([], False) if degraded else observed_http_section(events)
+    if observed_http or observed_truncated:
+        summary += f"\n브라우저/MITM 미검증 관측 {len(observed_http)}건 (검증·점수 무관)"
+        if observed_truncated:
+            summary += " · 일부 생략"
     report = {"schema_version": 1, "run_id": log.run_id, "status": status, "run_result": run_result,
               "stop_reason": reason, "summary": summary, "stats": stats, "unexplored_high_risk": high,
               "incomplete_nodes": gaps, "candidate_leads": candidate_leads,
               "seed_metrics": None if degraded else seed_metrics(events, state, log.metadata),
               "evidence_refs": evidence, "usage": usage, "last_snapshot_usage": log.metadata.get("v4_usage") if degraded else None,
               "last_readable_seq": events[-1]["seq"] if events else 0, "corruption": corruption, "error": error}
-    atomic_write_json(log.run_dir / "report.json", report)
+    report["observed_http"] = observed_http
+    report["observed_http_truncated"] = observed_truncated
+    archive = None
+    if audited:
+        report["observation_policy"] = policy
+        if policy in POLICIES:
+            report["unverified_leads"] = unverified_leads
+        report["http_audit"] = empty_audit()
+        if policy in POLICIES:
+            captures = list(state.get("http_exchanges", {}).values()) if not degraded else []
+            capture_status = "unavailable" if degraded else "recorded" if captures else "not_recorded"
+            report["http_audit"] = {"source": "harness_http", "status": capture_status,
+                                    "exchanges": captures}
+        if policy == AUDIT_PROJECTION_VERSION and not degraded and log.metadata.get("phase") == "finished":
+            archive = finalized_archive(events)
+    if archive:
+        with audit_writer(log.run_dir, archive):
+            try:
+                report["http_audit"] = checked_audit(log.run_dir, archive, state, log.metadata["target"])
+            except (OSError, KeyError, TypeError, ValueError):
+                report["http_audit"]["status"] = "unavailable"
+            atomic_write_json(log.run_dir / "report.json", report)
+    else:
+        atomic_write_json(log.run_dir / "report.json", report)
     if persist_metadata:
         _metadata(log, report=summary, report_status=status, report_stats=stats, v4_usage=usage,
                   run_result=run_result, finish_reason=reason)
@@ -297,7 +387,11 @@ def finalize_v4(log, runtime, run_result, reason, *, lab_reset):
                 raise RuntimeError("Lab reset failed")
             log.append("lab_reset", {"probe": reset, "status": "succeeded"})
             _metadata(log, lab_reset_status="succeeded")
-        log.append("run_finalized", {"run_result": run_result, "reason": reason})
+        final = {"run_result": run_result, "reason": reason}
+        if report.get("observation_policy") == AUDIT_PROJECTION_VERSION:
+            # Pick the operator archive only after runtime cleanup has completed.
+            final["http_audit_id"] = uuid.uuid4().hex
+        log.append("run_finalized", final)
         _metadata(log, phase="finished", log_status="finalized", cleanup_error="", finished_at=time.time())
     except Exception as exc:
         if log.metadata.get("lab_reset_status") == "running":

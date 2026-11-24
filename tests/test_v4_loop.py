@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 
 from engine.command_runtime import ExecutionResult
+from engine.reporting import save_report
+from engine.risk_rubric import project_node
 from engine.session_log import SessionLog
 from strategies.greedy import V4Runner, BudgetGate
 from engine.policy import V4BudgetStop
@@ -46,6 +48,45 @@ class Runtime:
 
 
 class LoopTests(unittest.TestCase):
+    def test_unverified_surface_lead_is_investigated_once_and_reported_from_tree(self):
+        self.log.update(scorer_settings={"reevaluation_policy": "supported_observations_only"})
+        visited = []
+        def callback(context):
+            node = context["node"]
+            visited.append(node["id"])
+            if node["kind"] == "root":
+                return self.command(context, [surface("https://example.test/shapes?q=", "surface")])
+            command = self.command(context, next_observation="repeat" if node["kind"] == "candidate" else "")
+            result = json.loads(command["command"])
+            result["observations"] = {"security_signal": "account_enumeration",
+                                      "query_behavior": "controlled_difference", "object_scope": "unknown"}
+            if node["kind"] == "candidate":
+                result["discovered"] = [surface("https://example.test/derived?q=", "surface")]
+            command["command"] = json.dumps(result)
+            if node["kind"] == "candidate":
+                self.assertIn("verification_task", context)
+                self.assertIn("audit_http", context["verification_task"]["instruction"])
+            return command
+        runner = V4Runner(self.log, Runtime(self.log), transport=self.transport(callback), scorer_adapter=FakeAdapter())
+        self.assertEqual(runner.run(), ("completed", "tree_exhausted"))
+        state = TreeStore(self.log).rebuild()
+        leads = [node for node in state["nodes"].values() if node.get("origin") == "unverified_lead"]
+        self.assertEqual(len(leads), 1)
+        lead = leads[0]
+        self.assertEqual(visited.count(lead["id"]), 1)
+        self.assertEqual(lead["investigation_state"], "done")
+        self.assertEqual(lead["verification_state"], "inconclusive")
+        self.assertEqual(lead["observations"]["security_signal"], "account_enumeration")
+        self.assertEqual(lead["risk"]["status"], "scored")
+        self.assertEqual(project_node(lead, projection_version="supported_observations_only")
+                         ["observations"]["security_signal"], "unknown")
+        self.assertEqual(sum(node.get("origin") == "unverified_lead" for node in state["nodes"].values()), 1)
+        self.assertIn("https://example.test/derived?q=",
+                      [node["locator"]["url"] for node in state["nodes"].values()])
+        report = save_report(self.log, "completed", "tree_exhausted", state=state)
+        self.assertEqual([item["node_id"] for item in report["unverified_leads"]], [lead["id"]])
+        self.assertEqual(report["unverified_leads"][0]["followup_status"], "inconclusive")
+
     def test_completed_investigation_keeps_reassessed_risk_on_last_leaf(self):
         def callback(context):
             command = self.command(context, [surface()] if context["node"]["id"] == "N0001" else [])

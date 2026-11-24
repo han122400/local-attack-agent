@@ -1,10 +1,11 @@
+import copy
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from engine.session_log import SessionLog
-from engine.tree import TreeStore
+from engine.tree import TreeStore, replay_tree
 from engine.contracts import ContractError
 
 
@@ -54,6 +55,76 @@ class FreshnessTests(unittest.TestCase):
         self.log.append("exec_finished", {"exec_id": exec_id, "call_id": call_id, "action": "run_command",
                         "exit_code": exit_code, "timed_out": False, "cancelled": False, "failure_source": None})
         self.tree.import_result(attempt["attempt_id"], exec_id=exec_id)
+
+    def test_dependency_revision_changes_on_freshness_and_revalidation_but_not_identical_results(self):
+        initial = self.tree.state.get("seed_dependency_revision")
+        self.assertIsNotNone(initial)
+        self.observe(200)
+        checked = self.tree.state["seed_dependency_revision"]
+        self.assertGreater(checked, initial)
+        self.observe(200)
+        self.assertEqual(self.tree.state["seed_dependency_revision"], checked)
+        # A repeated import delivery also leaves dependency state unchanged.
+        events = self.log.snapshot_events()
+        repeated = copy.deepcopy(events[-1])
+        repeated["seq"] += 1
+        self.assertEqual(replay_tree([*events, repeated], self.log.run_id)["seed_dependency_revision"], checked)
+        self.observe(404)
+        stale = self.tree.state["seed_dependency_revision"]
+        self.assertGreater(stale, checked)
+        self.assertTrue(self.tree.state["nodes"][self.child]["seed_revalidation_pending"])
+        self.observe(200, node_id=self.child, url="https://example.test/b")
+        self.assertFalse(self.tree.state["nodes"][self.child]["seed_revalidation_pending"])
+        self.assertGreater(self.tree.state["seed_dependency_revision"], stale)
+        committed = self.tree.state
+        self.assertEqual(self.tree.rebuild(), committed)
+
+    def test_dependency_revision_tracks_approval_replacement_and_failure(self):
+        dependent = self.tree.discover(self.parent, discovery("cap", relation="enabled_by"))
+        self.tree.mark_seeded(dependent, "b" * 32, "N0004", {})
+        self.observe(200)
+        initial = self.tree.state.get("seed_dependency_revision")
+        self.assertIsNotNone(initial)
+        ref = self.tree.state["attempts"]["A0001"]["evidence_refs"][0]
+        self.tree.record_seed_dependency_verification(dependent, self.parent, "A0001", ref)
+        approved = self.tree.state["seed_dependency_revision"]
+        self.assertGreater(approved, initial)
+        self.tree.record_seed_dependency_verification(dependent, self.parent, "A0001", ref)
+        self.assertEqual(self.tree.state["seed_dependency_revision"], approved)
+        self.observe(200)
+        self.assertEqual(self.tree.state["seed_dependency_revision"], approved)
+        ref = self.tree.state["attempts"]["A0002"]["evidence_refs"][0]
+        self.tree.record_seed_dependency_verification(dependent, self.parent, "A0002", ref)
+        replaced = self.tree.state["seed_dependency_revision"]
+        self.assertGreater(replaced, approved)
+        attempt = self.tree.begin_attempt(self.parent, call_id="CALL-failed")
+        self.tree.fail_attempt(attempt["attempt_id"], reason="not_executed", exec_id=None)
+        failed = self.tree.state["seed_dependency_revision"]
+        self.assertGreater(failed, replaced)
+        attempt = self.tree.begin_attempt(self.parent, call_id="CALL-failed-again")
+        self.tree.fail_attempt(attempt["attempt_id"], reason="not_executed", exec_id=None)
+        self.assertEqual(self.tree.rebuild()["seed_dependency_revision"], failed)
+
+    def test_dependency_revision_tracks_approval_removal_with_an_independent_path(self):
+        primary = self.tree.discover("N0001", discovery("primary", "candidate"))
+        alternate = self.tree.discover("N0001", discovery("alternate", "candidate"))
+        dependent = self.tree.discover(primary, discovery("cap", relation="enabled_by"))
+        self.tree.discover(alternate, discovery("cap", relation="enabled_by"))
+        for node_id in (primary, alternate, dependent):
+            self.tree.mark_seeded(node_id, "b" * 32, node_id, {})
+        for parent, attempt_id, path in ((primary, "A0001", "primary"), (alternate, "A0002", "alternate")):
+            self.observe(200, node_id=parent, url="https://example.test/" + path)
+            ref = self.tree.state["attempts"][attempt_id]["evidence_refs"][0]
+            self.tree.record_seed_dependency_verification(dependent, parent, attempt_id, ref)
+        approved = self.tree.state.get("seed_dependency_revision")
+        self.assertIsNotNone(approved)
+        attempt = self.tree.begin_attempt(primary, call_id="CALL-failed")
+        self.tree.fail_attempt(attempt["attempt_id"], reason="not_executed", exec_id=None)
+        state = self.tree.rebuild()
+        self.assertGreater(state["seed_dependency_revision"], approved)
+        self.assertEqual(set(state["nodes"][dependent]["seed_enabled_by_verified"]), {alternate})
+        self.assertFalse(state["nodes"][dependent].get("seed_revalidation_pending", False))
+        self.assertEqual(state["nodes"][primary]["seed_freshness"], "unknown")
 
     def test_status_change_is_recorded_and_invalidates_refinement(self):
         self.observe(404)

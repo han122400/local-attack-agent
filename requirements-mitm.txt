@@ -1,0 +1,5 @@
+# Optional, isolated backend only; install with Python >=3.12.
+# The default application and passive capture keep their Python 3.10 floor.
+# Example: py -3.13 -m venv .deps/mitm-env
+# .deps/mitm-env/Scripts/python.exe -m pip install -r requirements-mitm.txt
+mitmproxy==12.3.1

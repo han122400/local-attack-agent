@@ -9,7 +9,7 @@ import re
 from engine.decision_provider import (ProviderError, build_local_chat_payload, estimated_cost,
                                validate_local_pin, validate_pin)
 from engine.experiment_config import validate_experiment_config
-from engine.risk_rubric import (CONTRACT_VERSION, PROJECTION_VERSION, RUBRIC_VERSION, CRITERIA,
+from engine.risk_rubric import (AUDIT_PROJECTION_VERSION, CONTRACT_VERSION, PROJECTION_VERSION, RUBRIC_VERSION, CRITERIA,
                          ScoreContractError, build_ordinal_request, build_score_request, canonical_bytes,
                          fingerprint, is_finite_number, project_node, validate_answer,
                          validate_ordinal_answer, validate_usage)
@@ -44,7 +44,7 @@ def effective_settings(metadata: dict) -> dict:
     if "max_calls_per_parent" not in config["scorer_settings"]:
         settings["max_calls_per_parent"] = min(settings["max_calls_per_parent"], settings["max_calls"])
     validate_experiment_config({**config, "scorer_settings": settings})
-    if settings["rubric_version"] != RUBRIC_VERSION or settings["reevaluation_policy"] != PROJECTION_VERSION:
+    if settings["rubric_version"] != RUBRIC_VERSION:
         raise ContractError("Unsupported scoring contract version")
     return settings
 
@@ -72,10 +72,29 @@ def context(tree: dict, parent_id: str, configuration: dict, *, include_complete
         raise ContractError("Invalid assessment scope")
     parent = tree["nodes"][parent_id]
     siblings = [tree["nodes"][key] for key in parent["child_ids"]]
+    version = configuration["projection_version"]
+    from engine.observation_verification import POLICIES, supported_observations
+    if version in (AUDIT_PROJECTION_VERSION, *POLICIES):
+        # Neither provider adapters nor context hashes should see model-authored evidence.
+        # Omitted observations convey unknown, including the legacy boolean fields.
+        def structural_fields(node):
+            approved = supported_observations(node, policy=version) if version in POLICIES else {}
+            approved = {key: value for key, value in approved.items() if value is not None and value != "unknown"}
+            return {"id": node["id"], "kind": node["kind"], "locator": node["locator"],
+                    "hypothesis": {"type": node["hypothesis"]["type"]} if node["hypothesis"] else None,
+                    "exploration_state": node["exploration_state"],
+                    "observations": approved,
+                    **({"observation_verification": {"policy": version, "fields": {
+                        key: {"state": "supported", "value": value} for key, value in approved.items()}}}
+                       if version in POLICIES else {})}
+
+        parent = structural_fields(parent)
+        parent["_projection_version"] = version
+        siblings = [structural_fields(node) for node in siblings]
     projected, valid, invalid = [], [], {}
     for node in siblings:
         try:
-            item = project_node(node)
+            item = project_node(node, projection_version=version)
             valid.append(node)
         except ScoreContractError:
             item = {"id": node["id"], "invalid_input": True}
@@ -83,7 +102,7 @@ def context(tree: dict, parent_id: str, configuration: dict, *, include_complete
         projected.append({"projection": item, "locator_hash": fingerprint(node["locator"])})
     # Completed siblings stay in the shared context. Visits, attempts, free-text
     # claims, and evidence attachments alone do not invalidate a score.
-    value = {"configuration": configuration, "parent": project_node(parent),
+    value = {"configuration": configuration, "parent": project_node(parent, projection_version=version),
              "parent_locator_hash": fingerprint(parent["locator"]), "siblings": projected}
     selectable = [node["id"] for node in siblings if node["exploration_state"] not in ("done", "blocked")]
     eligible = ([node["id"] for node in siblings if node["exploration_state"] != "blocked"]
@@ -156,7 +175,7 @@ def apply_scoring_event(tree: dict, kind: str, payload: dict) -> None:
                                        "scorer_model": pin["id"], "scorer_settings": payload["settings"]})
         contract = ORDINAL_CONTRACT_VERSION if payload["provider"] == "local" else CONTRACT_VERSION
         if (settings != payload["settings"] or payload["settings_version"] != SETTINGS_VERSION or payload["contract_version"] != contract
-                or payload["projection_version"] != PROJECTION_VERSION or payload["rubric_version"] != RUBRIC_VERSION):
+                or payload["projection_version"] != settings["reevaluation_policy"] or payload["rubric_version"] != RUBRIC_VERSION):
             raise ContractError("Unsupported scorer configuration")
         numeric(payload["catalog_elapsed_seconds"])
         state["configuration"] = copy.deepcopy(payload)

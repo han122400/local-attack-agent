@@ -11,10 +11,13 @@ import json
 import math
 import re
 from urllib.parse import unquote, urlsplit
+from engine.observation_verification import (POLICY as SUPPORTED_OBSERVATIONS_POLICY, SHAPE_POLICY,
+                                             supported_observations)
 
 
 RUBRIC_VERSION = "risk-priority-v1"
 PROJECTION_VERSION = "scoring_fields_v1"
+AUDIT_PROJECTION_VERSION = "scoring_fields_v2_audit"
 CONTRACT_VERSION = "decisions-score-v2-rounded"
 ROUNDING_HALF_UNIT = 0.005
 # Gross bounds are derived from five independently rounded probabilities and
@@ -108,7 +111,10 @@ def observations(value) -> dict:
     return result
 
 
-def project_node(node: dict) -> dict:
+def project_node(node: dict, *, projection_version: str = PROJECTION_VERSION) -> dict:
+    if projection_version not in (PROJECTION_VERSION, AUDIT_PROJECTION_VERSION,
+                                  SUPPORTED_OBSERVATIONS_POLICY, SHAPE_POLICY):
+        raise ScoreContractError("unknown_projection_version")
     if (not isinstance(node, dict) or not isinstance(node.get("id"), str)
             or not re.fullmatch(r"N[0-9]{4,12}", node["id"])
             or node.get("kind") not in ("root", "surface", "candidate")):
@@ -136,17 +142,27 @@ def project_node(node: dict) -> dict:
                          "route_categories": route_categories, "input_category": input_category},
             "auth_context": auth if isinstance(auth, str) and auth in _AUTH else "unknown",
             "hypothesis_type": hypothesis_type if isinstance(hypothesis_type, str) and hypothesis_type in _HYPOTHESES else "other",
-            "observations": observations(node.get("observations", {}))}
+            "observations": (supported_observations(node, policy=projection_version)
+                             if projection_version in (SUPPORTED_OBSERVATIONS_POLICY, SHAPE_POLICY)
+                             else {} if projection_version == AUDIT_PROJECTION_VERSION
+                             else observations(node.get("observations", {})))}
+
+
+def _score_state(parent, siblings, node_ids):
+    version = parent.get("_projection_version", PROJECTION_VERSION) if isinstance(parent, dict) else PROJECTION_VERSION
+    projected = [project_node(node, projection_version=version) for node in siblings]
+    nodes = {node["id"]: node for node in projected}
+    if (len(nodes) != len(siblings) or not node_ids or len(node_ids) != len(set(node_ids))
+            or not set(node_ids) <= nodes.keys()):
+        raise ScoreContractError("invalid_question_mapping")
+    return {"rubric_version": RUBRIC_VERSION, "projection_version": version,
+            "parent": project_node(parent, projection_version=version), "nodes": nodes}
 
 
 def build_score_request(model: str, parent: dict, siblings: list[dict], node_ids: list[str]) -> dict:
     if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.:-]+", model):
         raise ScoreContractError("invalid_model_id")
-    projected = [project_node(node) for node in siblings]
-    nodes = {node["id"]: node for node in projected}
-    if (len(nodes) != len(siblings) or not node_ids or len(node_ids) != len(set(node_ids))
-            or not set(node_ids) <= nodes.keys()):
-        raise ScoreContractError("invalid_question_mapping")
+    state = _score_state(parent, siblings, node_ids)
     return {"model": model, "provider": {"allow_fallbacks": False},
             "questions": {f"risk_{node_id}": {"type": "score", "criteria": list(CRITERIA),
                 "instructions": f"Assess investigation priority for nodes.{node_id} in state, relative to its siblings. "
@@ -154,21 +170,14 @@ def build_score_request(model: str, parent: dict, siblings: list[dict], node_ids
                 "The ordered criteria jointly consider potential impact and observed feasibility. "
                 "Do not treat an unverified observation or a risk score as a confirmed vulnerability."}
                 for node_id in node_ids},
-            "state": {"rubric_version": RUBRIC_VERSION, "projection_version": PROJECTION_VERSION,
-                      "parent": project_node(parent), "nodes": nodes}}
+            "state": state}
 
 
 def build_ordinal_request(model: str, parent: dict, siblings: list[dict], node_ids: list[str]) -> dict:
     if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,256}", model):
         raise ScoreContractError("invalid_model_id")
-    projected = [project_node(node) for node in siblings]
-    nodes = {node["id"]: node for node in projected}
-    if (len(nodes) != len(siblings) or not node_ids or len(node_ids) != len(set(node_ids))
-            or not set(node_ids) <= nodes.keys()):
-        raise ScoreContractError("invalid_question_mapping")
     return {"model": model, "method": "ordinal_label", "criteria": list(CRITERIA),
-            "node_ids": list(node_ids), "state": {"rubric_version": RUBRIC_VERSION,
-            "projection_version": PROJECTION_VERSION, "parent": project_node(parent), "nodes": nodes}}
+            "node_ids": list(node_ids), "state": _score_state(parent, siblings, node_ids)}
 
 
 def is_finite_number(value) -> bool:

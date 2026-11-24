@@ -1,13 +1,14 @@
-"""Bounded follow-up candidates from measured surface observations.
+"""Bounded surface follow-ups and verification-only leads.
 
 These are leads requiring a new candidate investigation, never verdicts. The
-caller validates/captures result evidence and invokes this only for a successful
+caller validates/captures result evidence and invokes these only for a successful
 execution, before committing the result event. Historical events are not changed.
 """
 
 import copy
 
 from engine.contracts import dedup_key
+from engine.observation_verification import POLICIES
 
 
 _HYPOTHESES = {
@@ -18,6 +19,52 @@ _HYPOTHESES = {
     "unescaped_reflection": ("xss", "Verify whether the observed unescaped reflection is executable in its actual output context."),
     "cross_user_access": ("idor", "Verify whether another user's private data is accessible without the required ownership or authorization."),
 }
+
+UNVERIFIED_LEAD_POLICY = "unverified-lead-v1"
+UNVERIFIED_LEAD_LIMIT = 10
+UNVERIFIED_LEAD_HYPOTHESIS_TYPES = {
+    "auth_bypass": "auth", "weak_credentials": "auth", "account_enumeration": "auth",
+    "query_injection": "sqli", "unescaped_reflection": "xss", "cross_user_access": "idor",
+    "controlled_difference": "input_behavior"}
+
+
+def unverified_lead_candidates(node: dict, result: dict, verification: dict, *,
+                               existing_keys=()) -> list[dict]:
+    """Suggest one investigation for a claimed but unsupported surface signal.
+
+    A suggestion carries only its locator and hypothesis. The model's raw
+    observations remain on the source attempt and never become candidate facts.
+    """
+    if node.get("kind") != "surface" or node.get("origin") == "unverified_lead":
+        return []
+    if verification.get("policy") not in POLICIES:
+        return []
+    facts = result.get("observations", {})
+    fields = verification.get("fields", {})
+    signal = facts.get("security_signal")
+    checked = fields.get("security_signal", {})
+    if (signal in _HYPOTHESES and checked.get("value") == signal
+            and checked.get("state") in ("unsupported", "contradicted")):
+        category, statement = _HYPOTHESES[signal]
+        field = "security_signal"
+    else:
+        signal = facts.get("query_behavior")
+        checked = fields.get("query_behavior", {})
+        if (signal != "controlled_difference" or checked.get("value") != signal
+                or checked.get("state") not in ("unsupported", "contradicted")):
+            return []
+        category = "input_behavior"
+        statement = ("Check whether the claimed input-dependent response difference "
+                     "repeats under identical request conditions and what it means.")
+        field = "query_behavior"
+    candidate = {"kind": "candidate", "relation": "refines", "locator": copy.deepcopy(node["locator"]),
+                 "hypothesis": {"type": category, "statement": statement}}
+    key = dedup_key(candidate)
+    if key in existing_keys or any(
+            item.get("kind") == "candidate" and dedup_key(item) == key
+            for item in result.get("discovered", [])):
+        return []
+    return [{"discovery": candidate, "signal": signal, "field": field}]
 
 
 def followup_candidates(node: dict, result: dict) -> list[dict]:

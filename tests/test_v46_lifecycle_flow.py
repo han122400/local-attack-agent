@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from engine.command_runtime import CommandRuntime
 from engine.reporting import finalize_v4
+from engine.observation_verification import POLICY
 from engine.seed_source import resolve_seed
 from engine.session_log import SessionStore
 from engine.tree import TreeStore
@@ -24,7 +25,7 @@ class LifecycleFlowTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.store = SessionStore(self.root)
         self.settings = {"experiment_mode": "v4", "target": "https://example.test/", "goal": "inspect",
-            "model": "mock:model", "model_settings": {"think": False, "options": {"num_ctx": 8192, "num_predict": 4096}},
+            "model": "mock:model", "model_settings": {"think": False, "options": {"num_ctx": 32768, "num_predict": 4096}},
             "budgets": {"seconds": 120, "model_calls": 30, "tool_calls": 30, "command_seconds": 10, "finalize_seconds": 10},
             "scorer_provider": "openrouter", "scorer_model": "typesafe/jev-1.14", "scorer_settings": {},
             "v4_settings": {}, "tree_schema_version": 1, "prompt_version": "v4", "managed_processes": [],
@@ -75,6 +76,8 @@ class LifecycleFlowTests(unittest.TestCase):
         self.assertEqual(len(TreeStore(log).refresh()["attempts"]), 0)
         report = self.run_and_finalize(log)
         explorer.lease.release()
+        self.assertEqual(report["observation_policy"], POLICY)
+        self.assertEqual(report["http_audit"]["status"], "not_recorded")
         self.assertEqual(report["run_result"], "completed")
         self.assertEqual(report["stats"]["tested_candidates"], 1)
         self.assertEqual(report["seed_metrics"]["coverage_reuse"]["used"], 1)
@@ -94,6 +97,7 @@ class LifecycleFlowTests(unittest.TestCase):
         recovered.worker.join(10)
         self.assertFalse(recovered.worker.is_alive())
         report = json.loads((self.root / run_id / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["observation_policy"], POLICY)
         self.assertEqual(self.store.read(run_id)["phase"], "finished")
         self.assertEqual(report["stats"]["tested_candidates"], 0)
         self.assertFalse(report["candidate_leads"][0]["test_attempted"])

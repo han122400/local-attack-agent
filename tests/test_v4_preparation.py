@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from web import app
 from orchestrator import ExplorerV3
 from engine.session_log import SessionStore
+from engine.observation_verification import SHAPE_POLICY
 
 
 def finish(_payload):
@@ -19,6 +20,12 @@ def finish(_payload):
 
 
 class V4PreparationTests(unittest.TestCase):
+    def test_shape_policy_can_be_pinned_explicitly_without_changing_default(self):
+        self.body["scorer_settings"]["reevaluation_policy"] = SHAPE_POLICY
+        run_id = self._prepare()
+        saved = SessionStore(self.root).read(run_id)
+        self.assertEqual(saved["scorer_settings"]["reevaluation_policy"], SHAPE_POLICY)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -53,7 +60,7 @@ class V4PreparationTests(unittest.TestCase):
         self.assertEqual(saved["experiment_mode"], "v4")
         self.assertEqual(saved["phase"], "prepared")
         self.assertEqual(saved["scorer_model"], "typesafe/jev-1.14")
-        self.assertEqual(saved["scorer_settings"], {"max_retries": 0})
+        self.assertEqual(saved["scorer_settings"], {"max_retries": 0, "reevaluation_policy": "supported_observations_only"})
         self.assertEqual(saved["scorer_validation"], "syntax_only")
         self.assertFalse(saved["execution_ready"])
         self.assertIsNone(saved["prompt_version"])

@@ -49,6 +49,28 @@ class TreeStoreTests(unittest.TestCase):
                             "action": "run_command", "exit_code": exit_code, "timed_out": False, "cancelled": False})
         return attempt, result_file
 
+    def test_dependency_revision_tracks_new_nodes_and_paths_but_ignores_duplicate_discoveries(self):
+        initial = self.tree.state.get("seed_dependency_revision")
+        self.assertEqual(initial, 1)
+        first = self.tree.discover(self.root_id, surface())
+        first_revision = self.tree.state["seed_dependency_revision"]
+        self.assertGreater(first_revision, initial)
+        self.tree.discover(self.root_id, surface())
+        self.assertEqual(self.tree.state["seed_dependency_revision"], first_revision)
+        # Observations and lifecycle events are outside the dependency comparison.
+        self.tree.set_observations(first, {"response_status": 404})
+        self.tree.select_node(first)
+        self.assertEqual(self.tree.refresh()["seed_dependency_revision"], first_revision)
+        second = self.tree.discover(first, surface("https://example.test/item"))
+        second_revision = self.tree.state["seed_dependency_revision"]
+        self.assertGreater(second_revision, first_revision)
+        self.tree.discover(self.root_id, surface("https://example.test/item"))
+        alternate_revision = self.tree.state["seed_dependency_revision"]
+        self.assertGreater(alternate_revision, second_revision)
+        self.tree.discover(self.root_id, surface("https://example.test/item"))
+        self.assertEqual(self.tree.rebuild()["seed_dependency_revision"], alternate_revision)
+        self.assertEqual(len(self.tree.state["nodes"][second]["discovery_paths"]), 2)
+
     def test_root_and_dedup_keep_first_parent_and_alternate_discovery(self):
         self.assertEqual(self.root_id, "N0001")
         first = self.tree.discover(self.root_id, surface())

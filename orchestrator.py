@@ -13,6 +13,7 @@ from pathlib import Path
 from engine.paths import RUNS_ROOT
 from engine.experiment_config import validate_experiment_config, validate_seed_settings, require_execution_ready, compatible_prompt
 from engine.contracts import SCHEMA_VERSION
+from engine.observation_verification import POLICY as SUPPORTED_OBSERVATIONS_POLICY, SHAPE_POLICY
 from engine.tree import TreeStore
 from urllib.parse import urlsplit
 
@@ -197,6 +198,9 @@ class ExplorerV3:
                         "started_at": time.time(), "finished_at": None, "finish_reason": "",
                         "managed_processes": [], **experiment}
             if experiment_mode == "v4":
+                selected_policy = metadata["scorer_settings"].get("reevaluation_policy")
+                metadata["scorer_settings"] = {**metadata["scorer_settings"],
+                    "reevaluation_policy": SHAPE_POLICY if selected_policy == SHAPE_POLICY else SUPPORTED_OBSERVATIONS_POLICY}
                 metadata.update(v4_stage="execution", execution_ready=True, v4_settings=execution,
                                 scorer_validation="syntax_only", tree_schema_version=SCHEMA_VERSION, result_schema_version=SCHEMA_VERSION)
                 metadata["seed_settings"] = seed
@@ -254,6 +258,8 @@ class ExplorerV3:
         experiment = validate_experiment_config({"experiment_mode": "v4", "scorer_provider": scorer_provider,
                                                 "scorer_model": scorer_model,
                                                 "scorer_settings": {} if scorer_settings is None else scorer_settings})
+        if experiment["scorer_settings"].get("reevaluation_policy") != SHAPE_POLICY:
+            experiment["scorer_settings"]["reevaluation_policy"] = SUPPORTED_OBSERVATIONS_POLICY
         target = safe_target(target, self.allowed_target)
         if not isinstance(goal, str) or not goal.strip() or len(goal) > 2000:
             raise ValueError("Manual goal is required")

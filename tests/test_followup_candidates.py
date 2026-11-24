@@ -3,7 +3,7 @@
 import copy
 import unittest
 
-from engine.followup import followup_candidates
+from engine.followup import followup_candidates, unverified_lead_candidates
 
 
 def surface():
@@ -23,6 +23,43 @@ def observation(**changes):
 
 
 class FollowupCandidateTests(unittest.TestCase):
+    def test_unverified_signal_creates_unknown_observation_lead_without_strong_conditions(self):
+        result = observation(security_signal="account_enumeration", object_scope="unknown")
+        result["evidence_refs"] = []
+        verification = {"policy": "supported_observations_only", "fields": {
+            "security_signal": {"state": "unsupported", "value": "account_enumeration"}}}
+        leads = unverified_lead_candidates(surface(), result, verification)
+        self.assertEqual(len(leads), 1)
+        self.assertEqual(leads[0]["signal"], "account_enumeration")
+        candidate = leads[0]["discovery"]
+        self.assertEqual(candidate["hypothesis"]["type"], "auth")
+        self.assertNotIn("observations", candidate)
+        self.assertNotIn("evidence_refs", candidate)
+        self.assertEqual(result["observations"]["security_signal"], "account_enumeration")
+
+    def test_unverified_difference_alone_is_a_lead_but_supported_and_duplicate_are_not(self):
+        result = observation(security_signal="unknown", query_behavior="controlled_difference")
+        verification = {"policy": "supported_observations_only", "fields": {
+            "query_behavior": {"state": "unsupported", "value": "controlled_difference"}}}
+        leads = unverified_lead_candidates(surface(), result, verification)
+        self.assertEqual(len(leads), 1)
+        self.assertEqual(leads[0]["signal"], "controlled_difference")
+        self.assertEqual(leads[0]["discovery"]["hypothesis"]["type"], "input_behavior")
+        result["discovered"] = [leads[0]["discovery"]]
+        self.assertEqual(unverified_lead_candidates(surface(), result, verification), [])
+        result["discovered"] = []
+        verification["fields"]["query_behavior"]["state"] = "supported"
+        self.assertEqual(unverified_lead_candidates(surface(), result, verification), [])
+        self.assertEqual(unverified_lead_candidates({**surface(), "kind": "candidate"}, result, verification), [])
+
+    def test_existing_supported_followup_wins_the_same_dedup_key(self):
+        result = observation(security_signal="account_enumeration", object_scope="cross_user")
+        result["discovered"] = followup_candidates(surface(), result)
+        self.assertEqual(len(result["discovered"]), 1)
+        verification = {"policy": "supported_observations_only", "fields": {
+            "security_signal": {"state": "unsupported", "value": "account_enumeration"}}}
+        self.assertEqual(unverified_lead_candidates(surface(), result, verification), [])
+
     def test_auth_signal_creates_unverified_candidate_with_its_own_evidence(self):
         result = observation()
         candidates = followup_candidates(surface(), result)

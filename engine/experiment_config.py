@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import math
 import re
+from engine.observation_verification import POLICY as SUPPORTED_OBSERVATIONS_POLICY, SHAPE_POLICY
 from urllib.parse import urlsplit
 
 from engine.contracts import normalize_url
+from engine.risk_rubric import AUDIT_PROJECTION_VERSION, PROJECTION_VERSION
 
 
 _INTEGER_LIMITS = {"max_retries": (0, 5), "max_calls": (1, 500), "max_calls_per_parent": (1, 500),
@@ -91,7 +93,7 @@ def validate_experiment_config(body: dict) -> dict:
     if "rubric_version" in raw and (not isinstance(raw["rubric_version"], str)
                                    or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", raw["rubric_version"])):
         raise ValueError("Invalid rubric version")
-    if "reevaluation_policy" in raw and raw["reevaluation_policy"] != "scoring_fields_v1":
+    if "reevaluation_policy" in raw and raw["reevaluation_policy"] not in (PROJECTION_VERSION, AUDIT_PROJECTION_VERSION, SUPPORTED_OBSERVATIONS_POLICY, SHAPE_POLICY):
         raise ValueError("Unknown reevaluation policy")
     if "protocol" in raw and raw["protocol"] != "ollama":
         raise ValueError("Unknown local scorer protocol")

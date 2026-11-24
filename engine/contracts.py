@@ -84,7 +84,7 @@ def validate_locator(value: dict) -> dict:
 
 
 def validate_discovery(value: dict) -> dict:
-    _object(value, ("kind", "relation", "locator", "hypothesis"), ("observations", "evidence_refs"))
+    _object(value, ("kind", "relation", "locator", "hypothesis"), ("observations", "evidence_refs", "observation_evidence"))
     if value["kind"] not in ("surface", "candidate") or value["relation"] not in RELATIONS:
         raise ContractError("Invalid discovered node kind/relation")
     hypothesis = value["hypothesis"]
@@ -114,6 +114,8 @@ def validate_discovery(value: dict) -> dict:
         result["observations"] = observations(value["observations"])
     if "evidence_refs" in value:
         result["evidence_refs"] = validate_evidence_refs(value["evidence_refs"])
+    if "observation_evidence" in value:
+        result["observation_evidence"] = validate_observation_evidence(value["observation_evidence"])
     return result
 
 
@@ -155,10 +157,29 @@ def validate_evidence_refs(value: list) -> list[dict]:
     return refs
 
 
+def validate_observation_evidence(value):
+    if not isinstance(value, dict) or value.keys() - OBSERVATIONS_SCHEMA["properties"].keys():
+        raise ContractError("Invalid observation evidence fields")
+    result = {}
+    for field, proof in value.items():
+        _object(proof, (), ("request_ids", "baseline", "test", "json_pointer"))
+        parsed = {}
+        for key, item in proof.items():
+            if key == "json_pointer":
+                parsed[key] = _text(item, "JSON pointer", 1024, empty=True)
+            else:
+                if (not isinstance(item, list) or len(item) > 4
+                        or any(not isinstance(identity, str) or not re.fullmatch(r"R[0-9a-f]{32}", identity) for identity in item)):
+                    raise ContractError("Invalid captured request identities")
+                parsed[key] = list(item)
+        result[field] = parsed
+    return result
+
+
 def validate_result(value: dict, *, attempt_id: str, node_id: str) -> dict:
     fields = ("schema_version", "attempt_id", "node_id", "discovered", "proposed_verdict",
               "claim", "evidence_refs", "next_observation")
-    _object(value, fields, ("observations",))
+    _object(value, fields, ("observations", "observation_evidence"))
     if type(value["schema_version"]) is not int or value["schema_version"] != SCHEMA_VERSION:
         raise ContractError("Unsupported result schema version")
     if validate_id(value["attempt_id"], attempt=True) != attempt_id or validate_id(value["node_id"]) != node_id:
@@ -176,6 +197,8 @@ def validate_result(value: dict, *, attempt_id: str, node_id: str) -> dict:
                   "next_observation": _text(value["next_observation"], "next observation", 4000, empty=True)}
     if "observations" in value:
         normalized["observations"] = observations(value["observations"])
+    if "observation_evidence" in value:
+        normalized["observation_evidence"] = validate_observation_evidence(value["observation_evidence"])
     captured_paths = {ref["path"] for ref in refs}
     for discovery in normalized["discovered"]:
         if any(ref["path"] not in captured_paths for ref in discovery.get("evidence_refs", [])):
@@ -216,3 +239,10 @@ RESULT_SCHEMA = {"type": "object", "additionalProperties": False,
                                 "evidence_refs": {"type": "array", "maxItems": 50, "items": {
                                     "type": "object", "additionalProperties": False, "required": ["path", "description"],
                                     "properties": {"path": _TEXT, "description": _TEXT}}}}}
+
+_OBSERVATION_EVIDENCE = {"type": "object", "additionalProperties": {"type": "object",
+    "additionalProperties": False, "properties": {
+        **{name: {"type": "array", "maxItems": 4, "items": {"type": "string", "pattern": "^R[0-9a-f]{32}$"}}
+           for name in ("request_ids", "baseline", "test")}, "json_pointer": _TEXT}}}
+RESULT_SCHEMA["properties"]["observation_evidence"] = _OBSERVATION_EVIDENCE
+DISCOVERY_SCHEMA["properties"]["observation_evidence"] = _OBSERVATION_EVIDENCE
